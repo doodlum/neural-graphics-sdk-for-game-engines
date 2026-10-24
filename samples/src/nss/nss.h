@@ -134,6 +134,9 @@ class NSSSample : public vkb::VulkanSampleC
 	// ========== NSS (Neural Super Sampling) ==========
 	bool nss_enabled{false};
 
+	// FFX_API_VK_ML_FEATURE_* bits enabled on the device for the native ML compute path (non-ARM GPUs).
+	uint32_t ml_features{0};
+
 	bool use_fragment_path = true;
 	struct FragOrCompConfig
 	{

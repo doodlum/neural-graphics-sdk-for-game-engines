@@ -1,0 +1,421 @@
+// SPDX-FileCopyrightText: Copyright 2026 Neural Graphics SDK universal contributors
+// SPDX-License-Identifier: MIT
+//
+// Fused TOSA CONV2D -> RESCALE (-> TABLE) for int8 NHWC tensors.
+//
+// The conv input is a "virtual" tensor: the channel-wise CONCAT of up to two sources, each of which may be
+// a nearest-neighbour TOSA RESIZE of a stored tensor. This lets the whole NSS U-Net run as one dispatch per conv.
+//
+// Exactly one of the following paths is compiled:
+//   ML_PATH_COOPMAT  implicit GEMM on GL_KHR_cooperative_matrix (NVIDIA tensor cores, AMD WMMA, Intel XMX, ...).
+//                    ML_MAT_INT8 / ML_MAT_FP16 / ML_MAT_BF16 selects the matrix element type (all exact for int8 data).
+//   ML_PATH_DOT4     packed 4x8-bit integer dot products (GL_EXT_integer_dot_product).
+//   ML_PATH_SCALAR   plain 32-bit integer math, no optional device features required.
+//
+// All tensors are bound as uint32 arrays (4 int8 channels per word), so only the coop-matrix path needs
+// 8/16-bit storage features.
+
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+
+#if ML_PATH_COOPMAT
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#if ML_MAT_INT8
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#define MAT_T  int8_t
+#define ACC_T  int32_t
+#define RAW_INPUT 1  // A holds raw int8 activations; the zero point is folded into the bias on the CPU
+#elif ML_MAT_FP16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#define MAT_T  float16_t
+#define ACC_T  float
+#define RAW_INPUT 0
+#elif ML_MAT_BF16
+#extension GL_EXT_bfloat16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#define MAT_T  bfloat16_t
+#define ACC_T  float
+#define RAW_INPUT 0
+#endif
+#elif ML_PATH_DOT4
+#extension GL_EXT_integer_dot_product : require
+#define RAW_INPUT 1
+#else
+#define RAW_INPUT 1
+#endif
+
+// ---------------------------------------------------------------------------------------------------------
+// Specialization constants (set per layer and per vendor tuning)
+// ---------------------------------------------------------------------------------------------------------
+layout(constant_id = 0) const uint WG_SIZE = 128;  // threads per workgroup
+#if ML_PATH_COOPMAT
+layout(constant_id = 1) const uint TILE_M  = 16;   // coop-matrix M (pixels)
+layout(constant_id = 2) const uint TILE_N  = 16;   // coop-matrix N (output channels)
+layout(constant_id = 3) const uint TILE_K  = 32;   // coop-matrix K (input channels per step)
+layout(constant_id = 4) const uint NUM_SG  = 4;    // subgroups per workgroup, each owns TILE_M pixels
+layout(constant_id = 5) const uint NUM_NT  = 3;    // OC_PAD / TILE_N
+layout(constant_id = 6) const uint OC_PAD  = 48;   // output channels padded to TILE_N
+layout(constant_id = 7) const uint IC_PAD  = 32;   // input channels padded to TILE_K
+const uint TILE_P = TILE_M * NUM_SG;               // pixels per workgroup
+#endif
+
+layout(local_size_x_id = 0) in;
+
+// ---------------------------------------------------------------------------------------------------------
+// Bindings
+// ---------------------------------------------------------------------------------------------------------
+layout(set = 0, binding = 0, std430) readonly buffer Src0 { uint src0[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Src1 { uint src1[]; };
+#if ML_PATH_COOPMAT
+layout(set = 0, binding = 2, std430) readonly buffer Weights { MAT_T weights[]; };  // [tap][IC_PAD][OC_PAD]
+#else
+layout(set = 0, binding = 2, std430) readonly buffer Weights { uint weights[]; };   // [OC][tap][IC_PAD/4] packed int8
+#endif
+// Per output channel: bias (zero-point folded for raw-input paths), multiplier, shift; then a 256 entry int8 table.
+layout(set = 0, binding = 3, std430) readonly buffer Params { int params[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Dst { uint dst[]; };
+
+// Layer description, all specialization constants so the compiler can fold the address math.
+layout(constant_id = 10) const int IN_H        = 1;   // virtual (post resize/concat) input height
+layout(constant_id = 11) const int IN_W        = 1;
+layout(constant_id = 12) const int OUT_H       = 1;
+layout(constant_id = 13) const int OUT_W       = 1;
+layout(constant_id = 14) const int OUT_C       = 4;   // real output channels
+layout(constant_id = 15) const int OUT_STRIDE  = 4;   // stored output channels per pixel (multiple of 4)
+layout(constant_id = 16) const int KERNEL_H    = 1;
+layout(constant_id = 17) const int KERNEL_W    = 1;
+layout(constant_id = 18) const int STRIDE_Y    = 1;
+layout(constant_id = 19) const int STRIDE_X    = 1;
+layout(constant_id = 20) const int PAD_TOP     = 0;
+layout(constant_id = 21) const int PAD_LEFT    = 0;
+layout(constant_id = 22) const int DILATION_Y  = 1;
+layout(constant_id = 23) const int DILATION_X  = 1;
+layout(constant_id = 24) const int INPUT_ZP    = 0;   // CONV2D input zero point
+layout(constant_id = 25) const int IC_WORDS    = 1;   // padded input channels / 4
+layout(constant_id = 26) const int RESCALE_IN_ZP  = 0;
+layout(constant_id = 27) const int RESCALE_OUT_ZP = 0;
+layout(constant_id = 28) const int FLAGS       = 0;   // bit0 double round, bit1 per channel, bit2 table
+layout(constant_id = 29) const int NUM_SOURCES = 1;
+// Source 0 / 1: stored tensor size, logical channels, stored channel stride and optional nearest RESIZE.
+layout(constant_id = 30) const int S0_H = 1;
+layout(constant_id = 31) const int S0_W = 1;
+layout(constant_id = 32) const int S0_C = 4;
+layout(constant_id = 33) const int S0_STRIDE = 4;
+layout(constant_id = 34) const int S0_RESIZE = 0;
+layout(constant_id = 35) const int S0_SCALE_Y_N = 1;
+layout(constant_id = 36) const int S0_SCALE_Y_D = 1;
+layout(constant_id = 37) const int S0_OFFSET_Y = 0;
+layout(constant_id = 38) const int S0_SCALE_X_N = 1;
+layout(constant_id = 39) const int S0_SCALE_X_D = 1;
+layout(constant_id = 40) const int S0_OFFSET_X = 0;
+layout(constant_id = 41) const int S1_H = 1;
+layout(constant_id = 42) const int S1_W = 1;
+layout(constant_id = 43) const int S1_C = 0;
+layout(constant_id = 44) const int S1_STRIDE = 4;
+layout(constant_id = 45) const int S1_RESIZE = 0;
+layout(constant_id = 46) const int S1_SCALE_Y_N = 1;
+layout(constant_id = 47) const int S1_SCALE_Y_D = 1;
+layout(constant_id = 48) const int S1_OFFSET_Y = 0;
+layout(constant_id = 49) const int S1_SCALE_X_N = 1;
+layout(constant_id = 50) const int S1_SCALE_X_D = 1;
+layout(constant_id = 51) const int S1_OFFSET_X = 0;
+
+#define FLAG_DOUBLE_ROUND 1
+#define FLAG_PER_CHANNEL  2
+#define FLAG_TABLE        4
+
+// Replicated zero-point word used for padding taps (each byte = inputZp).
+uint ZpWord()
+{
+    uint b = uint(INPUT_ZP) & 0xFFu;
+    return b | (b << 8) | (b << 16) | (b << 24);
+}
+
+int NearestCoord(int v, int scaleN, int scaleD, int offset, int size)
+{
+    // TOSA RESIZE (NEAREST_NEIGHBOR), integer form.
+    int y  = v * scaleD + offset;
+    int iy = y / scaleN;
+    if (iy * scaleN > y)
+        iy--;
+    int ry = y - iy * scaleN;
+    int i0 = max(iy, 0);
+    int i1 = min(iy + 1, size - 1);
+    return (2 * ry >= scaleN) ? i1 : i0;
+}
+
+// Fetch 4 consecutive channels (one packed word) of the virtual input at (vy, vx), channel c (multiple of 4).
+uint FetchWord(int vy, int vx, int c)
+{
+    if (vy < 0 || vx < 0 || vy >= IN_H || vx >= IN_W)
+        return ZpWord();
+
+    if (c < S0_C)
+    {
+        int sy = vy, sx = vx;
+        if (S0_RESIZE != 0)
+        {
+            sy = NearestCoord(vy, S0_SCALE_Y_N, S0_SCALE_Y_D, S0_OFFSET_Y, S0_H);
+            sx = NearestCoord(vx, S0_SCALE_X_N, S0_SCALE_X_D, S0_OFFSET_X, S0_W);
+        }
+        return src0[((sy * S0_W + sx) * S0_STRIDE + c) >> 2];
+    }
+    c -= S0_C;
+    if (NUM_SOURCES > 1 && c < S1_C)
+    {
+        int sy = vy, sx = vx;
+        if (S1_RESIZE != 0)
+        {
+            sy = NearestCoord(vy, S1_SCALE_Y_N, S1_SCALE_Y_D, S1_OFFSET_Y, S1_H);
+            sx = NearestCoord(vx, S1_SCALE_X_N, S1_SCALE_X_D, S1_OFFSET_X, S1_W);
+        }
+        return src1[((sy * S1_W + sx) * S1_STRIDE + c) >> 2];
+    }
+    // Channel padding: weights are zero there, any value works.
+    return ZpWord();
+}
+
+// TOSA apply_scale_32 on a 32-bit value without requiring shaderInt64.
+int ApplyScale32(int value, int multiplier, int shift, bool doubleRound)
+{
+    int  hi;
+    int  lo;
+    imulExtended(value, multiplier, hi, lo);
+    uint ulo = uint(lo);
+    uint uhi = uint(hi);
+
+    // round = 1 << (shift - 1), plus +/- (1 << 30) for double rounding when shift > 31.
+    uint rlo = 0u, rhi = 0u;
+    if (shift - 1 < 32)
+        rlo = 1u << uint(shift - 1);
+    else
+        rhi = 1u << uint(shift - 33);
+    if (doubleRound && shift > 31)
+    {
+        if (hi >= 0)
+        {
+            uint carry;
+            rlo = uaddCarry(rlo, 1u << 30, carry);
+            rhi += carry;
+        }
+        else
+        {
+            // subtract 1<<30
+            uint borrow;
+            rlo = usubBorrow(rlo, 1u << 30, borrow);
+            rhi -= borrow;
+        }
+    }
+
+    uint carry;
+    ulo = uaddCarry(ulo, rlo, carry);
+    uhi = uhi + rhi + carry;
+
+    // Arithmetic shift of the signed 64-bit value (uhi:ulo) right by shift, then truncate to 32 bits.
+    if (shift >= 32)
+        return int(uhi) >> (shift - 32);
+    if (shift == 0)
+        return int(ulo);
+    return int((ulo >> uint(shift)) | (uhi << uint(32 - shift)));
+}
+
+// Params are laid out as [bias][multiplier][shift] each padded to a multiple of 4 entries, then the table.
+int OC_PARAM_STRIDE()
+{
+    return (OUT_C + 3) & ~3;
+}
+
+int TableLookup(int v)
+{
+    int index = v + 128;
+    int word  = params[3 * OC_PARAM_STRIDE() + (index >> 2)];
+    return bitfieldExtract(word, (index & 3) * 8, 8);
+}
+
+int Epilogue(int acc, int oc)
+{
+    int pIndex     = ((FLAGS & FLAG_PER_CHANNEL) != 0) ? oc : 0;
+    int multiplier = params[OC_PARAM_STRIDE() + pIndex];
+    int shift      = params[2 * OC_PARAM_STRIDE() + pIndex];
+    int v          = ApplyScale32(acc - RESCALE_IN_ZP, multiplier, shift, (FLAGS & FLAG_DOUBLE_ROUND) != 0);
+    v              = clamp(v + RESCALE_OUT_ZP, -128, 127);
+    if ((FLAGS & FLAG_TABLE) != 0)
+        v = TableLookup(v);
+    return v;
+}
+
+uint PackResult(ivec4 v)
+{
+    return (uint(v.x) & 0xFFu) | ((uint(v.y) & 0xFFu) << 8) | ((uint(v.z) & 0xFFu) << 16) | ((uint(v.w) & 0xFFu) << 24);
+}
+
+#if ML_PATH_COOPMAT
+// ---------------------------------------------------------------------------------------------------------
+// Cooperative-matrix implicit GEMM: M = pixels, N = output channels, K = taps x input channels.
+// ---------------------------------------------------------------------------------------------------------
+shared MAT_T sA[TILE_P * TILE_K];
+shared ACC_T sC[TILE_P * OC_PAD];
+
+void StageWord(uint dstIndex, uint word)
+{
+#if ML_MAT_INT8
+    i8vec4 v = unpack8(int(word));
+    sA[dstIndex + 0] = v.x;
+    sA[dstIndex + 1] = v.y;
+    sA[dstIndex + 2] = v.z;
+    sA[dstIndex + 3] = v.w;
+#else
+    // Float paths consume (x - zp), which is exactly representable for int8 data.
+    ivec4 v = ivec4(bitfieldExtract(int(word), 0, 8), bitfieldExtract(int(word), 8, 8), bitfieldExtract(int(word), 16, 8), bitfieldExtract(int(word), 24, 8)) - INPUT_ZP;
+    sA[dstIndex + 0] = MAT_T(float(v.x));
+    sA[dstIndex + 1] = MAT_T(float(v.y));
+    sA[dstIndex + 2] = MAT_T(float(v.z));
+    sA[dstIndex + 3] = MAT_T(float(v.w));
+#endif
+}
+
+void main()
+{
+    const uint numPixels = uint(OUT_H * OUT_W);
+    const uint tileBase  = gl_WorkGroupID.x * TILE_P;
+    const uint sg        = gl_SubgroupID;
+
+    coopmat<ACC_T, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> acc[NUM_NT];
+    [[unroll]] for (uint nt = 0; nt < NUM_NT; ++nt)
+        acc[nt] = coopmat<ACC_T, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(ACC_T(0));
+
+    const uint wordsPerRow  = TILE_K / 4;
+    const uint stageWords   = TILE_P * wordsPerRow;
+    const int  numTaps      = KERNEL_H * KERNEL_W;
+    const uint kChunks      = IC_PAD / TILE_K;
+
+    for (int tap = 0; tap < numTaps; ++tap)
+    {
+        const int ky = tap / KERNEL_W;
+        const int kx = tap - ky * KERNEL_W;
+        for (uint kc = 0; kc < kChunks; ++kc)
+        {
+            // Stage the A tile (TILE_P pixels x TILE_K channels) into shared memory.
+            for (uint i = gl_LocalInvocationID.x; i < stageWords; i += WG_SIZE)
+            {
+                const uint p     = i / wordsPerRow;
+                const uint w     = i - p * wordsPerRow;
+                const uint pixel = tileBase + p;
+                uint       word  = ZpWord();
+                if (pixel < numPixels)
+                {
+                    const int oy = int(pixel) / OUT_W;
+                    const int ox = int(pixel) - oy * OUT_W;
+                    const int vy = oy * STRIDE_Y - PAD_TOP + ky * DILATION_Y;
+                    const int vx = ox * STRIDE_X - PAD_LEFT + kx * DILATION_X;
+                    word         = FetchWord(vy, vx, int(kc * TILE_K + w * 4));
+                }
+                StageWord(p * TILE_K + w * 4, word);
+            }
+            barrier();
+
+            coopmat<MAT_T, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> a;
+            coopMatLoad(a, sA, sg * TILE_M * TILE_K, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+
+            const uint wBase = (uint(tap) * IC_PAD + kc * TILE_K) * OC_PAD;
+            [[unroll]] for (uint nt = 0; nt < NUM_NT; ++nt)
+            {
+                coopmat<MAT_T, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> b;
+                coopMatLoad(b, weights, wBase + nt * TILE_N, OC_PAD, gl_CooperativeMatrixLayoutRowMajor);
+                acc[nt] = coopMatMulAdd(a, b, acc[nt]);
+            }
+            barrier();
+        }
+    }
+
+    [[unroll]] for (uint nt = 0; nt < NUM_NT; ++nt)
+        coopMatStore(acc[nt], sC, sg * TILE_M * OC_PAD + nt * TILE_N, OC_PAD, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // Epilogue: each thread produces one packed word (4 output channels of one pixel).
+    const uint wordsPerPixel = uint(OUT_C + 3) / 4;
+    for (uint i = gl_LocalInvocationID.x; i < TILE_P * wordsPerPixel; i += WG_SIZE)
+    {
+        const uint p     = i / wordsPerPixel;
+        const uint w     = i - p * wordsPerPixel;
+        const uint pixel = tileBase + p;
+        if (pixel >= numPixels)
+            continue;
+        ivec4 r = ivec4(0);
+        [[unroll]] for (uint j = 0; j < 4; ++j)
+        {
+            const int oc = int(w * 4 + j);
+            if (oc < OUT_C)
+            {
+                const int accI = int(sC[p * OC_PAD + oc]) + params[oc];
+                r[j]           = Epilogue(accI, oc);
+            }
+        }
+        dst[(pixel * uint(OUT_STRIDE) + w * 4) >> 2] = PackResult(r);
+    }
+}
+
+#else
+// ---------------------------------------------------------------------------------------------------------
+// One thread per (pixel, 4 output channels).
+// ---------------------------------------------------------------------------------------------------------
+int Dot4(uint a, uint b)
+{
+#if ML_PATH_DOT4
+    return dotPacked4x8EXT(int(a), int(b));
+#else
+    int ia = int(a), ib = int(b);
+    return bitfieldExtract(ia, 0, 8) * bitfieldExtract(ib, 0, 8) + bitfieldExtract(ia, 8, 8) * bitfieldExtract(ib, 8, 8) +
+           bitfieldExtract(ia, 16, 8) * bitfieldExtract(ib, 16, 8) + bitfieldExtract(ia, 24, 8) * bitfieldExtract(ib, 24, 8);
+#endif
+}
+
+void main()
+{
+    const uint numPixels = uint(OUT_H * OUT_W);
+    const uint pixel     = gl_GlobalInvocationID.x;
+    const int  ocBase    = int(gl_GlobalInvocationID.y) * 4;
+    if (pixel >= numPixels || ocBase >= OUT_C)
+        return;
+
+    const int oy = int(pixel) / OUT_W;
+    const int ox = int(pixel) - oy * OUT_W;
+
+    const int numTaps    = KERNEL_H * KERNEL_W;
+    const int icWords    = IC_WORDS;
+    const int ocWords    = numTaps * icWords;  // weight words per output channel
+    const int numOc      = min(4, OUT_C - ocBase);
+
+    ivec4 acc = ivec4(0);
+    for (int tap = 0; tap < numTaps; ++tap)
+    {
+        const int ky = tap / KERNEL_W;
+        const int kx = tap - ky * KERNEL_W;
+        const int vy = oy * STRIDE_Y - PAD_TOP + ky * DILATION_Y;
+        const int vx = ox * STRIDE_X - PAD_LEFT + kx * DILATION_X;
+        for (int w = 0; w < icWords; ++w)
+        {
+            const uint x   = FetchWord(vy, vx, w * 4);
+            const int  wIx = tap * icWords + w;
+            [[unroll]] for (int j = 0; j < 4; ++j)
+            {
+                if (j < numOc)
+                    acc[j] += Dot4(x, weights[(ocBase + j) * ocWords + wIx]);
+            }
+        }
+    }
+
+    ivec4 r = ivec4(0);
+    [[unroll]] for (int j = 0; j < 4; ++j)
+    {
+        if (j < numOc)
+            r[j] = Epilogue(acc[j] + params[ocBase + j], ocBase + j);
+    }
+    dst[(pixel * uint(OUT_STRIDE) + uint(ocBase)) >> 2] = PackResult(r);
+}
+#endif

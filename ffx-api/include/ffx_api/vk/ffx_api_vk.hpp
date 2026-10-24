@@ -42,6 +42,15 @@ namespace ffx
     };
 
     template <>
+    struct struct_type<ffxCreateBackendVKMlFeaturesDesc> : std::integral_constant<uint64_t, FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_ML_FEATURES>
+    {
+    };
+
+    struct CreateBackendVKMlFeaturesDesc : public InitHelper<ffxCreateBackendVKMlFeaturesDesc>
+    {
+    };
+
+    template <>
     struct struct_type<ffxCreateContextDescFrameGenerationSwapChainVK> : std::integral_constant<uint64_t, FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK>
     {
     };

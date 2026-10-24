@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright 2026 Neural Graphics SDK universal contributors
+# SPDX-License-Identifier: MIT
+#
+# Native compute ML path (ml/): runtime sources and the conv kernels, compiled to embedded SPIR-V headers.
+# The coop-matrix bf16 variant needs a glslang with GL_EXT_bfloat16 (Vulkan SDK 1.4.313+).
+
+set(FFX_ML_PATH "${CMAKE_CURRENT_SOURCE_DIR}/ml")
+
+file(GLOB FFX_ML_SOURCE "${FFX_ML_PATH}/*.h" "${FFX_ML_PATH}/*.cpp")
+target_sources(ffx_backend_vk_${FFX_PLATFORM_NAME} PRIVATE ${FFX_ML_SOURCE})
+source_group("ml" FILES ${FFX_ML_SOURCE})
+
+find_program(FFX_ML_GLSLANG glslangValidator
+    HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" "${FFX_ROOT}/sdk/tools/binary_store"
+    REQUIRED)
+message(STATUS "ML kernels compiled with ${FFX_ML_GLSLANG}")
+
+set(FFX_ML_SHADER_OUTPUT_PATH "${CMAKE_CURRENT_BINARY_DIR}/ffx_ml_shaders")
+file(MAKE_DIRECTORY "${FFX_ML_SHADER_OUTPUT_PATH}")
+
+set(FFX_ML_KERNEL_SOURCE "${FFX_ML_PATH}/shaders/ffx_ml_conv2d.comp")
+set(FFX_ML_KERNEL_VARIANTS
+    "scalar|-DML_PATH_SCALAR=1"
+    "dot4|-DML_PATH_DOT4=1"
+    "coopmat_int8|-DML_PATH_COOPMAT=1,-DML_MAT_INT8=1"
+    "coopmat_fp16|-DML_PATH_COOPMAT=1,-DML_MAT_FP16=1"
+    "coopmat_bf16|-DML_PATH_COOPMAT=1,-DML_MAT_BF16=1")
+
+set(FFX_ML_KERNEL_HEADERS "")
+foreach(variant ${FFX_ML_KERNEL_VARIANTS})
+    string(REPLACE "|" ";" parts "${variant}")
+    string(REPLACE "," ";" parts "${parts}")
+    list(GET parts 0 name)
+    list(REMOVE_AT parts 0)
+    set(header "${FFX_ML_SHADER_OUTPUT_PATH}/ffx_ml_conv2d_${name}_spv.h")
+    add_custom_command(
+        OUTPUT "${header}"
+        COMMAND ${FFX_ML_GLSLANG} -V --target-env vulkan1.3 -S comp ${parts} --vn ffx_ml_conv2d_${name} -o "${header}" "${FFX_ML_KERNEL_SOURCE}"
+        DEPENDS "${FFX_ML_KERNEL_SOURCE}"
+        COMMENT "Compiling ML kernel ffx_ml_conv2d_${name}"
+        VERBATIM)
+    list(APPEND FFX_ML_KERNEL_HEADERS "${header}")
+endforeach()
+
+add_custom_target(ffx_ml_kernels_vk DEPENDS ${FFX_ML_KERNEL_HEADERS})
+add_dependencies(ffx_backend_vk_${FFX_PLATFORM_NAME} ffx_ml_kernels_vk)
+target_include_directories(ffx_backend_vk_${FFX_PLATFORM_NAME} PRIVATE "${FFX_ML_SHADER_OUTPUT_PATH}")
+
+# Conformance / performance test for the ML compute path (desktop only).
+option(FFX_ML_BUILD_TESTS "Build the native ML compute path test" ON)
+if (FFX_ML_BUILD_TESTS AND NOT ANDROID)
+    find_package(Vulkan REQUIRED)
+    add_executable(ffx_ml_runtime_test "${FFX_ML_PATH}/test/ffx_ml_runtime_test.cpp" ${FFX_ML_SOURCE})
+    add_dependencies(ffx_ml_runtime_test ffx_ml_kernels_vk ffx_backend_vk_${FFX_PLATFORM_NAME})
+    target_include_directories(ffx_ml_runtime_test PRIVATE "${FFX_ML_SHADER_OUTPUT_PATH}" "${FFX_PASS_DATA_GRAPH_OUTPUT_PATH}" "${Vulkan_INCLUDE_DIR}")
+    target_link_libraries(ffx_ml_runtime_test PRIVATE Vulkan::Vulkan)
+    target_compile_features(ffx_ml_runtime_test PRIVATE cxx_std_17)
+endif()

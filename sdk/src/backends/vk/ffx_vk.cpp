@@ -31,6 +31,8 @@
 #include <FidelityFX/host/ffx_util.h>
 #include <ffx_shader_blobs.h>
 
+#include "ml/ffx_vk_ml_runtime.h"
+
 #ifdef _WIN32
 #if !defined(__UNREAL__)  // Unreal wants to include its own minimal windows .h
 #include <windows.h>
@@ -45,6 +47,8 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 // For graph shape inference
 #include "spirv-tools/libspirv.hpp"
@@ -335,6 +339,47 @@ FfxErrorCode ExecuteGpuJobsVK(FfxInterface* backendInterface, FfxCommandList com
 
 static VkDeviceContext sVkDeviceContext = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
 
+// ML features the application declared per device (see ffxSetMlDeviceFeaturesVK).
+static std::mutex                             sMlDeviceFeaturesMutex;
+static std::unordered_map<VkDevice, uint32_t> sMlDeviceFeatures;
+
+// True when data graphs run on the native compute path instead of VK_ARM_data_graph. Selects how the
+// FFX_RESOURCE_STATE_DATA_GRAPH_* states map to Vulkan stages, accesses and layouts.
+static bool sDataGraphInCompute = false;
+
+static uint32_t GetMlDeviceFeatures(VkDevice device)
+{
+    std::lock_guard<std::mutex> lock(sMlDeviceFeaturesMutex);
+    auto                        it = sMlDeviceFeatures.find(device);
+    return it == sMlDeviceFeatures.end() ? 0u : it->second;
+}
+
+FFX_API void ffxSetMlDeviceFeaturesVK(VkDevice device, uint32_t enabledFeatures)
+{
+    std::lock_guard<std::mutex> lock(sMlDeviceFeaturesMutex);
+    sMlDeviceFeatures[device] = enabledFeatures;
+}
+
+FFX_API uint32_t ffxQueryMlDeviceFeaturesVK(VkInstance                instance,
+                                            VkPhysicalDevice          physicalDevice,
+                                            PFN_vkGetInstanceProcAddr getInstanceProcAddr,
+                                            const char**              extensionNames,
+                                            uint32_t*                 extensionCount)
+{
+    std::vector<const char*> required;
+    const uint32_t           flags = ffx_ml::QueryDeviceFeatures(instance, physicalDevice, getInstanceProcAddr, &required);
+    if (extensionCount)
+    {
+        if (extensionNames)
+        {
+            for (uint32_t i = 0; i < *extensionCount && i < required.size(); ++i)
+                extensionNames[i] = required[i];
+        }
+        *extensionCount = static_cast<uint32_t>(required.size());
+    }
+    return flags;
+}
+
 #define MAX_PIPELINE_USAGE_PER_FRAME (10)  // Required to make sure passes that are called more than once per-frame don't have their descriptors overwritten.
 
 #define MAX_DESCRIPTOR_SET_LAYOUTS  (32)
@@ -417,6 +462,10 @@ typedef struct BackendContext_VK
         bool undefined;
         bool dynamic;
 
+        // Native compute ML path: an image-aliased tensor is a plain buffer plus an image the graph output is copied to.
+        bool         mlComputeTensor;
+        VkDeviceSize mlTensorBufferSize;
+
     } Resource;
 
     typedef struct PipelineLayout
@@ -450,6 +499,9 @@ typedef struct BackendContext_VK
         // Data graph pipeline session memory owned by this pipeline layout.
         VkDeviceMemory dataGraphSessionMemory;
         VkDeviceSize   dataGraphSessionMemorySize;
+
+        // Native compute ML path: the lowered graph (ffx_ml::Graph) replacing the data graph pipeline.
+        ffx_ml::Graph* mlGraph;
 
         char      name[64];
         FfxUInt32 effectContextId;
@@ -548,6 +600,10 @@ typedef struct BackendContext_VK
 
     uint32_t               numDeviceExtensions = 0;
     VkExtensionProperties* extensionProperties = nullptr;
+
+    // Data graphs run through ffx_ml compute kernels rather than VK_ARM_data_graph.
+    bool     mlCompute         = false;
+    uint32_t mlEnabledFeatures = 0;
 
 } BackendContext_VK;
 
@@ -1484,8 +1540,13 @@ VkAccessFlags2 getVKAccessFlagsFromResourceState(FfxResourceStates state)
     case FFX_RESOURCE_STATE_RENDER_TARGET:
         return VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
     case FFX_RESOURCE_STATE_DATA_GRAPH_READ:
+        if (sDataGraphInCompute)
+            return VK_ACCESS_2_SHADER_READ_BIT;
         return VK_ACCESS_2_DATA_GRAPH_READ_BIT_ARM;
     case FFX_RESOURCE_STATE_DATA_GRAPH_WRITE:
+        // The compute path writes with shaders and copies image-aliased outputs with transfers.
+        if (sDataGraphInCompute)
+            return VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
         return VK_ACCESS_2_DATA_GRAPH_WRITE_BIT_ARM;
     case FFX_RESOURCE_STATE_DEPTH_ATTACHEMENT:
         return VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
@@ -1522,6 +1583,8 @@ VkPipelineStageFlags2 getVKPipelineStageFlagsFromResourceState(FfxResourceStates
         return VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     case FFX_RESOURCE_STATE_DATA_GRAPH_READ:
     case FFX_RESOURCE_STATE_DATA_GRAPH_WRITE:
+        if (sDataGraphInCompute)
+            return VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         return VK_PIPELINE_STAGE_2_DATA_GRAPH_BIT_ARM;
     case (FFX_RESOURCE_STATE_DEPTH_ATTACHEMENT):
         return VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -1557,6 +1620,9 @@ VkImageLayout getVKImageLayoutFromResourceState(FfxResourceStates state)
         return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     case FFX_RESOURCE_STATE_DATA_GRAPH_READ:
     case FFX_RESOURCE_STATE_DATA_GRAPH_WRITE:
+        // Compute path: the image half of an image-aliased tensor is only ever the destination of a copy.
+        if (sDataGraphInCompute)
+            return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         return VK_IMAGE_LAYOUT_TENSOR_ALIASING_ARM;
     case FFX_RESOURCE_STATE_DEPTH_ATTACHEMENT:
         return VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -1688,6 +1754,15 @@ void addBarrier(BackendContext_VK* backendContext, FfxResourceInternal* resource
     if (ffxResource.resourceDescription.type == FFX_RESOURCE_TYPE_BUFFER)
     {
         addBufferBarrier(ffxResource.bufferResource);
+    }
+    else if (ffxResource.resourceDescription.type == FFX_RESOURCE_TYPE_TENSOR && ffxResource.mlComputeTensor)
+    {
+        // Compute path tensors are a buffer, plus an image when image-aliased.
+        addBufferBarrier(ffxResource.aliasedTensorBufferResource);
+        if (ffxResource.aliasedTensorImageResource != VK_NULL_HANDLE)
+        {
+            addImageBarrier(ffxResource.aliasedTensorImageResource);
+        }
     }
     else if (ffxResource.resourceDescription.type == FFX_RESOURCE_TYPE_TENSOR)
     {
@@ -2646,6 +2721,30 @@ FfxErrorCode GetDeviceCapabilitiesVK(FfxInterface* backendInterface, FfxDeviceCa
         }
     }
 
+    // Without VK_ARM_tensors + VK_ARM_data_graph the networks run on the native compute path, which uses the
+    // vendor's own ML acceleration (see ml/ffx_vk_ml_runtime.h). FFX_ML_PATH=datagraph keeps the ARM path when it is
+    // available (for example through the ML emulation layer); coopmat/dot4/scalar force the compute path.
+    {
+        const char* forcedPath   = getenv("FFX_ML_PATH");
+        const bool  forceGraph   = forcedPath && strcmp(forcedPath, "datagraph") == 0;
+        const bool  forceCompute = forcedPath && !forceGraph;
+        const bool  armMl        = deviceCapabilities->tensorSupported && deviceCapabilities->dataGraphSupported;
+
+        backendContext->mlCompute         = forceCompute || (!armMl && !forceGraph);
+        backendContext->mlEnabledFeatures = GetMlDeviceFeatures(backendContext->device);
+        sDataGraphInCompute               = backendContext->mlCompute;
+
+        if (backendContext->mlCompute)
+        {
+            // Tensors become storage buffers, so every shader takes its buffer-aliased tensor path.
+            deviceCapabilities->tensorSupported       = true;
+            deviceCapabilities->dataGraphSupported    = true;
+            deviceCapabilities->computeSupportTensor  = false;
+            deviceCapabilities->fragmentSupportTensor = false;
+            deviceCapabilities->dataGraphOFSupported  = false;  // optical flow engine is not emulated
+        }
+    }
+
     backendInterface->devCapInitialized = true;
     if (deviceCapabilities != &backendInterface->deviceCapabilities)
     {
@@ -2778,6 +2877,26 @@ static VkTensorTilingARM GetTensorTiling(const bool bufferAliased)
     return bufferAliased ? VK_TENSOR_TILING_LINEAR_ARM : VK_TENSOR_TILING_OPTIMAL_ARM;
 }
 
+// Bytes per element of the tensor formats the SDK uses.
+static VkDeviceSize TensorElementSize(FfxSurfaceFormat format)
+{
+    switch (format)
+    {
+    case FFX_SURFACE_FORMAT_R8_SINT:
+    case FFX_SURFACE_FORMAT_R8_UINT:
+    case FFX_SURFACE_FORMAT_R8_UNORM:
+    case FFX_SURFACE_FORMAT_R8_SNORM:
+        return 1;
+    case FFX_SURFACE_FORMAT_R16_FLOAT:
+    case FFX_SURFACE_FORMAT_R16_UINT:
+    case FFX_SURFACE_FORMAT_R16_UNORM:
+    case FFX_SURFACE_FORMAT_R16_SNORM:
+        return 2;
+    default:
+        return 4;
+    }
+}
+
 FfxErrorCode CreateTensorResourceVK(FfxInterface*                       backendInterface,
                                     const FfxCreateResourceDescription* createResourceDescription,
                                     FfxUInt32                           effectContextId,
@@ -2852,6 +2971,82 @@ FfxErrorCode CreateTensorResourceVK(FfxInterface*                       backendI
     // IMAGE_ALIASING_BIT is incompatible with LINEAR (VUID-VkTensorDescriptionARM), so imageAliased and bufferAliased are mutually exclusive
     FFX_ASSERT_MESSAGE(!imageAliased || !bufferAliased, "Cant alias tensor both as image and buffer!");
 
+    backendResource->mlComputeTensor    = backendContext->mlCompute;
+    backendResource->mlTensorBufferSize = 0;
+    backendResource->tensorViewIndex    = -1;
+
+    // Image used by image-aliased tensors; on the compute path it is a separate image the graph output is copied into.
+    uint32_t channels = createResourceDescription->resourceDescription.channel;
+    VkFormat aliasedFormat =
+        imageAliased ? ffxGetVkFormatForTensorAliasedImage(createResourceDescription->resourceDescription.format, channels) : VK_FORMAT_UNDEFINED;
+
+    if (backendContext->mlCompute)
+    {
+        // Packed NHWC storage buffer, the layout the buffer-aliased shader paths and the ML kernels share.
+        VkDeviceSize elementCount = 1;
+        for (int64_t d : dimensions)
+            elementCount *= VkDeviceSize(d);
+        const VkDeviceSize bufferSize = FFX_ALIGN_UP(elementCount * TensorElementSize(resourceDesc.format), 16);
+
+        VkBufferCreateInfo bufferInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufferInfo.size               = bufferSize;
+        bufferInfo.usage              = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufferInfo.sharingMode        = VK_SHARING_MODE_EXCLUSIVE;
+        if (VulkanWrapper().vkCreateBuffer(device, &bufferInfo, nullptr, &backendResource->aliasedTensorBufferResource) != VK_SUCCESS)
+            return FFX_ERROR_BACKEND_API_ERROR;
+        backendResource->mlTensorBufferSize = bufferSize;
+
+        VkMemoryRequirements memReqs;
+        VulkanWrapper().vkGetBufferMemoryRequirements(device, backendResource->aliasedTensorBufferResource, &memReqs);
+
+        VkDeviceSize imageOffset = 0;
+        if (imageAliased)
+        {
+            const VkImageCreateInfo imageInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                                 nullptr,
+                                                 0,
+                                                 VK_IMAGE_TYPE_2D,
+                                                 aliasedFormat,
+                                                 {static_cast<uint32_t>(dimensions[2]), static_cast<uint32_t>(dimensions[1]), 1},
+                                                 1,
+                                                 1,
+                                                 VK_SAMPLE_COUNT_1_BIT,
+                                                 VK_IMAGE_TILING_OPTIMAL,
+                                                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                 VK_SHARING_MODE_EXCLUSIVE,
+                                                 0,
+                                                 nullptr,
+                                                 VK_IMAGE_LAYOUT_UNDEFINED};
+            if (VulkanWrapper().vkCreateImage(device, &imageInfo, nullptr, &backendResource->aliasedTensorImageResource) != VK_SUCCESS)
+                return FFX_ERROR_BACKEND_API_ERROR;
+
+            VkMemoryRequirements imageReqs;
+            VulkanWrapper().vkGetImageMemoryRequirements(device, backendResource->aliasedTensorImageResource, &imageReqs);
+            imageOffset             = FFX_ALIGN_UP(memReqs.size, imageReqs.alignment);
+            memReqs.size            = imageOffset + imageReqs.size;
+            memReqs.alignment       = FFX_MAXIMUM(memReqs.alignment, imageReqs.alignment);
+            memReqs.memoryTypeBits &= imageReqs.memoryTypeBits;
+        }
+
+        if (allocateDeviceMemory(backendContext, memReqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, backendResource))
+            return FFX_ERROR_BACKEND_API_ERROR;
+        backendResource->allocationSize = memReqs.size;
+        effectContext.vramUsage.totalUsageInBytes += memReqs.size;
+
+        if (VulkanWrapper().vkBindBufferMemory(device, backendResource->aliasedTensorBufferResource, backendResource->deviceMemory, 0) != VK_SUCCESS)
+            return FFX_ERROR_BACKEND_API_ERROR;
+        if (imageAliased)
+        {
+            const VkBindImageMemoryInfo bindImage = {
+                VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, nullptr, backendResource->aliasedTensorImageResource, backendResource->deviceMemory, imageOffset};
+            if (VulkanWrapper().vkBindImageMemory2(device, 1, &bindImage) != VK_SUCCESS)
+                return FFX_ERROR_BACKEND_API_ERROR;
+        }
+
+        outResource->alignedWidth = createResourceDescription->resourceDescription.shapeSize >= 3 ? static_cast<uint32_t>(dimensions[2])
+                                                                                                    : static_cast<uint32_t>(dimensions.back());
+    }
+
     VkTensorUsageFlagsARM tensorUsage = VK_TENSOR_USAGE_DATA_GRAPH_BIT_ARM;
     if (imageAliased)
     {
@@ -2879,15 +3074,16 @@ FfxErrorCode CreateTensorResourceVK(FfxInterface*                       backendI
         nullptr,  // pQueueFamilyIndices
     };
 
+    VkDeviceSize tensorDataSize = 0;
+    VkDeviceSize memoryOffset   = 0u;
+    if (!backendContext->mlCompute)
+    {
     if (VulkanWrapper().vkCreateTensorARM(device, &tensorCreateInfo, nullptr, &backendResource->tensorResource))
     {
         return FFX_ERROR_BACKEND_API_ERROR;
     }
 
     // Aliased image initialization
-    uint32_t channels = createResourceDescription->resourceDescription.channel;
-    VkFormat aliasedFormat =
-        imageAliased ? ffxGetVkFormatForTensorAliasedImage(createResourceDescription->resourceDescription.format, channels) : VK_FORMAT_UNDEFINED;
     if (imageAliased)
     {
         VkExtent3D              imageOutExtent     = {static_cast<uint32_t>(dimensions[2]), static_cast<uint32_t>(dimensions[1]), 1};
@@ -2928,9 +3124,7 @@ FfxErrorCode CreateTensorResourceVK(FfxInterface*                       backendI
     VulkanWrapper().vkGetTensorMemoryRequirementsARM(device, &tensorMemInfo, &tensorMemreqs);
 
     // Capture raw tensor data size before it may be enlarged to fit a co-aliased image.
-    const VkDeviceSize tensorDataSize = tensorMemreqs.memoryRequirements.size;
-
-    VkDeviceSize memoryOffset = 0u;
+    tensorDataSize = tensorMemreqs.memoryRequirements.size;
 
     // Aliased image initialization
     if (imageAliased)
@@ -2995,6 +3189,7 @@ FfxErrorCode CreateTensorResourceVK(FfxInterface*                       backendI
     {
         return FFX_ERROR_BACKEND_API_ERROR;
     }
+    }  // !backendContext->mlCompute
 
     if (imageAliased)
     {
@@ -3070,7 +3265,7 @@ FfxErrorCode CreateTensorResourceVK(FfxInterface*                       backendI
         }
     }
 
-    if (bufferAliased)
+    if (bufferAliased && !backendContext->mlCompute)
     {
         // Create a VkBuffer that shares the tensor's device memory.
         // The tensor is bound at memoryOffset; the buffer starts there and spans exactly the raw tensor data.
@@ -3512,7 +3707,8 @@ FfxErrorCode DestroyResourceVK(FfxInterface* backendInterface, FfxResourceIntern
         else if (backgroundResource.resourceDescription.type == FFX_RESOURCE_TYPE_TENSOR)
         {
             // Destroy tensor view
-            if (backendContext->pResourceViews[backgroundResource.tensorViewIndex].tensorView != VK_NULL_HANDLE)
+            if (backgroundResource.tensorViewIndex >= 0 &&
+                backendContext->pResourceViews[backgroundResource.tensorViewIndex].tensorView != VK_NULL_HANDLE)
             {
                 VulkanWrapper().vkDestroyTensorViewARM(
                     backendContext->device, backendContext->pResourceViews[backgroundResource.tensorViewIndex].tensorView, nullptr);
@@ -3530,7 +3726,7 @@ FfxErrorCode DestroyResourceVK(FfxInterface* backendInterface, FfxResourceIntern
             const bool imageAliased  = (flags & FFX_RESOURCE_FLAGS_IMAGE_ALIASED) == FFX_RESOURCE_FLAGS_IMAGE_ALIASED;
             const bool bufferAliased = (flags & FFX_RESOURCE_FLAGS_BUFFER_ALIASED) == FFX_RESOURCE_FLAGS_BUFFER_ALIASED;
 
-            if (imageAliased && backgroundResource.aliasedTensorImageResource != VK_NULL_HANDLE)
+            if ((imageAliased || backgroundResource.mlComputeTensor) && backgroundResource.aliasedTensorImageResource != VK_NULL_HANDLE)
             {
                 // Destroy SRV
                 if (backgroundResource.srvViewIndex >= 0)
@@ -3564,7 +3760,7 @@ FfxErrorCode DestroyResourceVK(FfxInterface* backendInterface, FfxResourceIntern
             }
 
             // Destroy aliased buffer
-            if (bufferAliased && backgroundResource.aliasedTensorBufferResource != VK_NULL_HANDLE)
+            if ((bufferAliased || backgroundResource.mlComputeTensor) && backgroundResource.aliasedTensorBufferResource != VK_NULL_HANDLE)
             {
                 VulkanWrapper().vkDestroyBuffer(backendContext->device, backgroundResource.aliasedTensorBufferResource, nullptr);
                 backgroundResource.aliasedTensorBufferResource = VK_NULL_HANDLE;
@@ -5689,6 +5885,90 @@ FfxErrorCode getOrCreateGraphicsPipeline(BackendContext_VK* backendContext, FfxG
     return FFX_OK;
 }
 
+// Native compute replacement for a VK_ARM_data_graph pipeline: the TOSA graph is lowered to compute kernels that use
+// the vendor's ML acceleration (cooperative matrices, int8 dot products) through ffx_ml.
+static FfxErrorCode CreateDataGraphComputePipelineVK(FfxInterface*                      backendInterface,
+                                                     const FfxDataGraphBlob&            dataGraphBlob,
+                                                     const FfxPipelineDescription*      desc,
+                                                     FfxUInt32                          effectContextId,
+                                                     FfxUInt32                          dataGraphWidth,
+                                                     FfxUInt32                          dataGraphHeight,
+                                                     BackendContext_VK::PipelineLayout* pPipelineLayout,
+                                                     FfxPipelineState*                  outPipeline)
+{
+    BackendContext_VK* backendContext = (BackendContext_VK*)backendInterface->scratchBuffer;
+
+    pPipelineLayout->effectContextId = effectContextId;
+    pPipelineLayout->mlGraph         = nullptr;
+    outPipeline->rootSignature       = reinterpret_cast<FfxRootSignature>(pPipelineLayout);
+    outPipeline->cmdSignature        = nullptr;
+    outPipeline->pipeline            = nullptr;
+    outPipeline->session             = nullptr;
+
+    outPipeline->uavTensorCount = dataGraphBlob.outputTensorNums;
+    FFX_ASSERT(outPipeline->uavTensorCount < FFX_MAX_NUM_TENSORS);
+    for (uint32_t tensorIndex = 0; tensorIndex < dataGraphBlob.outputTensorNums; ++tensorIndex)
+    {
+        outPipeline->uavTensorBindings[tensorIndex].slotIndex  = dataGraphBlob.outputTensorBindings[tensorIndex];
+        outPipeline->uavTensorBindings[tensorIndex].arrayIndex = 0;
+        strncpy(outPipeline->uavTensorBindings[tensorIndex].name, dataGraphBlob.outputTensorNames[tensorIndex], FFX_RESOURCE_NAME_SIZE - 1);
+        outPipeline->uavTensorBindings[tensorIndex].name[FFX_RESOURCE_NAME_SIZE - 1] = '\0';
+    }
+    outPipeline->srvTensorCount = dataGraphBlob.inputTensorNums;
+    FFX_ASSERT(outPipeline->srvTensorCount < FFX_MAX_NUM_TENSORS);
+    for (uint32_t tensorIndex = 0; tensorIndex < dataGraphBlob.inputTensorNums; ++tensorIndex)
+    {
+        outPipeline->srvTensorBindings[tensorIndex].slotIndex  = dataGraphBlob.inputTensorBindings[tensorIndex];
+        outPipeline->srvTensorBindings[tensorIndex].arrayIndex = 0;
+        strncpy(outPipeline->srvTensorBindings[tensorIndex].name, dataGraphBlob.inputTensorNames[tensorIndex], FFX_RESOURCE_NAME_SIZE - 1);
+        outPipeline->srvTensorBindings[tensorIndex].name[FFX_RESOURCE_NAME_SIZE - 1] = '\0';
+    }
+    strncpy(outPipeline->name, desc->name, FFX_RESOURCE_NAME_SIZE - 1);
+    outPipeline->name[FFX_RESOURCE_NAME_SIZE - 1] = '\0';
+
+    ffx_ml::GraphDesc graphDesc = {};
+    graphDesc.spirv             = reinterpret_cast<const uint32_t*>(dataGraphBlob.graphData);
+    graphDesc.spirvWords        = dataGraphBlob.graphDataSize / 4;
+    for (FfxUInt32 i = 0; i < dataGraphBlob.constantNums; ++i)
+    {
+        ffx_ml::GraphConstant constant;
+        constant.id       = dataGraphBlob.constantIds[i];
+        constant.vkFormat = dataGraphBlob.constantFormats[i];
+        constant.shape.assign(dataGraphBlob.constantShapes[i], dataGraphBlob.constantShapes[i] + dataGraphBlob.constantShapeSize[i]);
+        constant.data     = dataGraphBlob.constantDatas[i];
+        constant.dataSize = dataGraphBlob.constantDataSize[i];
+        graphDesc.constants.push_back(constant);
+    }
+    for (const auto& [binding, shape] : GetInputShapes(dataGraphBlob, dataGraphWidth, dataGraphHeight))
+        graphDesc.inputShapes[binding.second] = shape;
+
+    const ffx_ml::DeviceContext mlContext = {backendContext->instance,
+                                             backendContext->physicalDevice,
+                                             backendContext->device,
+                                             sVkDeviceContext.vkGetInstanceProcAddr,
+                                             sVkDeviceContext.vkDeviceProcAddr,
+                                             backendContext->mlEnabledFeatures};
+    ffx_ml::Path    forcedPath = ffx_ml::Path::Auto;
+    ffx_ml::MatType forcedType = ffx_ml::MatType::None;
+    ffx_ml::ReadEnvironmentOverrides(forcedPath, forcedType);
+    const ffx_ml::Selection selection = ffx_ml::SelectPath(mlContext, forcedPath, forcedType);
+
+    std::string                    error;
+    std::unique_ptr<ffx_ml::Graph> graph = ffx_ml::Graph::Create(mlContext, selection, graphDesc, &error);
+    if (!graph)
+    {
+        PrintMessage(backendInterface, FFX_MESSAGE_TYPE_ERROR, ("ML compute path: " + error + "\n").c_str());
+        return FFX_ERROR_BACKEND_API_ERROR;
+    }
+
+    const std::string message = "Data graph '" + std::string(desc->name) + "' on the native compute path: " + selection.Describe() + ", " +
+                                std::to_string(graph->GetDispatchCount()) + " dispatches\n";
+    PrintMessage(backendInterface, FFX_MESSAGE_TYPE_WARNING, message.c_str());
+
+    pPipelineLayout->mlGraph = graph.release();
+    return FFX_OK;
+}
+
 FfxErrorCode CreateDataGraphPipelineVK(FfxInterface*                 backendInterface,
                                        FfxEffect                     effect,
                                        FfxPass                       passId,
@@ -5714,6 +5994,11 @@ FfxErrorCode CreateDataGraphPipelineVK(FfxInterface*                 backendInte
     FFX_ASSERT_MESSAGE(effectContext.nextPipelineLayout < (effectContextId * FFX_MAX_PASS_COUNT) + FFX_MAX_PASS_COUNT,
                        "FFXInterface: Vulkan: Ran out of pipeline layouts. Please increase FFX_MAX_PASS_COUNT");
     BackendContext_VK::PipelineLayout* pPipelineLayout = &backendContext->pPipelineLayouts[effectContext.nextPipelineLayout++];
+
+    if (backendContext->mlCompute)
+    {
+        return CreateDataGraphComputePipelineVK(backendInterface, dataGraphBlob, desc, effectContextId, dataGraphWidth, dataGraphHeight, pPipelineLayout, outPipeline);
+    }
 
     // Setup descriptor sets
     std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
@@ -6567,6 +6852,12 @@ FfxErrorCode DestroyPipelineVK(FfxInterface* backendInterface, FfxPipelineState*
 
     if (pPipelineLayout)
     {
+        if (pPipelineLayout->mlGraph)
+        {
+            delete pPipelineLayout->mlGraph;
+            pPipelineLayout->mlGraph = nullptr;
+        }
+
         if (pPipelineLayout->dataGraphSessionMemory != VK_NULL_HANDLE)
         {
             VulkanWrapper().vkFreeMemory(backendContext->device, pPipelineLayout->dataGraphSessionMemory, nullptr);
@@ -7414,11 +7705,79 @@ static FfxErrorCode executeGpuJobFragment(BackendContext_VK* backendContext, Ffx
     return FFX_OK;
 }
 
+// Data graph job on the native compute path. Tensors are storage buffers; outputs that the SDK reads as images are
+// copied into their image after the graph ran.
+static FfxErrorCode executeGpuJobDataGraphCompute(BackendContext_VK*                 backendContext,
+                                                  FfxGpuJobDescription*              job,
+                                                  BackendContext_VK::PipelineLayout* pipelineLayout,
+                                                  VkCommandBuffer                    vkCommandBuffer)
+{
+    const FfxDataGraphJobDescription& graphJob = job->dataGraphJobDescription;
+
+    ffx_ml::ExternalTensor externals[FFX_MAX_NUM_TENSORS * 2];
+    uint32_t               externalCount = 0;
+
+    auto bindTensor = [&](FfxTensor& tensor, const FfxResourceBinding& binding, FfxResourceStates state) {
+        if (tensor.resource.internalIndex == 0)
+            return;
+        addBarrier(backendContext, &tensor.resource, state);
+        const BackendContext_VK::Resource& resource = backendContext->pResources[tensor.resource.internalIndex];
+        externals[externalCount++]                  = {binding.slotIndex, resource.aliasedTensorBufferResource, 0};
+    };
+    for (uint32_t i = 0; i < graphJob.pipeline.srvTensorCount; ++i)
+        bindTensor(job->dataGraphJobDescription.srvTensors[i], graphJob.pipeline.srvTensorBindings[i], FFX_RESOURCE_STATE_DATA_GRAPH_READ);
+    for (uint32_t i = 0; i < graphJob.pipeline.uavTensorCount; ++i)
+        bindTensor(job->dataGraphJobDescription.uavTensors[i], graphJob.pipeline.uavTensorBindings[i], FFX_RESOURCE_STATE_DATA_GRAPH_WRITE);
+    flushBarriers(backendContext, vkCommandBuffer);
+
+    pipelineLayout->mlGraph->Record(vkCommandBuffer, externals, externalCount);
+
+    // Image-aliased outputs: copy the packed NHWC buffer into the image (same texel layout, e.g. 4 x int8 -> RGBA8).
+    bool barrierDone = false;
+    for (uint32_t i = 0; i < graphJob.pipeline.uavTensorCount; ++i)
+    {
+        const FfxTensor& tensor = graphJob.uavTensors[i];
+        if (tensor.resource.internalIndex == 0)
+            continue;
+        const BackendContext_VK::Resource& resource = backendContext->pResources[tensor.resource.internalIndex];
+        if (resource.aliasedTensorImageResource == VK_NULL_HANDLE)
+            continue;
+
+        if (!barrierDone)
+        {
+            VkMemoryBarrier2 memoryBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                              nullptr,
+                                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                              VK_ACCESS_2_SHADER_WRITE_BIT,
+                                              VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                              VK_ACCESS_2_TRANSFER_READ_BIT};
+            VkDependencyInfo dependency   = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dependency.memoryBarrierCount = 1;
+            dependency.pMemoryBarriers    = &memoryBarrier;
+            VulkanWrapper().vkCmdPipelineBarrier2(vkCommandBuffer, &dependency);
+            barrierDone = true;
+        }
+
+        VkBufferImageCopy region           = {};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent                 = {resource.resourceDescription.width, resource.resourceDescription.height, 1};
+        VulkanWrapper().vkCmdCopyBufferToImage(
+            vkCommandBuffer, resource.aliasedTensorBufferResource, resource.aliasedTensorImageResource, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
+    return FFX_OK;
+}
+
 static FfxErrorCode executeGpuJobDataGraph(BackendContext_VK* backendContext, FfxGpuJobDescription* job, VkCommandBuffer vkCommandBuffer)
 {
     BackendContext_VK::PipelineLayout* pipelineLayout =
         reinterpret_cast<BackendContext_VK::PipelineLayout*>(job->dataGraphJobDescription.pipeline.rootSignature);
     FFX_ASSERT(pipelineLayout->effectContextId < backendContext->maxEffectContexts);
+
+    if (pipelineLayout->mlGraph)
+    {
+        return executeGpuJobDataGraphCompute(backendContext, job, pipelineLayout, vkCommandBuffer);
+    }
 
     const BackendContext_VK::EffectContext& effectContext = backendContext->pEffectContexts[pipelineLayout->effectContextId];
 

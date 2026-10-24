@@ -30,6 +30,21 @@
 
 ffxReturnCode_t CreateBackend(const ffxCreateContextDescHeader* desc, bool& backendFound, FfxInterface* iface, size_t contexts, Allocator& alloc)
 {
+#ifdef FFX_BACKEND_VK
+    // ML features must be known before the backend queries device capabilities.
+    VkDevice mlDevice = VK_NULL_HANDLE;
+    for (const auto* it = desc->pNext; it; it = it->pNext)
+    {
+        if (it->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK)
+            mlDevice = reinterpret_cast<const ffxCreateBackendVKDesc*>(it)->vkDevice;
+    }
+    for (const auto* it = desc->pNext; it; it = it->pNext)
+    {
+        if (it->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_ML_FEATURES && mlDevice != VK_NULL_HANDLE)
+            ffxSetMlDeviceFeaturesVK(mlDevice, reinterpret_cast<const ffxCreateBackendVKMlFeaturesDesc*>(it)->enabledFeatures);
+    }
+#endif  // FFX_BACKEND_VK
+
     for (const auto* it = desc->pNext; it; it = it->pNext)
     {
         switch (it->type)

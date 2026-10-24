@@ -100,6 +100,11 @@ NSSSample::NSSSample()
 	// ARM ML extensions
 	add_device_extension("VK_ARM_data_graph", true);
 	add_device_extension("VK_ARM_tensors", true);
+
+	// Native ML compute path for other vendors: their own matrix acceleration
+	// (NVIDIA tensor cores, AMD WMMA, Intel XMX) and int8 dot products.
+	add_device_extension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, true);
+	add_device_extension(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME, true);
 }
 
 void NSSSample::request_gpu_features(vkb::core::PhysicalDeviceC &gpu)
@@ -124,6 +129,38 @@ void NSSSample::request_gpu_features(vkb::core::PhysicalDeviceC &gpu)
 	REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceTensorFeaturesARM, shaderTensorAccess);
 	REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceTensorFeaturesARM, tensors);
 	REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceDataGraphFeaturesARM, dataGraph);
+
+	// ========================================
+	// Native ML compute path (devices without VK_ARM_data_graph)
+	// ========================================
+	auto bit = [](vk::Bool32 enabled, uint32_t flag) { return enabled ? flag : 0u; };
+
+	ml_features = 0;
+	ml_features |= FFX_API_VK_ML_FEATURE_SHADER_INT8;  // required above
+	ml_features |= bit(REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceVulkan12Features, storageBuffer8BitAccess), FFX_API_VK_ML_FEATURE_STORAGE_BUFFER_8BIT);
+	ml_features |= bit(REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceVulkan12Features, shaderFloat16), FFX_API_VK_ML_FEATURE_SHADER_FLOAT16);
+	ml_features |= bit(REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceVulkan11Features, storageBuffer16BitAccess), FFX_API_VK_ML_FEATURE_STORAGE_BUFFER_16BIT);
+	ml_features |= bit(REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceVulkan13Features, shaderIntegerDotProduct), FFX_API_VK_ML_FEATURE_INTEGER_DOT_PRODUCT);
+	if (REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceVulkan12Features, vulkanMemoryModel))
+	{
+		REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceVulkan12Features, vulkanMemoryModelDeviceScope);
+		ml_features |= FFX_API_VK_ML_FEATURE_VULKAN_MEMORY_MODEL;
+	}
+	if (REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceVulkan13Features, subgroupSizeControl) &&
+	    REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceVulkan13Features, computeFullSubgroups))
+	{
+		ml_features |= FFX_API_VK_ML_FEATURE_SUBGROUP_SIZE_CONTROL;
+	}
+	if (gpu.is_extension_supported(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME))
+	{
+		ml_features |= bit(REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceCooperativeMatrixFeaturesKHR, cooperativeMatrix), FFX_API_VK_ML_FEATURE_COOPERATIVE_MATRIX);
+	}
+	if (gpu.is_extension_supported(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME) &&
+	    REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceShaderBfloat16FeaturesKHR, shaderBFloat16Type) &&
+	    REQUEST_OPTIONAL_FEATURE(gpu, VkPhysicalDeviceShaderBfloat16FeaturesKHR, shaderBFloat16CooperativeMatrix))
+	{
+		ml_features |= FFX_API_VK_ML_FEATURE_SHADER_BFLOAT16;
+	}
 }
 
 static void OnNSSMessage(uint32_t type, const char *message)
@@ -195,8 +232,12 @@ void NSSSample::initialize_nss_context(const VkExtent2D &low_res_extent, const V
 	nss_desc.fpMessage             = OnNSSMessage;
 	nss_desc.qualityMode           = nss_quality_mode;
 
+	// Tell the SDK which ML features the device has enabled (native compute path on non-ARM GPUs).
+	ffx::CreateBackendVKMlFeaturesDesc mlFeaturesDesc{};
+	mlFeaturesDesc.enabledFeatures = ml_features;
+
 	// Create NSS context
-	ffx::ReturnCode result = ffx::CreateContext(nss_context, nullptr, nss_desc, backendDesc);
+	ffx::ReturnCode result = ffx::CreateContext(nss_context, nullptr, nss_desc, backendDesc, mlFeaturesDesc);
 	if (result != ffx::ReturnCode::Ok)
 	{
 		LOGW("Failed to create NSS context! Error code: {}, NSS features will be disabled", static_cast<uint32_t>(result));

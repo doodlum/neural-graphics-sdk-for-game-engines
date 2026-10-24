@@ -55,14 +55,6 @@ namespace ffx
         }
     }  // namespace detail
 
-    template <class First, class Second, class... Rest>
-    First* LinkHeaders(First& first, Second& second, Rest&... rest)
-    {
-        first.pNext = &second;
-        LinkHeaders(second, rest...);
-        return &first;
-    }
-
     template <class First, class Second>
     First* LinkHeaders(First& first, Second& second)
     {
@@ -76,6 +68,15 @@ namespace ffx
     {
         hdr.pNext = nullptr;
         return &hdr;
+    }
+
+    // Declared after the fixed-arity overloads so the recursive call can see them.
+    template <class First, class Second, class... Rest>
+    First* LinkHeaders(First& first, Second& second, Rest&... rest)
+    {
+        first.pNext = &second;
+        LinkHeaders(second, rest...);
+        return &first;
     }
 
     template <class... Desc>

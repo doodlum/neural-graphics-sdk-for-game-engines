@@ -51,6 +51,24 @@ struct ffxCreateBackendVKDesc
     PFN_vkGetInstanceProcAddr  vkGetInstanceProcAddr;
 };
 
+/// Optional, chained after ffxCreateBackendVKDesc: device features the application enabled for the native ML compute
+/// path used on devices without VK_ARM_data_graph (FFX_API_VK_ML_FEATURE_*, same values as FFX_VK_ML_FEATURE_* in ffx_vk.h).
+#define FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_ML_FEATURES 0x0000010u
+#define FFX_API_VK_ML_FEATURE_SHADER_INT8           (1u << 0)  ///< shaderInt8
+#define FFX_API_VK_ML_FEATURE_STORAGE_BUFFER_8BIT   (1u << 1)  ///< storageBuffer8BitAccess
+#define FFX_API_VK_ML_FEATURE_SHADER_FLOAT16        (1u << 2)  ///< shaderFloat16
+#define FFX_API_VK_ML_FEATURE_STORAGE_BUFFER_16BIT  (1u << 3)  ///< storageBuffer16BitAccess
+#define FFX_API_VK_ML_FEATURE_INTEGER_DOT_PRODUCT   (1u << 4)  ///< shaderIntegerDotProduct
+#define FFX_API_VK_ML_FEATURE_COOPERATIVE_MATRIX    (1u << 5)  ///< VK_KHR_cooperative_matrix cooperativeMatrix
+#define FFX_API_VK_ML_FEATURE_SHADER_BFLOAT16       (1u << 6)  ///< VK_KHR_shader_bfloat16 type + cooperative matrix
+#define FFX_API_VK_ML_FEATURE_SUBGROUP_SIZE_CONTROL (1u << 8)  ///< subgroupSizeControl + computeFullSubgroups
+#define FFX_API_VK_ML_FEATURE_VULKAN_MEMORY_MODEL   (1u << 9)  ///< vulkanMemoryModel
+struct ffxCreateBackendVKMlFeaturesDesc
+{
+    ffxCreateContextDescHeader header;
+    uint32_t                   enabledFeatures;  ///< combination of FFX_API_VK_ML_FEATURE_* flags
+};
+
 #define FFX_API_EFFECT_ID_FGSC_VK 0x00040000u
 
 #define FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK 0x40001u

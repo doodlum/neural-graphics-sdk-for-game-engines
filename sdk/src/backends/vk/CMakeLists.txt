@@ -234,6 +234,9 @@ if (FFX_NSS OR FFX_ALL)
 	include (CMakeShadersNSS.txt)
 endif()
 
+# Native compute execution of data graphs (all vendors without VK_ARM_data_graph)
+include (CMakeShadersML.txt)
+
 add_custom_target(ffx_shader_permutations_vk DEPENDS ${FFX_SC_PERMUTATION_OUTPUTS})
 add_dependencies(${FFX_SC_DEPENDENT_TARGET} ffx_shader_permutations_vk)
 

@@ -129,6 +129,52 @@ FFX_API size_t ffxGetScratchMemorySizeVK(VkDeviceContext& deviceContext, size_t 
 /// @ingroup VKBackend
 FFX_API FfxDevice ffxGetDeviceVK(VkDeviceContext* vkDeviceContext);
 
+/// Device features an application enabled on its <c><i>VkDevice</i></c> for the native ML compute path.
+///
+/// Devices without <c><i>VK_ARM_data_graph</i></c> run the neural networks with compute shaders that use the vendor's
+/// own ML acceleration: cooperative matrices (NVIDIA tensor cores, AMD WMMA, Intel XMX) or packed int8 dot products.
+/// Vulkan cannot report which features were enabled on a device, so the application declares them here. Without any
+/// declaration the backend uses a portable kernel that needs no optional features.
+///
+/// @ingroup VKBackend
+typedef enum FfxVkMlFeatureFlagBits
+{
+    FFX_VK_ML_FEATURE_SHADER_INT8           = (1u << 0),  ///< VkPhysicalDeviceShaderFloat16Int8Features::shaderInt8
+    FFX_VK_ML_FEATURE_STORAGE_BUFFER_8BIT   = (1u << 1),  ///< VkPhysicalDevice8BitStorageFeatures::storageBuffer8BitAccess
+    FFX_VK_ML_FEATURE_SHADER_FLOAT16        = (1u << 2),  ///< VkPhysicalDeviceShaderFloat16Int8Features::shaderFloat16
+    FFX_VK_ML_FEATURE_STORAGE_BUFFER_16BIT  = (1u << 3),  ///< VkPhysicalDevice16BitStorageFeatures::storageBuffer16BitAccess
+    FFX_VK_ML_FEATURE_INTEGER_DOT_PRODUCT   = (1u << 4),  ///< VkPhysicalDeviceShaderIntegerDotProductFeatures::shaderIntegerDotProduct
+    FFX_VK_ML_FEATURE_COOPERATIVE_MATRIX    = (1u << 5),  ///< VK_KHR_cooperative_matrix: cooperativeMatrix
+    FFX_VK_ML_FEATURE_SHADER_BFLOAT16       = (1u << 6),  ///< VK_KHR_shader_bfloat16: shaderBFloat16Type + shaderBFloat16CooperativeMatrix
+    FFX_VK_ML_FEATURE_SUBGROUP_SIZE_CONTROL = (1u << 8),  ///< subgroupSizeControl + computeFullSubgroups
+    FFX_VK_ML_FEATURE_VULKAN_MEMORY_MODEL   = (1u << 9),  ///< VkPhysicalDeviceVulkanMemoryModelFeatures::vulkanMemoryModel
+} FfxVkMlFeatureFlagBits;
+
+/// Declare the ML related features enabled on <c><i>device</i></c> (a combination of <c><i>FfxVkMlFeatureFlagBits</i></c>).
+/// Call this before creating effect contexts on the device.
+///
+/// @ingroup VKBackend
+FFX_API void ffxSetMlDeviceFeaturesVK(VkDevice device, uint32_t enabledFeatures);
+
+/// Report which of <c><i>FfxVkMlFeatureFlagBits</i></c> the physical device supports, and the device extensions that
+/// have to be enabled for them. Applications can use this to build their <c><i>VkDeviceCreateInfo</i></c>.
+///
+/// @param [in]  instance               The Vulkan instance.
+/// @param [in]  physicalDevice         The physical device.
+/// @param [in]  getInstanceProcAddr    vkGetInstanceProcAddr.
+/// @param [out] extensionNames         Optional array that receives up to <c><i>*extensionCount</i></c> extension names.
+/// @param [in,out] extensionCount      Capacity of <c><i>extensionNames</i></c> on input, number of required extensions on output.
+///
+/// @returns
+/// The supported <c><i>FfxVkMlFeatureFlagBits</i></c>.
+///
+/// @ingroup VKBackend
+FFX_API uint32_t ffxQueryMlDeviceFeaturesVK(VkInstance                instance,
+                                            VkPhysicalDevice          physicalDevice,
+                                            PFN_vkGetInstanceProcAddr getInstanceProcAddr,
+                                            const char**              extensionNames,
+                                            uint32_t*                 extensionCount);
+
 /// Populate an interface with pointers for the VK backend.
 ///
 /// @param [out] backendInterface           A pointer to a <c><i>FfxInterface</i></c> structure to populate with pointers.

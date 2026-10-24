@@ -274,6 +274,24 @@ struct HPPType<VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT>
 };
 
 template <>
+struct HPPType<VkPhysicalDeviceVulkan11Features>
+{
+	using Type = vk::PhysicalDeviceVulkan11Features;
+};
+
+template <>
+struct HPPType<VkPhysicalDeviceCooperativeMatrixFeaturesKHR>
+{
+	using Type = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR;
+};
+
+template <>
+struct HPPType<VkPhysicalDeviceShaderBfloat16FeaturesKHR>
+{
+	using Type = vk::PhysicalDeviceShaderBfloat16FeaturesKHR;
+};
+
+template <>
 struct HPPType<VkPhysicalDeviceVulkan12Features>
 {
 	using Type = vk::PhysicalDeviceVulkan12Features;
