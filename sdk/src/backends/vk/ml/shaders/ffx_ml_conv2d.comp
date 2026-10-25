@@ -51,7 +51,7 @@
 #extension GL_EXT_integer_dot_product : require
 #if ML_DOT4_TILED
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_ballot : require
 #endif
 #define RAW_INPUT 1
 #else
@@ -79,9 +79,8 @@ layout(constant_id = 52) const uint NT_PER_WG = 3;  // N tiles per workgroup; gl
 layout(constant_id = 53) const uint WG_Y = 1;   // workgroup rows (threads)
 layout(constant_id = 54) const int  PX   = 4;   // output pixels per thread along x
 layout(constant_id = 55) const int  OCB  = 16;  // output channels per thread (multiple of 4); gl_WorkGroupID.z picks the block
-layout(constant_id = 56) const int  KSPLIT = 1;     // adjacent lanes sharing one output tile, each summing every KSPLIT-th input word
-layout(constant_id = 57) const int  KSPLIT_LOG2 = 0;
-layout(local_size_x_id = 0, local_size_y_id = 53) in;
+layout(constant_id = 56) const int  KSPLIT = 1;  // subgroups sharing the workgroup's output tiles (local z), each summing every KSPLIT-th input word
+layout(local_size_x_id = 0, local_size_y_id = 53, local_size_z_id = 56) in;
 #else
 layout(local_size_x_id = 0) in;
 #endif
@@ -145,6 +144,10 @@ layout(constant_id = 48) const int S1_OFFSET_Y = 0;
 layout(constant_id = 49) const int S1_SCALE_X_N = 1;
 layout(constant_id = 50) const int S1_SCALE_X_D = 1;
 layout(constant_id = 51) const int S1_OFFSET_X = 0;
+
+// 1: the host verified every shift is >= 33 and double rounding is off. The rounding constant then lies entirely in the
+// high word of the 64-bit product, so (hi + 2^(shift-33)) >> (shift-32) is the exact TOSA result (no low word needed).
+layout(constant_id = 58) const int SCALE_HI_ONLY = 0;
 
 #define FLAG_DOUBLE_ROUND 1
 #define FLAG_PER_CHANNEL  2
@@ -263,7 +266,15 @@ int Epilogue(int acc, int oc)
     int pIndex     = ((FLAGS & FLAG_PER_CHANNEL) != 0) ? oc : 0;
     int multiplier = params[OC_PARAM_STRIDE() + pIndex];
     int shift      = params[2 * OC_PARAM_STRIDE() + pIndex];
-    int v          = ApplyScale32(acc - RESCALE_IN_ZP, multiplier, shift, (FLAGS & FLAG_DOUBLE_ROUND) != 0);
+    int v;
+    if (SCALE_HI_ONLY != 0)
+    {
+        int hi, lo;
+        imulExtended(acc - RESCALE_IN_ZP, multiplier, hi, lo);
+        v = (hi + (1 << (shift - 33))) >> (shift - 32);
+    }
+    else
+        v = ApplyScale32(acc - RESCALE_IN_ZP, multiplier, shift, (FLAGS & FLAG_DOUBLE_ROUND) != 0);
     v              = clamp(v + RESCALE_OUT_ZP, -128, 127);
     if ((FLAGS & FLAG_TABLE) != 0)
         v = TableLookup(v);
@@ -446,6 +457,7 @@ void main()
 // Weights are laid out [ocBlock][tap][icWord][OCB] (zero padded) so one tap/word step reads OCB consecutive words.
 // ---------------------------------------------------------------------------------------------------------
 const int COLS = (PX - 1) * STRIDE_X + (KERNEL_W - 1) * DILATION_X + 1;
+shared int sRed[KSPLIT > 1 ? KSPLIT * PX * OCB * int(WG_SIZE * WG_Y) : 1];  // KSPLIT partial sums
 
 int Dot4(uint a, uint b)
 {
@@ -467,8 +479,11 @@ int Dot4(uint a, uint b)
 
 void main()
 {
-    const int kp      = int(gl_LocalInvocationID.x) & (KSPLIT - 1);  // this lane's share of the input words
-    const int ox0     = (int(gl_GlobalInvocationID.x) >> KSPLIT_LOG2) * PX;
+    // KSPLIT > 1: the workgroup is KSPLIT subgroups (one per local z), all covering the same WG_SIZE x WG_Y tiles. The
+    // host only uses it when one z slice is exactly one subgroup, so kp is subgroup-uniform; the broadcast tells the
+    // compiler, which keeps the weight addresses scalar.
+    const int kp      = KSPLIT > 1 ? int(subgroupBroadcastFirst(gl_LocalInvocationID.z)) : 0;
+    const int ox0     = int(gl_GlobalInvocationID.x) * PX;
     const int oy      = int(gl_GlobalInvocationID.y);
     const int ocBlock = int(gl_WorkGroupID.z);
     const int cy      = min(oy, OUT_H - 1);  // out-of-range threads compute a valid row and skip the store
@@ -549,29 +564,36 @@ void main()
         }
     }
 
-    // KSPLIT > 1: reduce-scatter the partial sums across the KSPLIT lanes (exact integer adds). After step s a lane keeps
-    // the half of its current range selected by bit s of kp, so in the end each lane owns PX * OCB / KSPLIT finished sums,
-    // starting at accOffset of the flattened [PX][OCB] tile, and runs the epilogue for those only.
-    int accOffset = 0;
-    [[unroll]] for (int st = 0; st < KSPLIT_LOG2; ++st)
+    // KSPLIT > 1: every subgroup stores its partial sums to shared memory, then subgroup kp finishes the slice
+    // [kp * FIN, (kp + 1) * FIN) of the flattened [PX][OCB] tile (exact integer adds) and runs the epilogue for it.
+    const int FIN = (PX * OCB) / KSPLIT;  // finished sums per thread (multiple of 4)
+    int       fin[FIN];
+    if (KSPLIT > 1)
     {
-        const int  hn    = (PX * OCB) >> (st + 1);
-        const bool upper = ((kp >> st) & 1) != 0;
-        [[unroll]] for (int i = 0; i < hn; ++i)
+        const uint tileThreads = WG_SIZE * WG_Y;
+        const uint t           = gl_LocalInvocationID.y * WG_SIZE + gl_LocalInvocationID.x;
+        [[unroll]] for (int i = 0; i < PX * OCB; ++i)
+            sRed[(uint(kp * PX * OCB + i)) * tileThreads + t] = acc[i];
+        barrier();
+        [[unroll]] for (int i = 0; i < FIN; ++i)
         {
-            const int keep = upper ? acc[hn + i] : acc[i];
-            const int send = upper ? acc[i] : acc[hn + i];
-            acc[i]         = keep + subgroupShuffleXor(send, 1u << st);
+            int sum = 0;
+            [[unroll]] for (int k = 0; k < KSPLIT; ++k)
+                sum += sRed[uint(k * PX * OCB + kp * FIN + i) * tileThreads + t];
+            fin[i] = sum;
         }
-        accOffset += upper ? hn : 0;
+    }
+    else
+    {
+        [[unroll]] for (int i = 0; i < FIN; ++i)
+            fin[i] = acc[i];
     }
 
     if (oy >= OUT_H)
         return;
-    const int FIN = (PX * OCB) >> KSPLIT_LOG2;  // finished sums owned by this lane (multiple of 4)
     [[unroll]] for (int q = 0; q < FIN / 4; ++q)
     {
-        const int idx = accOffset + q * 4;  // flattened [PX][OCB] index; 4 consecutive channels of one pixel
+        const int idx = kp * FIN + q * 4;  // flattened [PX][OCB] index; 4 consecutive channels of one pixel
         const int p   = idx / OCB;
         const int oc  = ocBlock * OCB + (idx - p * OCB);
         const int ox  = ox0 + p;
@@ -581,7 +603,7 @@ void main()
         [[unroll]] for (int j = 0; j < 4; ++j)
         {
             if (oc + j < OUT_C)
-                r[j] = Epilogue(acc[q * 4 + j] + params[oc + j], oc + j);
+                r[j] = Epilogue(fin[q * 4 + j] + params[oc + j], oc + j);
         }
         dst[((oy * OUT_W + ox) * OUT_STRIDE + oc) >> 2] = PackResult(r);
     }
