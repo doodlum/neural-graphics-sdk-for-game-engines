@@ -92,6 +92,7 @@ namespace ffx_ml
         uint32_t subgroupSize = 0;   // subgroup size the kernel is built for
         bool     requireSubgroupSize = false;
         uint32_t workgroupSize = 0;  // threads per workgroup (dot4 / scalar)
+        bool     dot4Tiled     = false;  // dot4 path: register-tiled kernel (see VendorTuning in ffx_vk_ml_runtime.cpp)
         std::string deviceName;
 
         std::string Describe() const;

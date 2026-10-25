@@ -12,6 +12,7 @@
 // Kernels, compiled from shaders/ffx_ml_conv2d.comp at build time.
 #include "ffx_ml_conv2d_scalar_spv.h"
 #include "ffx_ml_conv2d_dot4_spv.h"
+#include "ffx_ml_conv2d_dot4_tiled_spv.h"
 #include "ffx_ml_conv2d_coopmat_int8_spv.h"
 #include "ffx_ml_conv2d_coopmat_fp16_spv.h"
 #include "ffx_ml_conv2d_coopmat_bf16_spv.h"
@@ -124,6 +125,14 @@ namespace ffx_ml
             uint32_t vectorWorkgroup;     // workgroup size for dot4 / scalar kernels
             MatType  matOrder[3];         // coop-matrix element types to try, fastest first (all exact)
             uint32_t splitTargetGroups;   // coop layers with fewer workgroups split their output channels (grid z)
+            // Register-tiled dot4 kernel (ML_DOT4_TILED). 0 keeps the one-thread-per-(pixel, 4 channels) kernel.
+            uint32_t dot4Tiled;           // 1: use the tiled kernel
+            uint32_t dot4Subgroup;        // subgroup size to require for it (0 = driver default)
+            uint32_t dot4Px;              // output pixels per thread along x
+            uint32_t dot4Ocb;             // max output channels per thread
+            uint32_t dot4WgX, dot4WgY;    // workgroup shape in threads
+            uint32_t dot4TargetThreads;   // layers with fewer threads get narrower tiles (fewer pixels / channels per thread)
+            uint32_t dot4KsplitMax;       // max lanes splitting one tile's input words (1 = off)
         };
 
         VendorTuning TuningFor(Vendor vendor)
@@ -135,7 +144,9 @@ namespace ffx_ml
                 // a split target of 128 workgroups (~2 per SM) was best; see docs/nss_gpu_tuning.md.
                 return {4, 32, 16, 128, {MatType::Fp16, MatType::Bf16, MatType::Int8}, 128};
             case Vendor::Amd:
-                return {4, 32, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};   // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned)
+                // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned). RDNA2 (no WMMA) takes the tiled dot4 kernel, tuned on the
+                // Steam Deck (Van Gogh); see docs/nss_gpu_tuning.md.
+                return {4, 32, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128, 1, 64, 1, 32, 8, 8, 0, 1};
             case Vendor::Intel:
                 return {8, 16, 8, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};    // Xe XMX systolic arrays, SIMD16 with 8xNxK tiles (untuned)
             default:
@@ -266,6 +277,10 @@ namespace ffx_ml
         {
             s += " " + std::string(ToString(matType)) + " " + std::to_string(tileM) + "x" + std::to_string(tileN) + "x" + std::to_string(tileK) +
                  ", " + std::to_string(numSubgroups) + " subgroups of " + std::to_string(subgroupSize);
+        }
+        else if (dot4Tiled)
+        {
+            s += " tiled, subgroup " + std::to_string(subgroupSize);
         }
         else
         {
@@ -455,6 +470,19 @@ namespace ffx_ml
         {
             sel.path          = Path::Dot4;
             sel.workgroupSize = tuning.vectorWorkgroup;
+            sel.dot4Tiled     = tuning.dot4Tiled != 0;
+            if (const char* e = getenv("FFX_ML_DOT4_TILED"))
+                sel.dot4Tiled = atoi(e) != 0;
+            uint32_t sgSize = tuning.dot4Subgroup;
+            if (const char* e = getenv("FFX_ML_DOT4_SUBGROUP"))
+                sgSize = uint32_t(atoi(e));
+            sel.subgroupSize = subgroup.subgroupSize;
+            if (sel.dot4Tiled && (features & FEATURE_SUBGROUP_SIZE_CONTROL) && sgSize != 0 && sgSize >= sizeControl.minSubgroupSize &&
+                sgSize <= sizeControl.maxSubgroupSize && (sizeControl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
+            {
+                sel.subgroupSize        = sgSize;
+                sel.requireSubgroupSize = true;
+            }
             return sel;
         }
 
@@ -578,6 +606,63 @@ namespace ffx_ml
             return fn.BindBufferMemory(ctx.device, a.buffer, a.memory, 0) == VK_SUCCESS;
         }
 
+        struct Dot4Tile
+        {
+            uint32_t px, ocb, blocks, wgX, wgY, ksplit;
+        };
+
+        Dot4Tile ChooseDot4Tile(const FusedConv& fc, const tosa::Node& conv) const
+        {
+            (void)conv;
+            const VendorTuning t   = TuningFor(selection.vendor);
+            auto               env = [](const char* name, uint32_t def) {
+                const char* e = getenv(name);
+                return e ? uint32_t(atoi(e)) : def;
+            };
+            Dot4Tile tile;
+            tile.wgX                = std::max(1u, env("FFX_ML_DOT4_WGX", t.dot4WgX ? t.dot4WgX : 8));
+            tile.wgY                = std::max(1u, env("FFX_ML_DOT4_WGY", t.dot4WgY ? t.dot4WgY : 8));
+            uint32_t       px       = std::max(1u, env("FFX_ML_DOT4_PX", t.dot4Px ? t.dot4Px : 4));
+            const uint32_t ocbMax   = std::max(4u, env("FFX_ML_DOT4_OCB", t.dot4Ocb ? t.dot4Ocb : 16)) & ~3u;
+            const uint32_t target   = env("FFX_ML_DOT4_TARGET_THREADS", t.dot4TargetThreads);
+            const uint32_t oc4      = RoundUp(uint32_t(fc.outC), 4);
+            tile.blocks             = (oc4 + ocbMax - 1) / ocbMax;
+            tile.ocb                = RoundUp((oc4 + tile.blocks - 1) / tile.blocks, 4);
+            auto threads            = [&](uint32_t p, uint32_t blocks) { return ((uint32_t(fc.outW) + p - 1) / p) * uint32_t(fc.outH) * blocks; };
+            // Small layers: fewer pixels per thread first, then narrower channel blocks, until the target thread count is met.
+            while (target && px > 1 && threads(px, tile.blocks) < target)
+                px /= 2;
+            while (target && tile.ocb > 4 && threads(px, tile.blocks) < target)
+            {
+                const uint32_t ocb = tile.ocb / 2 >= 4 ? RoundUp(tile.ocb / 2, 4) : 4;
+                tile.blocks        = (oc4 + ocb - 1) / ocb;
+                tile.ocb           = RoundUp((oc4 + tile.blocks - 1) / tile.blocks, 4);
+            }
+            tile.px = px;
+            // Input-word split across adjacent lanes (exact subgroup reduction): shortens each thread's serial chain on layers
+            // too small to fill the GPU. The lanes of a tile must share a subgroup and own whole packed words after the
+            // reduce-scatter, so KSPLIT divides the subgroup size and PX * OCB / KSPLIT stays a multiple of 4.
+            uint32_t       k       = 1;
+            const uint32_t kMax    = env("FFX_ML_DOT4_KSPLIT_MAX", t.dot4KsplitMax);
+            const uint32_t icWords = (uint32_t(fc.inC) + 3) / 4;
+            while (k < kMax && k * 2 <= icWords && (tile.px * tile.ocb) % (8 * k) == 0 && threads(px, tile.blocks) * k < target)
+                k *= 2;
+            if (const char* e = getenv("FFX_ML_DOT4_KSPLIT"))
+            {
+                k = 1;
+                while (k * 2 <= uint32_t(atoi(e)) && (tile.px * tile.ocb) % (8 * k) == 0)
+                    k *= 2;
+            }
+            tile.ksplit = k;
+            if (k > 1)
+            {
+                // One row of lanes per workgroup, a whole number of subgroups wide (full subgroups are required).
+                tile.wgX = std::max(tile.wgX * tile.wgY, selection.subgroupSize ? selection.subgroupSize : 64u);
+                tile.wgY = 1;
+            }
+            return tile;
+        }
+
         const uint32_t* KernelCode(size_t& bytes) const
         {
             switch (selection.path)
@@ -598,6 +683,11 @@ namespace ffx_ml
                     return nullptr;
                 }
             case Path::Dot4:
+                if (selection.dot4Tiled)
+                {
+                    bytes = sizeof(ffx_ml_conv2d_dot4_tiled);
+                    return ffx_ml_conv2d_dot4_tiled;
+                }
                 bytes = sizeof(ffx_ml_conv2d_dot4);
                 return ffx_ml_conv2d_dot4;
             default:
@@ -681,6 +771,12 @@ namespace ffx_ml
                     return conv.weights[(size_t(oc) * taps + tap) * IC + ic];
                 };
 
+                // Tiled dot4: pixels and output channels per thread, output-channel blocks (grid z), workgroup shape.
+                const bool tiled = selection.path == Path::Dot4 && selection.dot4Tiled;
+                Dot4Tile   tile  = {};
+                if (tiled)
+                    tile = ChooseDot4Tile(fc, conv);
+
                 // Weights
                 align(64);
                 layer.weightsOffset = constants.size();
@@ -717,6 +813,23 @@ namespace ffx_ml
                                     break;
                                 }
                             }
+                }
+                else if (tiled)
+                {
+                    // [ocBlock][tap][icWord][OCB] words, zero padded past OC.
+                    const uint32_t icWords = icPad / 4;
+                    const size_t   base    = constants.size();
+                    constants.resize(base + size_t(tile.blocks) * tile.ocb * taps * icWords * 4, 0);
+                    for (uint32_t oc = 0; oc < OC; ++oc)
+                    {
+                        const uint32_t blk = oc / tile.ocb, o = oc % tile.ocb;
+                        for (uint32_t tap = 0; tap < taps; ++tap)
+                            for (uint32_t ic = 0; ic < IC; ++ic)
+                            {
+                                const size_t word = ((size_t(blk) * taps + tap) * icWords + ic / 4) * tile.ocb + o;
+                                constants[base + word * 4 + (ic & 3)] = uint8_t(int8_t(weightAt(oc, tap, ic)));
+                            }
+                    }
                 }
                 else
                 {
@@ -818,7 +931,18 @@ namespace ffx_ml
                     const uint32_t weightBudget = getenv("FFX_ML_WEIGHTS_SHARED_LIMIT") ? uint32_t(atoi(getenv("FFX_ML_WEIGHTS_SHARED_LIMIT"))) : 0u;
                     weightsShared = sharedBytes(tileRows, true) <= std::min(sharedMemoryLimit, weightBudget) ? 1u : 0u;
                 }
-                spec(0, int32_t(coop ? selection.numSubgroups * selection.subgroupSize : selection.workgroupSize));
+                spec(0, int32_t(coop ? selection.numSubgroups * selection.subgroupSize : tiled ? tile.wgX : selection.workgroupSize));
+                if (tiled)
+                {
+                    spec(53, int32_t(tile.wgY));
+                    spec(54, int32_t(tile.px));
+                    spec(55, int32_t(tile.ocb));
+                    spec(56, int32_t(tile.ksplit));
+                    uint32_t log2k = 0;
+                    while ((1u << log2k) < tile.ksplit)
+                        ++log2k;
+                    spec(57, int32_t(log2k));
+                }
                 if (coop)
                 {
                     spec(1, int32_t(selection.tileM));
@@ -891,6 +1015,13 @@ namespace ffx_ml
                     pipeInfo.stage.pNext = &requiredSize;
                     pipeInfo.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
                 }
+                else if (tiled && selection.requireSubgroupSize)
+                {
+                    // Full subgroups need the workgroup X size to be a multiple of the subgroup size (always true with KSPLIT > 1).
+                    pipeInfo.stage.pNext = &requiredSize;
+                    if (tile.wgX % selection.subgroupSize == 0)
+                        pipeInfo.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+                }
                 pipeInfo.layout = pipelineLayout;
                 if (fn.CreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &layer.pipeline) != VK_SUCCESS)
                     return fail("vkCreateComputePipelines failed for layer " + std::to_string(li));
@@ -902,6 +1033,13 @@ namespace ffx_ml
                     layer.groups[0]      = (uint32_t(fc.outW) + selection.tileM - 1) / selection.tileM;
                     layer.groups[1]      = (uint32_t(fc.outH) + tileH - 1) / tileH;
                     layer.groups[2]      = (ocPad / selection.tileN) / ntPerWorkgroup;
+                }
+                else if (tiled)
+                {
+                    const uint32_t threadsX = (uint32_t(fc.outW) + tile.px - 1) / tile.px * tile.ksplit;
+                    layer.groups[0]         = (threadsX + tile.wgX - 1) / tile.wgX;
+                    layer.groups[1]         = (uint32_t(fc.outH) + tile.wgY - 1) / tile.wgY;
+                    layer.groups[2]         = tile.blocks;
                 }
                 else
                 {
