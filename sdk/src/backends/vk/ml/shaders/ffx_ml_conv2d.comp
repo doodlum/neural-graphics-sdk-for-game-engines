@@ -27,18 +27,21 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_8bit_storage : require
 #define MAT_T  int8_t
+#define VEC4_T i8vec4
 #define ACC_T  int32_t
 #define RAW_INPUT 1  // A holds raw int8 activations; the zero point is folded into the bias on the CPU
 #elif ML_MAT_FP16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #define MAT_T  float16_t
+#define VEC4_T f16vec4
 #define ACC_T  float
 #define RAW_INPUT 0
 #elif ML_MAT_BF16
 #extension GL_EXT_bfloat16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #define MAT_T  bfloat16_t
+#define VEC4_T bf16vec4
 #define ACC_T  float
 #define RAW_INPUT 0
 #endif
@@ -61,7 +64,9 @@ layout(constant_id = 4) const uint NUM_SG  = 4;    // subgroups per workgroup, e
 layout(constant_id = 5) const uint NUM_NT  = 3;    // OC_PAD / TILE_N
 layout(constant_id = 6) const uint OC_PAD  = 48;   // output channels padded to TILE_N
 layout(constant_id = 7) const uint IC_PAD  = 32;   // input channels padded to TILE_K
-const uint TILE_P = TILE_M * NUM_SG;               // pixels per workgroup
+layout(constant_id = 8) const uint TILE_ROWS = 2;  // output rows per subgroup
+layout(constant_id = 9) const uint WEIGHTS_SHARED = 0;  // 1: the layer's weights are staged into shared memory
+layout(constant_id = 52) const uint NT_PER_WG = 3;  // N tiles per workgroup; gl_WorkGroupID.z picks the group of N tiles
 #endif
 
 layout(local_size_x_id = 0) in;
@@ -73,6 +78,7 @@ layout(set = 0, binding = 0, std430) readonly buffer Src0 { uint src0[]; };
 layout(set = 0, binding = 1, std430) readonly buffer Src1 { uint src1[]; };
 #if ML_PATH_COOPMAT
 layout(set = 0, binding = 2, std430) readonly buffer Weights { MAT_T weights[]; };  // [tap][IC_PAD][OC_PAD]
+layout(set = 0, binding = 2, std430) readonly buffer WeightsVec { VEC4_T weightsVec[]; };  // same data, 4 per element
 #else
 layout(set = 0, binding = 2, std430) readonly buffer Weights { uint weights[]; };   // [OC][tap][IC_PAD/4] packed int8
 #endif
@@ -257,106 +263,162 @@ uint PackResult(ivec4 v)
 #if ML_PATH_COOPMAT
 // ---------------------------------------------------------------------------------------------------------
 // Cooperative-matrix implicit GEMM: M = pixels, N = output channels, K = taps x input channels.
+//
+// A workgroup owns a 2D output tile: TILE_M pixels wide (one coop-matrix row block) and NUM_SG * TILE_ROWS rows.
+// The input patch the tile needs (with halo, after resize/concat/padding) is staged into shared memory once; every
+// tap's A matrix is then read straight from the patch with coopMatLoad (row stride = STRIDE_X * IC_PAD), so the
+// main loop has no barriers and no global loads besides the (cached) weights.
 // ---------------------------------------------------------------------------------------------------------
-shared MAT_T sA[TILE_P * TILE_K];
-shared ACC_T sC[TILE_P * OC_PAD];
+const uint TILE_H   = NUM_SG * TILE_ROWS;
+const uint PATCH_W  = (TILE_M - 1) * uint(STRIDE_X) + uint(KERNEL_W - 1) * uint(DILATION_X) + 1;
+const uint PATCH_H  = (TILE_H - 1) * uint(STRIDE_Y) + uint(KERNEL_H - 1) * uint(DILATION_Y) + 1;
 
-void StageWord(uint dstIndex, uint word)
+// Shared arrays use the matrix element type (coopMatLoad of vector-typed arrays is not portable); offsets and
+// strides are in elements. Staging writes the four elements of each packed word.
+const uint IC_VEC   = IC_PAD / 4;
+const uint OC_VEC   = OC_PAD / 4;
+const uint W_VEC    = WEIGHTS_SHARED != 0 ? uint(KERNEL_H * KERNEL_W) * IC_PAD * OC_VEC : 1;
+
+shared MAT_T sPatch[PATCH_H * PATCH_W * IC_PAD];
+shared MAT_T sW[W_VEC * 4];
+shared ACC_T sC[NUM_SG * TILE_M * OC_PAD];
+
+void Store4(uint index, VEC4_T v, bool weightsArray)
+{
+    if (weightsArray)
+    {
+        sW[index + 0] = v.x;
+        sW[index + 1] = v.y;
+        sW[index + 2] = v.z;
+        sW[index + 3] = v.w;
+    }
+    else
+    {
+        sPatch[index + 0] = v.x;
+        sPatch[index + 1] = v.y;
+        sPatch[index + 2] = v.z;
+        sPatch[index + 3] = v.w;
+    }
+}
+
+VEC4_T ToMat(uint word)
 {
 #if ML_MAT_INT8
-    i8vec4 v = unpack8(int(word));
-    sA[dstIndex + 0] = v.x;
-    sA[dstIndex + 1] = v.y;
-    sA[dstIndex + 2] = v.z;
-    sA[dstIndex + 3] = v.w;
+    return VEC4_T(unpack8(int(word)));
 #else
     // Float paths consume (x - zp), which is exactly representable for int8 data.
     ivec4 v = ivec4(bitfieldExtract(int(word), 0, 8), bitfieldExtract(int(word), 8, 8), bitfieldExtract(int(word), 16, 8), bitfieldExtract(int(word), 24, 8)) - INPUT_ZP;
-    sA[dstIndex + 0] = MAT_T(float(v.x));
-    sA[dstIndex + 1] = MAT_T(float(v.y));
-    sA[dstIndex + 2] = MAT_T(float(v.z));
-    sA[dstIndex + 3] = MAT_T(float(v.w));
+    return VEC4_T(vec4(v));
 #endif
 }
 
 void main()
 {
-    const uint numPixels = uint(OUT_H * OUT_W);
-    const uint tileBase  = gl_WorkGroupID.x * TILE_P;
-    const uint sg        = gl_SubgroupID;
+    const int  tileX0 = int(gl_WorkGroupID.x * TILE_M);
+    const int  tileY0 = int(gl_WorkGroupID.y * TILE_H);
+    const uint sg     = gl_SubgroupID;
+    const uint ntBase = gl_WorkGroupID.z * NT_PER_WG;  // first output-channel tile of this workgroup
 
-    coopmat<ACC_T, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> acc[NUM_NT];
-    [[unroll]] for (uint nt = 0; nt < NUM_NT; ++nt)
-        acc[nt] = coopmat<ACC_T, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(ACC_T(0));
-
-    const uint wordsPerRow  = TILE_K / 4;
-    const uint stageWords   = TILE_P * wordsPerRow;
-    const int  numTaps      = KERNEL_H * KERNEL_W;
-    const uint kChunks      = IC_PAD / TILE_K;
-
-    for (int tap = 0; tap < numTaps; ++tap)
+    // 1) Stage the input patch: PATCH_H x PATCH_W pixels x IC_PAD channels, one packed word (4 channels) per item.
+    const uint wordsPerPixel = IC_PAD / 4;
+    const uint patchWords    = PATCH_H * PATCH_W * wordsPerPixel;
+    const int  inY0          = tileY0 * STRIDE_Y - PAD_TOP;
+    const int  inX0          = tileX0 * STRIDE_X - PAD_LEFT;
+    // All of a thread's global loads are issued before any shared store, so their latencies overlap.
+    const uint STAGE_ITERS = (PATCH_H * PATCH_W * (IC_PAD / 4) + WG_SIZE - 1) / WG_SIZE;
+    uint       staged[STAGE_ITERS];
+    [[unroll]] for (uint k = 0; k < STAGE_ITERS; ++k)
     {
-        const int ky = tap / KERNEL_W;
-        const int kx = tap - ky * KERNEL_W;
-        for (uint kc = 0; kc < kChunks; ++kc)
+        const uint i = gl_LocalInvocationID.x + k * WG_SIZE;
+        staged[k]    = 0u;
+        if (i < patchWords)
         {
-            // Stage the A tile (TILE_P pixels x TILE_K channels) into shared memory.
-            for (uint i = gl_LocalInvocationID.x; i < stageWords; i += WG_SIZE)
-            {
-                const uint p     = i / wordsPerRow;
-                const uint w     = i - p * wordsPerRow;
-                const uint pixel = tileBase + p;
-                uint       word  = ZpWord();
-                if (pixel < numPixels)
-                {
-                    const int oy = int(pixel) / OUT_W;
-                    const int ox = int(pixel) - oy * OUT_W;
-                    const int vy = oy * STRIDE_Y - PAD_TOP + ky * DILATION_Y;
-                    const int vx = ox * STRIDE_X - PAD_LEFT + kx * DILATION_X;
-                    word         = FetchWord(vy, vx, int(kc * TILE_K + w * 4));
-                }
-                StageWord(p * TILE_K + w * 4, word);
-            }
-            barrier();
-
-            coopmat<MAT_T, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> a;
-            coopMatLoad(a, sA, sg * TILE_M * TILE_K, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
-
-            const uint wBase = (uint(tap) * IC_PAD + kc * TILE_K) * OC_PAD;
-            [[unroll]] for (uint nt = 0; nt < NUM_NT; ++nt)
-            {
-                coopmat<MAT_T, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> b;
-                coopMatLoad(b, weights, wBase + nt * TILE_N, OC_PAD, gl_CooperativeMatrixLayoutRowMajor);
-                acc[nt] = coopMatMulAdd(a, b, acc[nt]);
-            }
-            barrier();
+            const uint pixel = i / wordsPerPixel;
+            const uint w     = i - pixel * wordsPerPixel;
+            const uint py    = pixel / PATCH_W;
+            const uint px    = pixel - py * PATCH_W;
+            staged[k]        = FetchWord(inY0 + int(py), inX0 + int(px), int(w * 4));
         }
     }
-
-    [[unroll]] for (uint nt = 0; nt < NUM_NT; ++nt)
-        coopMatStore(acc[nt], sC, sg * TILE_M * OC_PAD + nt * TILE_N, OC_PAD, gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (uint k = 0; k < STAGE_ITERS; ++k)
+    {
+        const uint i = gl_LocalInvocationID.x + k * WG_SIZE;
+        if (i < patchWords)
+            Store4(i * 4, ToMat(staged[k]), false);
+    }
+    if (WEIGHTS_SHARED != 0)
+    {
+        for (uint i = gl_LocalInvocationID.x; i < W_VEC; i += WG_SIZE)
+            Store4(i * 4, weightsVec[i], true);
+    }
     barrier();
 
-    // Epilogue: each thread produces one packed word (4 output channels of one pixel).
-    const uint wordsPerPixel = uint(OUT_C + 3) / 4;
-    for (uint i = gl_LocalInvocationID.x; i < TILE_P * wordsPerPixel; i += WG_SIZE)
+    // 2) Each subgroup computes TILE_ROWS rows of TILE_M pixels x NT_PER_WG * TILE_N channels.
+    const int  numTaps = KERNEL_H * KERNEL_W;
+    const uint kChunks = IC_PAD / TILE_K;
+    const uint rowStride = uint(STRIDE_X) * IC_PAD;  // elements between neighbouring output pixels in the patch
+    const uint wordBegin = ntBase * TILE_N / 4;
+    const uint wordEnd   = min(uint(OUT_C + 3) / 4, (ntBase + NT_PER_WG) * TILE_N / 4);
+    const uint outWords  = wordEnd - wordBegin;
+    const uint cBase     = sg * TILE_M * OC_PAD;
+
+    for (uint r = 0; r < TILE_ROWS; ++r)
     {
-        const uint p     = i / wordsPerPixel;
-        const uint w     = i - p * wordsPerPixel;
-        const uint pixel = tileBase + p;
-        if (pixel >= numPixels)
-            continue;
-        ivec4 r = ivec4(0);
-        [[unroll]] for (uint j = 0; j < 4; ++j)
+        const uint localRow = sg * TILE_ROWS + r;
+        const int  oy       = tileY0 + int(localRow);
+        if (oy >= OUT_H)
+            break;
+
+        coopmat<ACC_T, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> acc[NT_PER_WG];
+        [[unroll]] for (uint nt = 0; nt < NT_PER_WG; ++nt)
+            acc[nt] = coopmat<ACC_T, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(ACC_T(0));
+
+        for (int tap = 0; tap < numTaps; ++tap)
         {
-            const int oc = int(w * 4 + j);
-            if (oc < OUT_C)
+            const int  ky        = tap / KERNEL_W;
+            const int  kx        = tap - ky * KERNEL_W;
+            const uint patchBase = ((localRow * uint(STRIDE_Y) + uint(ky * DILATION_Y)) * PATCH_W + uint(kx * DILATION_X)) * IC_PAD;
+            for (uint kc = 0; kc < kChunks; ++kc)
             {
-                const int accI = int(sC[p * OC_PAD + oc]) + params[oc];
-                r[j]           = Epilogue(accI, oc);
+                coopmat<MAT_T, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> a;
+                coopMatLoad(a, sPatch, patchBase + kc * TILE_K, rowStride, gl_CooperativeMatrixLayoutRowMajor);
+
+                const uint wBase = (uint(tap) * IC_PAD + kc * TILE_K) * OC_PAD + ntBase * TILE_N;
+                [[unroll]] for (uint nt = 0; nt < NT_PER_WG; ++nt)
+                {
+                    coopmat<MAT_T, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> b;
+                    if (WEIGHTS_SHARED != 0)
+                        coopMatLoad(b, sW, wBase + nt * TILE_N, OC_PAD, gl_CooperativeMatrixLayoutRowMajor);
+                    else
+                        coopMatLoad(b, weights, wBase + nt * TILE_N, OC_PAD, gl_CooperativeMatrixLayoutRowMajor);
+                    acc[nt] = coopMatMulAdd(a, b, acc[nt]);
+                }
             }
         }
-        dst[(pixel * uint(OUT_STRIDE) + w * 4) >> 2] = PackResult(r);
+
+        // 3) Epilogue for this row, within the subgroup: accumulators -> shared -> rescale (+ table) -> packed int8.
+        [[unroll]] for (uint nt = 0; nt < NT_PER_WG; ++nt)
+            coopMatStore(acc[nt], sC, cBase + (ntBase + nt) * TILE_N, OC_PAD, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        for (uint i = gl_SubgroupInvocationID; i < TILE_M * outWords; i += gl_SubgroupSize)
+        {
+            const uint p  = i / outWords;
+            const uint w  = wordBegin + i - p * outWords;
+            const int  ox = tileX0 + int(p);
+            if (ox >= OUT_W)
+                continue;
+            ivec4 res = ivec4(0);
+            [[unroll]] for (uint j = 0; j < 4; ++j)
+            {
+                const int oc = int(w * 4 + j);
+                if (oc < OUT_C)
+                    res[j] = Epilogue(int(sC[cBase + p * OC_PAD + uint(oc)]) + params[oc], oc);
+            }
+            dst[((uint(oy) * uint(OUT_W) + uint(ox)) * uint(OUT_STRIDE) + w * 4) >> 2] = PackResult(res);
+        }
+        subgroupBarrier();
     }
 }
 

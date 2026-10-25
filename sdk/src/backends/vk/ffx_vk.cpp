@@ -50,6 +50,9 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
+#include <string>
 // For graph shape inference
 #include "spirv-tools/libspirv.hpp"
 #include "spirv/unified1/spirv.hpp11"
@@ -8246,6 +8249,116 @@ static FfxErrorCode executeGpuJobClearUint(BackendContext_VK* backendContext, Ff
     return FFX_OK;
 }
 
+// Optional per-job GPU timing for tuning (FFX_PROFILE_PASSES=<output file>). A timestamp is written after every job;
+// results are read back a few executions later and the per-label medians are rewritten to the file periodically.
+namespace
+{
+    struct JobProfiler
+    {
+        static constexpr uint32_t kSlots = 8, kMaxQueries = 64;
+
+        VkDevice                       device = VK_NULL_HANDLE;
+        VkQueryPool                    pool   = VK_NULL_HANDLE;
+        float                          periodNs = 1.0f;
+        uint64_t                       executions = 0;
+        std::vector<std::string>       labels[kSlots];
+        std::map<std::string, std::vector<float>> samples;
+        std::vector<std::string>       order;
+        PFN_vkCmdWriteTimestamp        cmdWriteTimestamp  = nullptr;
+        PFN_vkCmdResetQueryPool        cmdResetQueryPool  = nullptr;
+        PFN_vkGetQueryPoolResults      getQueryPoolResults = nullptr;
+
+        static JobProfiler* Get(VkDevice device, VkPhysicalDevice physicalDevice)
+        {
+            static const char* path = getenv("FFX_PROFILE_PASSES");
+            if (!path || !*path)
+                return nullptr;
+            static JobProfiler profiler;
+            if (profiler.device == VK_NULL_HANDLE)
+            {
+                profiler.device = device;
+                auto gdpa       = VulkanWrapper().vkGetDeviceProcAddr;
+                profiler.cmdWriteTimestamp   = (PFN_vkCmdWriteTimestamp)gdpa(device, "vkCmdWriteTimestamp");
+                profiler.cmdResetQueryPool   = (PFN_vkCmdResetQueryPool)gdpa(device, "vkCmdResetQueryPool");
+                profiler.getQueryPoolResults = (PFN_vkGetQueryPoolResults)gdpa(device, "vkGetQueryPoolResults");
+                auto createQueryPool         = (PFN_vkCreateQueryPool)gdpa(device, "vkCreateQueryPool");
+                VkPhysicalDeviceProperties props;
+                VulkanWrapper().vkGetPhysicalDeviceProperties(physicalDevice, &props);
+                profiler.periodNs           = props.limits.timestampPeriod;
+                VkQueryPoolCreateInfo info  = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                info.queryType              = VK_QUERY_TYPE_TIMESTAMP;
+                info.queryCount             = kSlots * kMaxQueries;
+                if (!createQueryPool || createQueryPool(device, &info, nullptr, &profiler.pool) != VK_SUCCESS)
+                    profiler.pool = VK_NULL_HANDLE;
+            }
+            return profiler.device == device && profiler.pool != VK_NULL_HANDLE ? &profiler : nullptr;
+        }
+
+        uint32_t slot = 0;
+
+        void Begin(VkCommandBuffer cmd, uint32_t jobCount)
+        {
+            slot = uint32_t(executions++ % kSlots);
+            Collect(slot);
+            labels[slot].clear();
+            cmdResetQueryPool(cmd, pool, slot * kMaxQueries, kMaxQueries);
+            if (jobCount + 1 <= kMaxQueries)
+                cmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, slot * kMaxQueries);
+            else
+                slot = ~0u;
+        }
+
+        void After(VkCommandBuffer cmd, const FfxGpuJobDescription& job)
+        {
+            if (slot == ~0u)
+                return;
+            static const char* typeNames[] = {"clear_float", "copy", "compute", "barrier", "discard", "fragment", "data_graph", "clear_uint"};
+            // Job labels only exist in debug builds; name each job by its type and position instead.
+            std::string label = std::to_string(labels[slot].size()) + "_" + (job.jobType < 8 ? typeNames[job.jobType] : "job");
+            labels[slot].push_back(label);
+            cmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, slot * kMaxQueries + uint32_t(labels[slot].size()));
+        }
+
+        void Collect(uint32_t s)
+        {
+            const std::vector<std::string>& l = labels[s];
+            if (l.empty())
+                return;
+            uint64_t ts[kMaxQueries];
+            if (getQueryPoolResults(device, pool, s * kMaxQueries, uint32_t(l.size() + 1), sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+                return;
+            std::map<std::string, float> frame;
+            for (size_t i = 0; i < l.size(); ++i)
+            {
+                if (!samples.count(l[i]) && !frame.count(l[i]))
+                    order.push_back(l[i]);
+                frame[l[i]] += float(ts[i + 1] - ts[i]) * periodNs * 1e-3f;
+            }
+            frame["total"] = float(ts[l.size()] - ts[0]) * periodNs * 1e-3f;
+            for (auto& [k, v] : frame)
+                samples[k].push_back(v);
+            if (samples["total"].size() % 250 == 0)
+                Write();
+        }
+
+        void Write()
+        {
+            FILE* f = fopen(getenv("FFX_PROFILE_PASSES"), "w");
+            if (!f)
+                return;
+            auto median = [](std::vector<float> v) {
+                std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+                return v[v.size() / 2];
+            };
+            fprintf(f, "samples %zu (median us per execution)\n", samples["total"].size());
+            for (const std::string& k : order)
+                fprintf(f, "%-24s %8.2f\n", k.c_str(), median(samples[k]));
+            fprintf(f, "%-24s %8.2f\n", "total", median(samples["total"]));
+            fclose(f);
+        }
+    };
+}  // namespace
+
 FfxErrorCode ExecuteGpuJobsVK(FfxInterface* backendInterface, FfxCommandList commandList, FfxUInt32 effectContextId)
 {
     FFX_ASSERT(nullptr != backendInterface);
@@ -8255,6 +8368,10 @@ FfxErrorCode ExecuteGpuJobsVK(FfxInterface* backendInterface, FfxCommandList com
     VkCommandBuffer vkCommandBuffer = reinterpret_cast<VkCommandBuffer>(commandList);
 
     FfxErrorCode errorCode = FFX_OK;
+
+    JobProfiler* profiler = JobProfiler::Get(backendContext->device, backendContext->physicalDevice);
+    if (profiler)
+        profiler->Begin(vkCommandBuffer, backendContext->gpuJobCount);
 
     // execute all renderjobs
     for (uint32_t i = 0; i < backendContext->gpuJobCount; ++i)
@@ -8315,6 +8432,8 @@ FfxErrorCode ExecuteGpuJobsVK(FfxInterface* backendInterface, FfxCommandList com
             endMarkerVK(backendContext, vkCommandBuffer);
         }
 #endif
+        if (profiler)
+            profiler->After(vkCommandBuffer, *gpuJob);
     }
 
     // check the execute function returned cleanly.

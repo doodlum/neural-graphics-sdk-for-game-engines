@@ -151,6 +151,11 @@ namespace ffx_ml
         const Selection& GetSelection() const { return m_selection; }
         uint32_t         GetDispatchCount() const;
 
+        // Profiling: when set, Record writes a timestamp before the first and after every dispatch into
+        // queryPool[firstQuery .. firstQuery + GetDispatchCount()] (the caller resets the queries).
+        void        SetProfiling(VkQueryPool queryPool, uint32_t firstQuery);
+        std::string DescribeLayer(uint32_t index) const;  // e.g. "conv3x3 s2 12->16 272x480->136x240"
+
         struct Impl;
 
     private:

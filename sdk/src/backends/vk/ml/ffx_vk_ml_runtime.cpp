@@ -50,6 +50,7 @@ namespace ffx_ml
             PFN_vkCmdDispatch                                       CmdDispatch;
             PFN_vkCmdPipelineBarrier                                CmdPipelineBarrier;
             PFN_vkCmdCopyBuffer                                     CmdCopyBuffer;
+            PFN_vkCmdWriteTimestamp                                 CmdWriteTimestamp;
 
             bool Load(const DeviceContext& ctx)
             {
@@ -87,6 +88,7 @@ namespace ffx_ml
                 FFX_ML_DEVICE_FN(CmdDispatch);
                 FFX_ML_DEVICE_FN(CmdPipelineBarrier);
                 FFX_ML_DEVICE_FN(CmdCopyBuffer);
+                FFX_ML_DEVICE_FN(CmdWriteTimestamp);
 #undef FFX_ML_INSTANCE_FN
 #undef FFX_ML_DEVICE_FN
                 return ok;
@@ -120,6 +122,8 @@ namespace ffx_ml
             uint32_t preferredSubgroup;   // subgroup size to request when subgroup size control is enabled (0 = default)
             uint32_t preferredTileM;      // preferred M for the coop-matrix tile (0 = largest)
             uint32_t vectorWorkgroup;     // workgroup size for dot4 / scalar kernels
+            MatType  matOrder[3];         // coop-matrix element types to try, fastest first (all exact)
+            uint32_t splitTargetGroups;   // coop layers with fewer workgroups split their output channels (grid z)
         };
 
         VendorTuning TuningFor(Vendor vendor)
@@ -127,13 +131,15 @@ namespace ffx_ml
             switch (vendor)
             {
             case Vendor::Nvidia:
-                return {4, 32, 16, 128};  // warp32 tensor cores, 16x16xK tiles (mma.sync m16n8k32 pairs)
+                // warp32 tensor cores, 16x16xK tiles (mma.sync m16n8k32 pairs). On the RTX 4080 fp16 beat int8 by ~5-8% and
+                // a split target of 128 workgroups (~2 per SM) was best; see docs/nss_gpu_tuning.md.
+                return {4, 32, 16, 128, {MatType::Fp16, MatType::Bf16, MatType::Int8}, 128};
             case Vendor::Amd:
-                return {4, 32, 16, 64};   // RDNA3+ WMMA runs in wave32, 16x16x16 tiles
+                return {4, 32, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};   // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned)
             case Vendor::Intel:
-                return {8, 16, 8, 64};    // Xe XMX systolic arrays, SIMD16 with 8xNxK tiles
+                return {8, 16, 8, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};    // Xe XMX systolic arrays, SIMD16 with 8xNxK tiles (untuned)
             default:
-                return {4, 0, 16, 64};
+                return {4, 0, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};
             }
         }
 
@@ -397,9 +403,9 @@ namespace ffx_ml
             std::vector<VkCooperativeMatrixPropertiesKHR> shapes(count, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
             fn.GetPhysicalDeviceCooperativeMatrixPropertiesKHR(context.physicalDevice, &count, shapes.data());
 
-            // Exact types only: int8 natively; fp16/bf16 hold every int8 value and fp32 accumulation stays exact.
-            const MatType ladder[] = {MatType::Int8, MatType::Fp16, MatType::Bf16};
-            for (MatType type : ladder)
+            // Exact types only: int8 natively; fp16/bf16 hold every int8 value and fp32 accumulation stays exact. The order
+            // is the vendor's measured preference; FFX_ML_MATTYPE forces one.
+            for (MatType type : tuning.matOrder)
             {
                 if (forcedType != MatType::None && forcedType != type)
                     continue;
@@ -506,6 +512,8 @@ namespace ffx_ml
         bool                  constantsUploaded = false;
         std::vector<SetGroup> setGroups;
         uint64_t              frame = 0;
+        VkQueryPool           profilePool  = VK_NULL_HANDLE;
+        uint32_t              profileFirst = 0;
         std::map<uint32_t, std::vector<int64_t>> shapes;  // external bindings
 
         VkPhysicalDeviceMemoryProperties memoryProperties = {};
@@ -607,6 +615,9 @@ namespace ffx_ml
             };
 
             fn.GetPhysicalDeviceMemoryProperties(ctx.physicalDevice, &memoryProperties);
+            VkPhysicalDeviceProperties2 deviceProperties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            fn.GetPhysicalDeviceProperties2(ctx.physicalDevice, &deviceProperties);
+            const uint32_t sharedMemoryLimit = deviceProperties.properties.limits.maxComputeSharedMemorySize;
 
             // Descriptor layout: src0, src1, weights, params, dst.
             VkDescriptorSetLayoutBinding bindings[5] = {};
@@ -766,7 +777,47 @@ namespace ffx_ml
                     entries.push_back({id, uint32_t(values.size() * 4), 4});
                     values.push_back(value);
                 };
-                const uint32_t tileP = selection.tileM * selection.numSubgroups;
+                // Coop-matrix tile height: as many rows per subgroup (up to 4) as the input patch lets fit in shared memory.
+                // Coop-matrix tile: one row per subgroup (keeps occupancy high on the small NSS layers).
+                uint32_t tileRows      = getenv("FFX_ML_TILE_ROWS") ? uint32_t(atoi(getenv("FFX_ML_TILE_ROWS"))) : 1;
+                uint32_t weightsShared  = 0;
+                uint32_t ntPerWorkgroup = ocPad / std::max(selection.tileN, 1u);
+                if (coop)
+                {
+                    // Output-channel split: each workgroup computes a subset of the N tiles (grid z), which shortens the
+                    // per-subgroup MMA chain and multiplies the workgroup count. Small, low-resolution layers are split until
+                    // they have at least VendorTuning::splitTargetGroups workgroups; large layers are left whole (splitting them re-stages
+                    // the same input patch per split and measured slower). FFX_ML_N_SPLIT forces a split for experiments.
+                    const uint32_t numNt          = ntPerWorkgroup;
+                    const uint32_t tileH          = selection.numSubgroups * tileRows;
+                    const uint32_t spatialGroups  = ((uint32_t(fc.outW) + selection.tileM - 1) / selection.tileM) * ((uint32_t(fc.outH) + tileH - 1) / tileH);
+                    const uint32_t splitTarget    = getenv("FFX_ML_N_SPLIT_TARGET") ? uint32_t(atoi(getenv("FFX_ML_N_SPLIT_TARGET"))) : TuningFor(selection.vendor).splitTargetGroups;
+                    uint32_t       split          = 1;
+                    while (split < numNt && spatialGroups * split < splitTarget)
+                        ++split;
+                    if (getenv("FFX_ML_N_SPLIT"))
+                        split = uint32_t(atoi(getenv("FFX_ML_N_SPLIT")));
+                    split = std::max(1u, std::min(split, numNt));
+                    while (numNt % split)
+                        ++split;
+                    ntPerWorkgroup = numNt / split;
+                    const uint32_t elem        = MatElementSize(selection.matType);
+                    const uint32_t weightBytes = taps * icPad * ocPad * elem;
+                    auto sharedBytes           = [&](uint32_t rows, bool withWeights) {
+                        const uint32_t tileH  = selection.numSubgroups * rows;
+                        const uint32_t patchW = (selection.tileM - 1) * conv.stride[1] + (conv.kernelW - 1) * conv.dilation[1] + 1;
+                        const uint32_t patchH = (tileH - 1) * conv.stride[0] + (conv.kernelH - 1) * conv.dilation[0] + 1;
+                        return patchW * patchH * icPad * elem + selection.numSubgroups * selection.tileM * ocPad * 4 + (withWeights ? weightBytes : 16);
+                    };
+                    while (tileRows > 1 && sharedBytes(tileRows, false) > sharedMemoryLimit)
+                        --tileRows;
+                    if (sharedBytes(tileRows, false) > sharedMemoryLimit)
+                        return fail("layer " + std::to_string(li) + " does not fit in shared memory");
+                    // Staging the weights per workgroup measured slower than reading them through the cache on the RTX 4080,
+                    // so it is opt-in (FFX_ML_WEIGHTS_SHARED_LIMIT=<bytes>) for experiments on other GPUs.
+                    const uint32_t weightBudget = getenv("FFX_ML_WEIGHTS_SHARED_LIMIT") ? uint32_t(atoi(getenv("FFX_ML_WEIGHTS_SHARED_LIMIT"))) : 0u;
+                    weightsShared = sharedBytes(tileRows, true) <= std::min(sharedMemoryLimit, weightBudget) ? 1u : 0u;
+                }
                 spec(0, int32_t(coop ? selection.numSubgroups * selection.subgroupSize : selection.workgroupSize));
                 if (coop)
                 {
@@ -777,6 +828,9 @@ namespace ffx_ml
                     spec(5, int32_t(ocPad / selection.tileN));
                     spec(6, int32_t(ocPad));
                     spec(7, int32_t(icPad));
+                    spec(8, int32_t(tileRows));
+                    spec(9, int32_t(weightsShared));
+                    spec(52, int32_t(ntPerWorkgroup));
                 }
                 spec(10, fc.inH);
                 spec(11, fc.inW);
@@ -844,7 +898,10 @@ namespace ffx_ml
                 const uint32_t pixels = uint32_t(fc.outH * fc.outW);
                 if (coop)
                 {
-                    layer.groups[0] = (pixels + tileP - 1) / tileP;
+                    const uint32_t tileH = selection.numSubgroups * tileRows;
+                    layer.groups[0]      = (uint32_t(fc.outW) + selection.tileM - 1) / selection.tileM;
+                    layer.groups[1]      = (uint32_t(fc.outH) + tileH - 1) / tileH;
+                    layer.groups[2]      = (ocPad / selection.tileN) / ntPerWorkgroup;
                 }
                 else
                 {
@@ -979,13 +1036,18 @@ namespace ffx_ml
             if (!group)
                 return;
 
+            if (profilePool)
+                fn.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profilePool, profileFirst);
             for (size_t li = 0; li < layers.size(); ++li)
             {
                 const Layer& l = layers[li];
                 fn.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, l.pipeline);
                 fn.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &group->sets[li], 0, nullptr);
                 fn.CmdDispatch(cmd, l.groups[0], l.groups[1], l.groups[2]);
-                if (li + 1 < layers.size())
+                if (profilePool)
+                    fn.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profilePool, profileFirst + uint32_t(li) + 1);
+                static const bool noBarriers = getenv("FFX_ML_EXPERIMENT_NO_BARRIERS") != nullptr;  // timing experiments only: wrong results
+                if (li + 1 < layers.size() && !noBarriers)
                 {
                     VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
                     fn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
@@ -1030,5 +1092,26 @@ namespace ffx_ml
     uint32_t Graph::GetDispatchCount() const
     {
         return uint32_t(m_impl->layers.size());
+    }
+
+    void Graph::SetProfiling(VkQueryPool queryPool, uint32_t firstQuery)
+    {
+        m_impl->profilePool  = queryPool;
+        m_impl->profileFirst = firstQuery;
+    }
+
+    std::string Graph::DescribeLayer(uint32_t index) const
+    {
+        const FusedConv&  fc   = m_impl->lowered.convs[index];
+        const tosa::Node& conv = *fc.conv;
+        std::string s = "conv" + std::to_string(conv.kernelH) + "x" + std::to_string(conv.kernelW) + " s" + std::to_string(conv.stride[0]) + " " +
+                        std::to_string(fc.inC) + "->" + std::to_string(fc.outC) + " " + std::to_string(fc.inH) + "x" + std::to_string(fc.inW) + "->" +
+                        std::to_string(fc.outH) + "x" + std::to_string(fc.outW);
+        for (const ConvSource& src : fc.sources)
+            if (src.resize)
+                s += " (resize in)";
+        if (fc.sources.size() > 1)
+            s += " (concat in)";
+        return s;
     }
 }  // namespace ffx_ml

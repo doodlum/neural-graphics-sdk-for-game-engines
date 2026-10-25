@@ -101,33 +101,37 @@ namespace
         float                            timestampPeriod = 1.0f;
         VkPhysicalDeviceMemoryProperties memory   = {};
 
-        Buffer CreateBuffer(size_t size)
+        // Host-visible buffers are for staging; the graph reads and writes device-local ones, as it does in NSS.
+        Buffer CreateBuffer(size_t size, bool deviceLocal = false)
         {
             Buffer             b;
             VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             info.size               = size;
-            info.usage              = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            info.usage              = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             CHECK_VK(vkCreateBuffer(device, &info, nullptr, &b.buffer));
             VkMemoryRequirements req;
             vkGetBufferMemoryRequirements(device, b.buffer, &req);
             uint32_t type = UINT32_MAX;
             for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; ++i)
             {
-                const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                const VkMemoryPropertyFlags want =
+                    deviceLocal ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
                 if ((req.memoryTypeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & want) == want)
                     type = i;
             }
             VkMemoryAllocateInfo alloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, type};
             CHECK_VK(vkAllocateMemory(device, &alloc, nullptr, &b.memory));
             CHECK_VK(vkBindBufferMemory(device, b.buffer, b.memory, 0));
-            CHECK_VK(vkMapMemory(device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped));
+            if (!deviceLocal)
+                CHECK_VK(vkMapMemory(device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped));
             b.size = size;
             return b;
         }
 
         void Destroy(Buffer& b)
         {
-            vkUnmapMemory(device, b.memory);
+            if (b.mapped)
+                vkUnmapMemory(device, b.memory);
             vkDestroyBuffer(device, b.buffer, nullptr);
             vkFreeMemory(device, b.memory, nullptr);
             b = {};
@@ -272,12 +276,53 @@ namespace
             buffers[binding] = ctx.CreateBuffer(data.size());
             memset(buffers[binding].mapped, 0x55, data.size());
         }
+        std::map<uint32_t, Buffer> deviceBuffers;
         for (auto& [binding, b] : buffers)
-            externals.push_back({binding, b.buffer, 0});
+        {
+            deviceBuffers[binding] = ctx.CreateBuffer(b.size, true);
+            externals.push_back({binding, deviceBuffers[binding].buffer, 0});
+        }
 
         VkCommandBuffer             cmd;
         VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, ctx.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         CHECK_VK(vkAllocateCommandBuffers(ctx.device, &allocInfo, &cmd));
+
+        // Copies between the staging and device-local buffers, outside the timed region.
+        auto copyAll = [&](bool upload) {
+            VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            CHECK_VK(vkBeginCommandBuffer(cmd, &begin));
+            for (auto& [binding, b] : buffers)
+            {
+                VkBufferCopy region = {0, 0, b.size};
+                if (upload)
+                    vkCmdCopyBuffer(cmd, b.buffer, deviceBuffers[binding].buffer, 1, &region);
+                else
+                    vkCmdCopyBuffer(cmd, deviceBuffers[binding].buffer, b.buffer, 1, &region);
+            }
+            VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+            CHECK_VK(vkEndCommandBuffer(cmd));
+            VkSubmitInfo submit       = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers    = &cmd;
+            CHECK_VK(vkQueueSubmit(ctx.queue, 1, &submit, VK_NULL_HANDLE));
+            CHECK_VK(vkQueueWaitIdle(ctx.queue));
+        };
+        copyAll(true);
+
+        // Per-layer profile (separate query pool): first query before the graph, one after each dispatch.
+        const uint32_t layerCount = graph->GetDispatchCount();
+        VkQueryPool    profilePool = VK_NULL_HANDLE;
+        if (getenv("ML_PROFILE"))
+        {
+            VkQueryPoolCreateInfo queryInfo = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            queryInfo.queryType             = VK_QUERY_TYPE_TIMESTAMP;
+            queryInfo.queryCount            = layerCount + 1;
+            CHECK_VK(vkCreateQueryPool(ctx.device, &queryInfo, nullptr, &profilePool));
+            graph->SetProfiling(profilePool, 0);
+        }
+        std::vector<double> layerMs(layerCount, 1e30);
 
         double bestMs = 1e30, totalMs = 0;
         for (int it = 0; it < iterations + 1; ++it)
@@ -285,6 +330,8 @@ namespace
             VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             CHECK_VK(vkBeginCommandBuffer(cmd, &begin));
             vkCmdResetQueryPool(cmd, ctx.queries, 0, 2);
+            if (profilePool)
+                vkCmdResetQueryPool(cmd, profilePool, 0, layerCount + 1);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.queries, 0);
             graph->Record(cmd, externals.data(), uint32_t(externals.size()));
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.queries, 1);
@@ -299,12 +346,54 @@ namespace
             uint64_t ts[2];
             CHECK_VK(vkGetQueryPoolResults(ctx.device, ctx.queries, 0, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
             const double ms = double(ts[1] - ts[0]) * ctx.timestampPeriod * 1e-6;
+            if (profilePool && it > 0)
+            {
+                std::vector<uint64_t> lts(layerCount + 1);
+                CHECK_VK(vkGetQueryPoolResults(ctx.device, profilePool, 0, layerCount + 1, lts.size() * 8, lts.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+                for (uint32_t li = 0; li < layerCount; ++li)
+                    layerMs[li] = std::min(layerMs[li], double(lts[li + 1] - lts[li]) * ctx.timestampPeriod * 1e-6);
+            }
             if (it > 0)  // first iteration includes the one-time weight upload
             {
                 bestMs = std::min(bestMs, ms);
                 totalMs += ms;
             }
         }
+
+        // Steady-state cost: many back-to-back executions in one submit, so the GPU stays clocked up as in a game
+        // frame (single submits leave it idle in between and read high). Best of a few batches.
+        double batchMs = 1e30;
+        if (!profilePool)
+        {
+            const int batch = 64;
+            for (int rep = 0; rep < 16; ++rep)  // the first batches warm the clocks up; only the last 4 count
+            {
+                VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                CHECK_VK(vkBeginCommandBuffer(cmd, &begin));
+                vkCmdResetQueryPool(cmd, ctx.queries, 0, 2);
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.queries, 0);
+                for (int b = 0; b < batch; ++b)
+                {
+                    VkMemoryBarrier between = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &between, 0, nullptr, 0, nullptr);
+                    graph->Record(cmd, externals.data(), uint32_t(externals.size()));
+                }
+                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.queries, 1);
+                CHECK_VK(vkEndCommandBuffer(cmd));
+                VkSubmitInfo submit       = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                submit.commandBufferCount = 1;
+                submit.pCommandBuffers    = &cmd;
+                CHECK_VK(vkQueueSubmit(ctx.queue, 1, &submit, VK_NULL_HANDLE));
+                CHECK_VK(vkQueueWaitIdle(ctx.queue));
+                uint64_t ts[2];
+                CHECK_VK(vkGetQueryPoolResults(ctx.device, ctx.queries, 0, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+                if (rep >= 12)
+                    batchMs = std::min(batchMs, double(ts[1] - ts[0]) * ctx.timestampPeriod * 1e-6 / batch);
+            }
+        }
+
+        copyAll(false);
 
         size_t mismatches = 0, total = 0;
         int    maxDiff    = 0;
@@ -321,18 +410,27 @@ namespace
         }
 
         const bool pass = mismatches == 0;
-        printf("  %-56s %s  mismatches %zu/%zu (max |diff| %d)  %.3f ms best, %.3f ms avg\n",
+        printf("  %-56s %s  mismatches %zu/%zu (max |diff| %d)  %.3f ms best, %.3f ms avg, %.3f ms batched\n",
                sel.Describe().c_str(),
                pass ? "EXACT " : "FAIL  ",
                mismatches,
                total,
                maxDiff,
                bestMs,
-               totalMs / iterations);
+               totalMs / iterations,
+               batchMs);
 
+        if (profilePool)
+        {
+            for (uint32_t li = 0; li < layerCount; ++li)
+                printf("      layer %2u %-52s %.4f ms\n", li, graph->DescribeLayer(li).c_str(), layerMs[li]);
+            vkDestroyQueryPool(ctx.device, profilePool, nullptr);
+        }
         vkFreeCommandBuffers(ctx.device, ctx.pool, 1, &cmd);
         graph.reset();
         for (auto& [binding, b] : buffers)
+            ctx.Destroy(b);
+        for (auto& [binding, b] : deviceBuffers)
             ctx.Destroy(b);
         return pass;
     }
