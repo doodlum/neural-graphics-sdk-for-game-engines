@@ -13,13 +13,27 @@
 #include <nss_v1_0_1_high_int8.h>
 #include <nss_v1_0_1_mid_low_int8.h>
 
+#include <algorithm>
 #include <cinttypes>
+#include <numeric>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+static void SetEnv(const char* name, const char* value) { _putenv_s(name, value ? value : ""); }
+#else
+static void SetEnv(const char* name, const char* value)
+{
+    if (value)
+        setenv(name, value, 1);
+    else
+        unsetenv(name);
+}
+#endif
 
 #define CHECK_VK(x)                                                                 \
     do                                                                              \
@@ -244,6 +258,7 @@ namespace
     {
         ffx_ml::Path    path;
         ffx_ml::MatType type;
+        const char*     env = nullptr;  // "NAME=value" set for this run only (kernel variants)
     };
 
     // Returns true when the GPU result matches the reference exactly.
@@ -311,18 +326,20 @@ namespace
         };
         copyAll(true);
 
-        // Per-layer profile (separate query pool): first query before the graph, one after each dispatch.
+        // Per-layer profile (separate query pool): first query before the graph, one after each dispatch. Each submit runs
+        // the graph kProfileRuns times back to back (own query range each) so the GPU stays clocked up.
         const uint32_t layerCount = graph->GetDispatchCount();
+        const uint32_t kProfileRuns = 16;
         VkQueryPool    profilePool = VK_NULL_HANDLE;
         if (getenv("ML_PROFILE"))
         {
             VkQueryPoolCreateInfo queryInfo = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             queryInfo.queryType             = VK_QUERY_TYPE_TIMESTAMP;
-            queryInfo.queryCount            = layerCount + 1;
+            queryInfo.queryCount            = (layerCount + 1) * kProfileRuns;
             CHECK_VK(vkCreateQueryPool(ctx.device, &queryInfo, nullptr, &profilePool));
-            graph->SetProfiling(profilePool, 0);
         }
         std::vector<double> layerMs(layerCount, 1e30);
+        double              profileTotalMs = 1e30;
 
         double bestMs = 1e30, totalMs = 0;
         for (int it = 0; it < iterations + 1; ++it)
@@ -331,9 +348,21 @@ namespace
             CHECK_VK(vkBeginCommandBuffer(cmd, &begin));
             vkCmdResetQueryPool(cmd, ctx.queries, 0, 2);
             if (profilePool)
-                vkCmdResetQueryPool(cmd, profilePool, 0, layerCount + 1);
+                vkCmdResetQueryPool(cmd, profilePool, 0, (layerCount + 1) * kProfileRuns);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.queries, 0);
-            graph->Record(cmd, externals.data(), uint32_t(externals.size()));
+            const uint32_t runs = (profilePool && it > 0) ? kProfileRuns : 1;
+            for (uint32_t run = 0; run < runs; ++run)
+            {
+                if (run > 0)
+                {
+                    VkMemoryBarrier between = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &between, 0, nullptr, 0, nullptr);
+                }
+                if (profilePool)
+                    graph->SetProfiling(it > 0 ? profilePool : VK_NULL_HANDLE, run * (layerCount + 1));
+                graph->Record(cmd, externals.data(), uint32_t(externals.size()));
+            }
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.queries, 1);
             VkMemoryBarrier toHost = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0, nullptr);
@@ -348,10 +377,21 @@ namespace
             const double ms = double(ts[1] - ts[0]) * ctx.timestampPeriod * 1e-6;
             if (profilePool && it > 0)
             {
-                std::vector<uint64_t> lts(layerCount + 1);
-                CHECK_VK(vkGetQueryPoolResults(ctx.device, profilePool, 0, layerCount + 1, lts.size() * 8, lts.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-                for (uint32_t li = 0; li < layerCount; ++li)
-                    layerMs[li] = std::min(layerMs[li], double(lts[li + 1] - lts[li]) * ctx.timestampPeriod * 1e-6);
+                std::vector<uint64_t> lts((layerCount + 1) * kProfileRuns);
+                CHECK_VK(vkGetQueryPoolResults(ctx.device, profilePool, 0, uint32_t(lts.size()), lts.size() * 8, lts.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+                const bool warm = it > iterations / 3;  // the first submits ramp the GPU clocks up
+                for (uint32_t run = 1; warm && run < kProfileRuns; ++run)  // run 0 starts from an idle GPU
+                {
+                    const uint64_t* r = &lts[run * (layerCount + 1)];
+                    double          t = 0;
+                    for (uint32_t li = 0; li < layerCount; ++li)
+                    {
+                        layerMs[li] = std::min(layerMs[li], double(r[li + 1] - r[li]) * ctx.timestampPeriod * 1e-6);
+                        t += double(r[li + 1] - r[li]) * ctx.timestampPeriod * 1e-6;
+                    }
+                    profileTotalMs = std::min(profileTotalMs, t);
+                }
+                continue;  // multi-run submits are not single-graph timings
             }
             if (it > 0)  // first iteration includes the one-time weight upload
             {
@@ -424,6 +464,7 @@ namespace
         {
             for (uint32_t li = 0; li < layerCount; ++li)
                 printf("      layer %2u %-52s %.4f ms\n", li, graph->DescribeLayer(li).c_str(), layerMs[li]);
+            printf("      sum of per-layer minima %.4f ms, fastest whole graph %.4f ms\n", std::accumulate(layerMs.begin(), layerMs.end(), 0.0), profileTotalMs);
             vkDestroyQueryPool(ctx.device, profilePool, nullptr);
         }
         vkFreeCommandBuffers(ctx.device, ctx.pool, 1, &cmd);
@@ -459,12 +500,17 @@ int main(int argc, char** argv)
     models.push_back(MakeModel("nss_v1_0_1_mid_low_int8", g_nss_v1_0_1_mid_low_int8_Info, height / 2, width / 2));
     for (Model& m : models)
         m.desc.spirv = m.words.data();  // re-point after the copies into the vector
+    // FFX_ML_TEST_MODELS=high|mid_low runs one model only (tuning loops).
+    if (const char* only = getenv("FFX_ML_TEST_MODELS"))
+        models.erase(std::remove_if(models.begin(), models.end(), [&](const Model& m) { return !strstr(m.name, (std::string("v1_0_1_") + only + "_int8").c_str()); }),
+                     models.end());
 
     const Config configs[] = {
         {ffx_ml::Path::CoopMat, ffx_ml::MatType::Int8},
         {ffx_ml::Path::CoopMat, ffx_ml::MatType::Fp16},
         {ffx_ml::Path::CoopMat, ffx_ml::MatType::Bf16},
         {ffx_ml::Path::Dot4, ffx_ml::MatType::None},
+        {ffx_ml::Path::Dot4, ffx_ml::MatType::None, "FFX_ML_DOT4_TILED=0"},  // untiled dot4 kernel (same as above where tiling is off)
         {ffx_ml::Path::Scalar, ffx_ml::MatType::None},
     };
 
@@ -497,8 +543,23 @@ int main(int argc, char** argv)
         printf("%s (input %" PRId64 "x%" PRId64 "x%" PRId64 ")\n", model.name, inShape[1], inShape[2], inShape[3]);
         for (const Config& config : configs)
         {
+            // FFX_ML_TEST_PATHS=dot4,scalar,... limits the paths run (faster tuning loops).
+            if (const char* only = getenv("FFX_ML_TEST_PATHS"))
+                if (!strstr(only, ffx_ml::ToString(config.path)))
+                    continue;
+            std::string name;
+            if (config.env)
+            {
+                const char* eq = strchr(config.env, '=');
+                name           = std::string(config.env, eq);
+                if (getenv(name.c_str()))
+                    continue;  // the caller forced this variable for every run, so the variant run would be a duplicate
+                SetEnv(name.c_str(), eq + 1);
+            }
             bool skipped = false;
             allPass &= RunConfig(ctx, model, config, inputs, reference, iterations, skipped);
+            if (config.env)
+                SetEnv(name.c_str(), nullptr);
             if (skipped)
                 printf("  %-56s skipped (not supported)\n", (std::string(ffx_ml::ToString(config.path)) + " " + ffx_ml::ToString(config.type)).c_str());
         }

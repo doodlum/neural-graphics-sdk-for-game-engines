@@ -10,6 +10,8 @@
 //   ML_PATH_COOPMAT  implicit GEMM on GL_KHR_cooperative_matrix (NVIDIA tensor cores, AMD WMMA, Intel XMX, ...).
 //                    ML_MAT_INT8 / ML_MAT_FP16 / ML_MAT_BF16 selects the matrix element type (all exact for int8 data).
 //   ML_PATH_DOT4     packed 4x8-bit integer dot products (GL_EXT_integer_dot_product).
+//                    ML_DOT4_TILED=1 selects the register-tiled variant (PX pixels x OCB channels per thread, weights
+//                    read with wave-uniform addresses so AMD fetches them through the scalar cache).
 //   ML_PATH_SCALAR   plain 32-bit integer math, no optional device features required.
 //
 // All tensors are bound as uint32 arrays (4 int8 channels per word), so only the coop-matrix path needs
@@ -47,6 +49,10 @@
 #endif
 #elif ML_PATH_DOT4
 #extension GL_EXT_integer_dot_product : require
+#if ML_DOT4_TILED
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#endif
 #define RAW_INPUT 1
 #else
 #define RAW_INPUT 1
@@ -69,7 +75,15 @@ layout(constant_id = 9) const uint WEIGHTS_SHARED = 0;  // 1: the layer's weight
 layout(constant_id = 52) const uint NT_PER_WG = 3;  // N tiles per workgroup; gl_WorkGroupID.z picks the group of N tiles
 #endif
 
+#if ML_DOT4_TILED
+layout(constant_id = 53) const uint WG_Y = 1;   // workgroup rows (threads)
+layout(constant_id = 54) const int  PX   = 4;   // output pixels per thread along x
+layout(constant_id = 55) const int  OCB  = 16;  // output channels per thread (multiple of 4); gl_WorkGroupID.z picks the block
+layout(constant_id = 56) const int  KSPLIT = 1;  // subgroups sharing the workgroup's output tiles (local z), each summing every KSPLIT-th input word
+layout(local_size_x_id = 0, local_size_y_id = 53, local_size_z_id = 56) in;
+#else
 layout(local_size_x_id = 0) in;
+#endif
 
 // ---------------------------------------------------------------------------------------------------------
 // Bindings
@@ -130,6 +144,10 @@ layout(constant_id = 48) const int S1_OFFSET_Y = 0;
 layout(constant_id = 49) const int S1_SCALE_X_N = 1;
 layout(constant_id = 50) const int S1_SCALE_X_D = 1;
 layout(constant_id = 51) const int S1_OFFSET_X = 0;
+
+// 1: the host verified every shift is >= 33 and double rounding is off. The rounding constant then lies entirely in the
+// high word of the 64-bit product, so (hi + 2^(shift-33)) >> (shift-32) is the exact TOSA result (no low word needed).
+layout(constant_id = 58) const int SCALE_HI_ONLY = 0;
 
 #define FLAG_DOUBLE_ROUND 1
 #define FLAG_PER_CHANNEL  2
@@ -248,7 +266,15 @@ int Epilogue(int acc, int oc)
     int pIndex     = ((FLAGS & FLAG_PER_CHANNEL) != 0) ? oc : 0;
     int multiplier = params[OC_PARAM_STRIDE() + pIndex];
     int shift      = params[2 * OC_PARAM_STRIDE() + pIndex];
-    int v          = ApplyScale32(acc - RESCALE_IN_ZP, multiplier, shift, (FLAGS & FLAG_DOUBLE_ROUND) != 0);
+    int v;
+    if (SCALE_HI_ONLY != 0)
+    {
+        int hi, lo;
+        imulExtended(acc - RESCALE_IN_ZP, multiplier, hi, lo);
+        v = (hi + (1 << (shift - 33))) >> (shift - 32);
+    }
+    else
+        v = ApplyScale32(acc - RESCALE_IN_ZP, multiplier, shift, (FLAGS & FLAG_DOUBLE_ROUND) != 0);
     v              = clamp(v + RESCALE_OUT_ZP, -128, 127);
     if ((FLAGS & FLAG_TABLE) != 0)
         v = TableLookup(v);
@@ -419,6 +445,167 @@ void main()
             dst[((uint(oy) * uint(OUT_W) + uint(ox)) * uint(OUT_STRIDE) + w * 4) >> 2] = PackResult(res);
         }
         subgroupBarrier();
+    }
+}
+
+#elif ML_DOT4_TILED
+// ---------------------------------------------------------------------------------------------------------
+// Register-tiled packed int8 conv. Each thread owns PX consecutive output pixels of one row and OCB output channels
+// (the block gl_WorkGroupID.z). Per tap row and input word it loads the COLS input words its pixels need once and
+// feeds each of them to up to PX * OCB dot4s. All threads of a workgroup share the output-channel block, so every
+// weight address is uniform: on AMD those become scalar (s_buffer_load) reads and the dot4s take them as SGPR operands.
+// Weights are laid out [ocBlock][tap][icWord][OCB] (zero padded) so one tap/word step reads OCB consecutive words.
+// ---------------------------------------------------------------------------------------------------------
+const int COLS = (PX - 1) * STRIDE_X + (KERNEL_W - 1) * DILATION_X + 1;
+shared int sRed[KSPLIT > 1 ? KSPLIT * PX * OCB * int(WG_SIZE * WG_Y) : 1];  // KSPLIT partial sums
+
+int Dot4(uint a, uint b)
+{
+    return dotPacked4x8EXT(int(a), int(b));
+}
+
+// acc[p][o] += x[p, kx] . w[kx][o] for the KERNEL_W taps of one kernel row and one input word; WB is the weight word of
+// kx = 0. A macro, not a function: arrays sized by specialization constants do not survive being passed as parameters.
+#define ACCUMULATE(WB)                                                                    \
+    [[unroll]] for (int kx = 0; kx < KERNEL_W; ++kx)                                       \
+    {                                                                                     \
+        [[unroll]] for (int o = 0; o < OCB; ++o)                                          \
+        {                                                                                 \
+            const uint wv = weights[(WB) + kx * IC_WORDS * OCB + o];                       \
+            [[unroll]] for (int p = 0; p < PX; ++p)                                       \
+                acc[p * OCB + o] += Dot4(x[p * STRIDE_X + kx * DILATION_X], wv);          \
+        }                                                                                 \
+    }
+
+void main()
+{
+    // KSPLIT > 1: the workgroup is KSPLIT subgroups (one per local z), all covering the same WG_SIZE x WG_Y tiles. The
+    // host only uses it when one z slice is exactly one subgroup, so kp is subgroup-uniform; the broadcast tells the
+    // compiler, which keeps the weight addresses scalar.
+    const int kp      = KSPLIT > 1 ? int(subgroupBroadcastFirst(gl_LocalInvocationID.z)) : 0;
+    const int ox0     = int(gl_GlobalInvocationID.x) * PX;
+    const int oy      = int(gl_GlobalInvocationID.y);
+    const int ocBlock = int(gl_WorkGroupID.z);
+    const int cy      = min(oy, OUT_H - 1);  // out-of-range threads compute a valid row and skip the store
+    const uint zp     = ZpWord();
+
+    int acc[PX * OCB];
+    [[unroll]] for (int i = 0; i < PX * OCB; ++i)
+        acc[i] = 0;
+
+    const int wBlockBase = ocBlock * (KERNEL_H * KERNEL_W * IC_WORDS * OCB);
+    const int s0Words    = S0_C / 4;
+
+    for (int ky = 0; ky < KERNEL_H; ++ky)
+    {
+        const int  vy      = cy * STRIDE_Y - PAD_TOP + ky * DILATION_Y;
+        const bool rowOk   = vy >= 0 && vy < IN_H;
+        const int  vyc     = clamp(vy, 0, IN_H - 1);
+        const int  sy0     = S0_RESIZE != 0 ? NearestCoord(vyc, S0_SCALE_Y_N, S0_SCALE_Y_D, S0_OFFSET_Y, S0_H) : vyc;
+        const int  sy1     = S1_RESIZE != 0 ? NearestCoord(vyc, S1_SCALE_Y_N, S1_SCALE_Y_D, S1_OFFSET_Y, S1_H) : vyc;
+
+        // Word address of every input column this thread touches (clamped in range; invalid taps select the zero point).
+        int  base0[COLS];
+        int  base1[COLS];
+        bool valid[COLS];
+        [[unroll]] for (int j = 0; j < COLS; ++j)
+        {
+            const int vx  = ox0 * STRIDE_X - PAD_LEFT + j;
+            const int vxc = clamp(vx, 0, IN_W - 1);
+            valid[j]      = rowOk && vx >= 0 && vx < IN_W;
+            const int sx0 = S0_RESIZE != 0 ? NearestCoord(vxc, S0_SCALE_X_N, S0_SCALE_X_D, S0_OFFSET_X, S0_W) : vxc;
+            base0[j]      = ((sy0 * S0_W + sx0) * S0_STRIDE) >> 2;
+            if (NUM_SOURCES > 1)
+            {
+                const int sx1 = S1_RESIZE != 0 ? NearestCoord(vxc, S1_SCALE_X_N, S1_SCALE_X_D, S1_OFFSET_X, S1_W) : vxc;
+                base1[j]      = ((sy1 * S1_W + sx1) * S1_STRIDE) >> 2;
+            }
+            else
+                base1[j] = 0;
+        }
+
+        // Source 0 words, then source 1 words (concat). Words past the sources are channel padding with zero weights, so
+        // they are skipped. Loads are unconditional (addresses are clamped in range) and selected afterwards, and the next
+        // word is fetched before the current one is consumed so the load latency overlaps the dot4s. With KSPLIT > 1 this
+        // lane only takes the words w = kp (mod KSPLIT).
+        const int wRow  = wBlockBase + ky * KERNEL_W * IC_WORDS * OCB;
+        const int s1End = NUM_SOURCES > 1 ? min(IC_WORDS, s0Words + (S1_C + 3) / 4) : s0Words;
+        uint      xn[COLS];
+        if (s0Words > 0)
+        {
+            [[unroll]] for (int j = 0; j < COLS; ++j)
+                xn[j] = src0[base0[j] + min(kp, s0Words - 1)];
+        }
+        for (int w = kp; w < s0Words; w += KSPLIT)
+        {
+            uint x[COLS];
+            [[unroll]] for (int j = 0; j < COLS; ++j)
+                x[j] = valid[j] ? xn[j] : zp;
+            const int wn = min(w + KSPLIT, s0Words - 1);
+            [[unroll]] for (int j = 0; j < COLS; ++j)
+                xn[j] = src0[base0[j] + wn];
+            ACCUMULATE(wRow + w * OCB)
+        }
+        if (NUM_SOURCES > 1 && s1End > s0Words)
+        {
+            const int w1 = s0Words + ((kp - s0Words) & (KSPLIT - 1));  // first word >= s0Words with w = kp (mod KSPLIT)
+            [[unroll]] for (int j = 0; j < COLS; ++j)
+                xn[j] = src1[base1[j] + min(w1, s1End - 1) - s0Words];
+            for (int w = w1; w < s1End; w += KSPLIT)
+            {
+                uint x[COLS];
+                [[unroll]] for (int j = 0; j < COLS; ++j)
+                    x[j] = valid[j] ? xn[j] : zp;
+                const int wn = min(w + KSPLIT, s1End - 1) - s0Words;
+                [[unroll]] for (int j = 0; j < COLS; ++j)
+                    xn[j] = src1[base1[j] + wn];
+                ACCUMULATE(wRow + w * OCB)
+            }
+        }
+    }
+
+    // KSPLIT > 1: every subgroup stores its partial sums to shared memory, then subgroup kp finishes the slice
+    // [kp * FIN, (kp + 1) * FIN) of the flattened [PX][OCB] tile (exact integer adds) and runs the epilogue for it.
+    const int FIN = (PX * OCB) / KSPLIT;  // finished sums per thread (multiple of 4)
+    int       fin[FIN];
+    if (KSPLIT > 1)
+    {
+        const uint tileThreads = WG_SIZE * WG_Y;
+        const uint t           = gl_LocalInvocationID.y * WG_SIZE + gl_LocalInvocationID.x;
+        [[unroll]] for (int i = 0; i < PX * OCB; ++i)
+            sRed[(uint(kp * PX * OCB + i)) * tileThreads + t] = acc[i];
+        barrier();
+        [[unroll]] for (int i = 0; i < FIN; ++i)
+        {
+            int sum = 0;
+            [[unroll]] for (int k = 0; k < KSPLIT; ++k)
+                sum += sRed[uint(k * PX * OCB + kp * FIN + i) * tileThreads + t];
+            fin[i] = sum;
+        }
+    }
+    else
+    {
+        [[unroll]] for (int i = 0; i < FIN; ++i)
+            fin[i] = acc[i];
+    }
+
+    if (oy >= OUT_H)
+        return;
+    [[unroll]] for (int q = 0; q < FIN / 4; ++q)
+    {
+        const int idx = kp * FIN + q * 4;  // flattened [PX][OCB] index; 4 consecutive channels of one pixel
+        const int p   = idx / OCB;
+        const int oc  = ocBlock * OCB + (idx - p * OCB);
+        const int ox  = ox0 + p;
+        if (oc >= OUT_C || ox >= OUT_W)
+            continue;
+        ivec4 r = ivec4(0);
+        [[unroll]] for (int j = 0; j < 4; ++j)
+        {
+            if (oc + j < OUT_C)
+                r[j] = Epilogue(fin[q * 4 + j] + params[oc + j], oc + j);
+        }
+        dst[((oy * OUT_W + ox) * OUT_STRIDE + oc) >> 2] = PackResult(r);
     }
 }
 
