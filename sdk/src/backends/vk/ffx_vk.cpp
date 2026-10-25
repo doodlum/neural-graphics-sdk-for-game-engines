@@ -679,7 +679,9 @@ FfxErrorCode ffxGetInterfaceVK(FfxInterface* backendInterface, FfxDevice device,
     backendInterface->fpScheduleGpuJob            = ScheduleGpuJobVK;
     backendInterface->fpExecuteGpuJobs            = ExecuteGpuJobsVK;
     //backendInterface->fpRegisterConstantBufferAllocator   = RegisterConstantBufferAllocatorVK;
+#ifdef FFX_FI
     backendInterface->fpSwapChainConfigureFrameGeneration = ffxSetFrameGenerationConfigToSwapchainVK;
+#endif
 
     // Memory assignments
     backendInterface->scratchBuffer     = scratchBuffer;
