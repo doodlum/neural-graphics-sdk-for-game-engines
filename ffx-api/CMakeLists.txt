@@ -118,6 +118,11 @@ if (FFX_GRAPHICS_API STREQUAL vk)
 		${CMAKE_CURRENT_SOURCE_DIR}/include/ffx_api/vk/*.hpp)
 endif()
 
+# The version resource is UTF-16, which only MSVC's rc.exe reads; skip it for mingw cross builds.
+if(NOT MSVC)
+	list(FILTER private_ffx_api EXCLUDE REGEX "\\.rc$")
+endif()
+
 # Use operating system and architecture as the postfix for the library name
 # We might consider add graphics api when we start supporting other than vulkan(for example dx12)
 if(FFX_BUILD_AS_DLL)

@@ -34,7 +34,7 @@ set(NSS_BASE_ARGS
     -DQUANTIZED=1
     )
 
-if(WIN32)
+if(CMAKE_HOST_WIN32)  # brace permutation lists need quoting for a POSIX host shell
     set(NSS_PERMUTATION_ARGS
         -DREVERSE_Z={0,1}
         -DRESAMPLE_BICUBIC={0,1}

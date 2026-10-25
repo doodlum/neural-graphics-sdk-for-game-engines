@@ -30,7 +30,7 @@ set(ARM_OPTICALFLOW_BASE_ARGS
     -glslangexe=${FFX_GLSLANG_EXE_PATH}
     -reflection -deps=gcc -DMIN_SAD -DFFX_GPU=1)
 
-if(WIN32)
+if(CMAKE_HOST_WIN32)  # brace permutation lists need quoting for a POSIX host shell
     set(ARM_OPTICALFLOW_PERMUTATION_ARGS
         -DDEPTH_INVERTED={0,1}
     )

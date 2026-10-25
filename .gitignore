@@ -44,4 +44,4 @@ cache
 imgui.ini
 .gradle/
 .android/
-result/
+result//build_win*/

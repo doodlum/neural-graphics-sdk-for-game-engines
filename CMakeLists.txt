@@ -155,8 +155,8 @@ endif()
 set(FFX_GLSL ON)
 # disable ASR to focus on NSS part
 set(FFX_NSS ON)
-set(FFX_FI ON)
-set(FFX_OF ON)
+option(FFX_FI "Build Neural Frame Rate Upscaling (frame interpolation)" ON)
+option(FFX_OF "Build optical flow (required by FFX_FI)" ON)
 
 add_subdirectory(./ffx-api)
 
