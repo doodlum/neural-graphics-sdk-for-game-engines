@@ -170,7 +170,8 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init_with_ProjectID(const char*, in
 NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_Shutdown()
 {
     Log(3, "%s", "NVSDK_NGX_VULKAN_Shutdown");
-    Registry().CollectGarbage();
+    // NGX shutdown comes before the device is destroyed and after the game has idled it: free everything now.
+    Registry().CollectGarbage(true);
     return NVSDK_NGX_Result_Success;
 }
 

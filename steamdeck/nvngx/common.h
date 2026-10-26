@@ -23,6 +23,8 @@ struct ProxyConfig
     float cameraFovY;       // radians
     float exposure;         // 0 = use the game's pre-exposure when given, else 1
     bool  mlFeaturesForced; // AISS_LAYER=1: the Vulkan layer enabled int8/dot-product device features
+    int   debugView;        // AISS_DEBUG_VIEW: -1 off, 0 = NSS's 4x4 grid of internal views, 1-16 = one view
+    int   dumpFrame;        // AISS_DUMP_FRAME: evaluation index whose output is written to aiss_frame_<n>.ppm, -1 off
 };
 
 const ProxyConfig& Config();

@@ -75,6 +75,8 @@ const ProxyConfig& Config()
         c.cameraFovY       = EnvFloat("AISS_CAMERA_FOV", 60.0f) * 3.14159265f / 180.0f;
         c.exposure         = EnvFloat("AISS_EXPOSURE", 0.0f);
         c.mlFeaturesForced = EnvInt("AISS_LAYER", 0) != 0;
+        c.debugView        = EnvInt("AISS_DEBUG_VIEW", -1);
+        c.dumpFrame        = EnvInt("AISS_DUMP_FRAME", -1);
         return c;
     }();
     return config;

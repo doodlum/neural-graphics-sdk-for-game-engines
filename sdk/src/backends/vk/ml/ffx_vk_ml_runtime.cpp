@@ -117,6 +117,27 @@ namespace ffx_ml
             }
         }
 
+        // Proton reports AMD GPUs as NVIDIA (vendor 0x10DE) so games enable DLSS. The tuning must follow the real
+        // hardware, so the driver ID and the device name take precedence over the vendor ID.
+        Vendor VendorFromDevice(uint32_t vendorId, VkDriverId driverId, const char* deviceName)
+        {
+            switch (driverId)
+            {
+            case VK_DRIVER_ID_MESA_RADV:
+            case VK_DRIVER_ID_AMD_PROPRIETARY:
+            case VK_DRIVER_ID_AMD_OPEN_SOURCE:
+                return Vendor::Amd;
+            case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
+            case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+                return Vendor::Intel;
+            default:
+                break;
+            }
+            if (deviceName && (strstr(deviceName, "RADV") || strstr(deviceName, "AMD") || strstr(deviceName, "Radeon")))
+                return Vendor::Amd;
+            return VendorFromId(vendorId);
+        }
+
         // Per-vendor kernel tuning. The tile shape itself always comes from what the driver reports.
         struct VendorTuning
         {
@@ -396,13 +417,14 @@ namespace ffx_ml
 
         Selection sel;
 
-        VkPhysicalDeviceSubgroupSizeControlProperties sizeControl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceDriverProperties              driver      = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceSubgroupSizeControlProperties sizeControl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, &driver};
         VkPhysicalDeviceSubgroupProperties            subgroup    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &sizeControl};
         VkPhysicalDeviceProperties2                   props       = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
         fn.GetPhysicalDeviceProperties2(context.physicalDevice, &props);
 
         sel.vendorId   = props.properties.vendorID;
-        sel.vendor     = VendorFromId(sel.vendorId);
+        sel.vendor     = VendorFromDevice(sel.vendorId, driver.driverID, props.properties.deviceName);
         sel.deviceName = props.properties.deviceName;
         const VendorTuning tuning = TuningFor(sel.vendor);
         const uint32_t     features = context.enabledFeatures;

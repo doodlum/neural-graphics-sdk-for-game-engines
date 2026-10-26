@@ -67,6 +67,9 @@ private:
     bool Init(const VulkanDevice& device, const UpscalerCreateInfo& info);
     bool CreateDepthCopy();
     VkImageView CreateView(VkImage image, VkFormat format, VkImageAspectFlags aspect);
+    uint32_t    FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags);
+    void        RecordDump(VkCommandBuffer cmd, const UpscalerImage& output);
+    void        WriteDump();
 
     struct Fn;
     std::unique_ptr<Fn> m_fn;
@@ -90,6 +93,12 @@ private:
     VkDescriptorSet m_sets[kRing]       = {};
     VkImageView     m_gameViews[kRing]  = {};
     uint64_t        m_dispatchCount     = 0;
+
+    // AISS_DUMP_FRAME readback of one output frame.
+    VkBuffer       m_dumpBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory m_dumpMemory = VK_NULL_HANDLE;
+    UpscalerImage  m_dumpImage;
+    uint64_t       m_dumpAt     = 0;
 };
 
 // NGX handles map to upscalers; released ones are destroyed once the GPU can no longer use them.

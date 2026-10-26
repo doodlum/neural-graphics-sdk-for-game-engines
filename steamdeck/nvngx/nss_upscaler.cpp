@@ -8,6 +8,8 @@
 #include <ffx_api/vk/ffx_api_vk.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
@@ -46,6 +48,13 @@ struct NssUpscaler::Fn
     VK_FN(vkCmdBindDescriptorSets)
     VK_FN(vkCmdPushConstants)
     VK_FN(vkCmdDispatch)
+    VK_FN(vkCreateBuffer)
+    VK_FN(vkDestroyBuffer)
+    VK_FN(vkGetBufferMemoryRequirements)
+    VK_FN(vkBindBufferMemory)
+    VK_FN(vkMapMemory)
+    VK_FN(vkUnmapMemory)
+    VK_FN(vkCmdCopyImageToBuffer)
 #undef VK_FN
 };
 
@@ -141,6 +150,13 @@ bool NssUpscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& inf
     VK_FN(vkCmdBindDescriptorSets)
     VK_FN(vkCmdPushConstants)
     VK_FN(vkCmdDispatch)
+    VK_FN(vkCreateBuffer)
+    VK_FN(vkDestroyBuffer)
+    VK_FN(vkGetBufferMemoryRequirements)
+    VK_FN(vkBindBufferMemory)
+    VK_FN(vkMapMemory)
+    VK_FN(vkUnmapMemory)
+    VK_FN(vkCmdCopyImageToBuffer)
 #undef VK_FN
     m_fn->vkGetPhysicalDeviceMemoryProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
         device.gipa(device.instance, "vkGetPhysicalDeviceMemoryProperties"));
@@ -207,12 +223,7 @@ bool NssUpscaler::CreateDepthCopy()
 
     VkMemoryRequirements req;
     fn.vkGetImageMemoryRequirements(dev, m_depthImage, &req);
-    VkPhysicalDeviceMemoryProperties props;
-    fn.vkGetPhysicalDeviceMemoryProperties(m_dev.physicalDevice, &props);
-    uint32_t type = UINT32_MAX;
-    for (uint32_t i = 0; i < props.memoryTypeCount && type == UINT32_MAX; ++i)
-        if ((req.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-            type = i;
+    const uint32_t type = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (type == UINT32_MAX)
         return false;
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -280,6 +291,16 @@ bool NssUpscaler::CreateDepthCopy()
     dsai.descriptorSetCount          = kRing;
     dsai.pSetLayouts                 = layouts;
     return fn.vkAllocateDescriptorSets(dev, &dsai, m_sets) == VK_SUCCESS && m_depthView != VK_NULL_HANDLE;
+}
+
+uint32_t NssUpscaler::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags)
+{
+    VkPhysicalDeviceMemoryProperties props;
+    m_fn->vkGetPhysicalDeviceMemoryProperties(m_dev.physicalDevice, &props);
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
+        if ((typeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & flags) == flags)
+            return i;
+    return UINT32_MAX;
 }
 
 VkImageView NssUpscaler::CreateView(VkImage image, VkFormat format, VkImageAspectFlags aspect)
@@ -452,6 +473,12 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     nss.exposure               = d.exposure;
     nss.frameTimeDelta         = d.frameTimeMs;
     nss.reset                  = d.reset;
+    if (Config().debugView >= 0)
+    {
+        nss.flags         = FFX_API_NSS_DISPATCH_FLAG_DRAW_DEBUG_VIEW;
+        nss.debugViews    = nss.output;
+        nss.debugViewMode = static_cast<uint32_t>(Config().debugView);
+    }
 
     ffxContext ctx = m_context;
     const ffxReturnCode_t rc = ffxDispatch(&ctx, &nss.header);
@@ -467,12 +494,127 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &done, 0,
                             nullptr, 0, nullptr);
 
+    if (Config().dumpFrame >= 0 && m_dispatchCount == uint64_t(Config().dumpFrame) + 1)
+        RecordDump(cmd, d.output);
+    else if (m_dumpBuffer && m_dispatchCount == m_dumpAt)
+        WriteDump();
+
     if (rc != FFX_API_RETURN_OK)
     {
         LOGI("ffxDispatch(NSS) failed: %u", rc);
         return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// AISS_DUMP_FRAME: copy one output frame to host memory and write it as a PPM next to the log (debugging aid).
+// ---------------------------------------------------------------------------------------------------------------------
+void NssUpscaler::RecordDump(VkCommandBuffer cmd, const UpscalerImage& output)
+{
+    auto& fn = *m_fn;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size               = VkDeviceSize(output.width) * output.height * 8;
+    bci.usage              = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (fn.vkCreateBuffer(m_dev.device, &bci, nullptr, &m_dumpBuffer) != VK_SUCCESS)
+        return;
+    VkMemoryRequirements req;
+    fn.vkGetBufferMemoryRequirements(m_dev.device, m_dumpBuffer, &req);
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize       = req.size;
+    mai.memoryTypeIndex      = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX || fn.vkAllocateMemory(m_dev.device, &mai, nullptr, &m_dumpMemory) != VK_SUCCESS)
+        return;
+    fn.vkBindBufferMemory(m_dev.device, m_dumpBuffer, m_dumpMemory, 0);
+
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask        = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask        = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout            = output.layout;
+    b.newLayout            = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image                = output.image;
+    b.subresourceRange     = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkBufferImageCopy region = {};
+    region.imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent       = {output.width, output.height, 1};
+    fn.vkCmdCopyImageToBuffer(cmd, output.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_dumpBuffer, 1, &region);
+    std::swap(b.oldLayout, b.newLayout);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    m_dumpImage = output;
+    m_dumpAt    = m_dispatchCount + 16;  // read back once the frame has certainly retired
+}
+
+static float HalfToFloat(uint16_t h)
+{
+    const uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 31, man = h & 1023;
+    float v = exp == 0 ? std::ldexp(float(man), -24) : exp == 31 ? 65504.0f : std::ldexp(float(man | 1024), int(exp) - 25);
+    return sign ? -v : v;
+}
+
+static float Uf11ToFloat(uint32_t v, int manBits)
+{
+    const uint32_t exp = v >> manBits, man = v & ((1u << manBits) - 1);
+    if (exp == 0)
+        return std::ldexp(float(man), -14 - manBits);
+    return std::ldexp(float(man | (1u << manBits)), int(exp) - 15 - manBits);
+}
+
+void NssUpscaler::WriteDump()
+{
+    auto&    fn  = *m_fn;
+    void*    ptr = nullptr;
+    if (fn.vkMapMemory(m_dev.device, m_dumpMemory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS)
+    {
+        char name[64];
+        snprintf(name, sizeof(name), "aiss_frame_%d.ppm", Config().dumpFrame);
+        if (FILE* f = fopen(name, "wb"))
+        {
+            const uint32_t w = m_dumpImage.width, h = m_dumpImage.height;
+            fprintf(f, "P6\n%u %u\n255\n", w, h);
+            auto toByte = [](float x) {
+                x = x < 0 ? 0 : x / (1.0f + x);                                      // Reinhard, HDR -> [0,1)
+                x = x <= 0.0031308f ? 12.92f * x : 1.055f * std::pow(x, 1 / 2.4f) - 0.055f;  // sRGB
+                return uint8_t(x * 255.0f + 0.5f);
+            };
+            for (uint32_t i = 0; i < w * h; ++i)
+            {
+                float rgb[3] = {};
+                switch (m_dumpImage.format)
+                {
+                case VK_FORMAT_R16G16B16A16_SFLOAT: {
+                    const uint16_t* p = static_cast<const uint16_t*>(ptr) + i * 4;
+                    for (int c = 0; c < 3; ++c) rgb[c] = HalfToFloat(p[c]);
+                    break;
+                }
+                case VK_FORMAT_B10G11R11_UFLOAT_PACK32: {
+                    const uint32_t p = static_cast<const uint32_t*>(ptr)[i];
+                    rgb[0] = Uf11ToFloat(p & 0x7FF, 6); rgb[1] = Uf11ToFloat((p >> 11) & 0x7FF, 6); rgb[2] = Uf11ToFloat(p >> 22, 5);
+                    break;
+                }
+                default: {  // 8-bit UNORM RGBA/BGRA: already display-referred, undo nothing
+                    const uint8_t* p = static_cast<const uint8_t*>(ptr) + i * 4;
+                    const bool bgra  = m_dumpImage.format == VK_FORMAT_B8G8R8A8_UNORM || m_dumpImage.format == VK_FORMAT_B8G8R8A8_SRGB;
+                    const uint8_t out[3] = {p[bgra ? 2 : 0], p[1], p[bgra ? 0 : 2]};
+                    fwrite(out, 1, 3, f);
+                    continue;
+                }
+                }
+                const uint8_t out[3] = {toByte(rgb[0]), toByte(rgb[1]), toByte(rgb[2])};
+                fwrite(out, 1, 3, f);
+            }
+            fclose(f);
+            LOGI("wrote %s (%ux%u, format %d)", name, w, h, m_dumpImage.format);
+        }
+        fn.vkUnmapMemory(m_dev.device, m_dumpMemory);
+    }
+    fn.vkDestroyBuffer(m_dev.device, m_dumpBuffer, nullptr);
+    fn.vkFreeMemory(m_dev.device, m_dumpMemory, nullptr);
+    m_dumpBuffer = VK_NULL_HANDLE;
+    m_dumpMemory = VK_NULL_HANDLE;
 }
 
 NssUpscaler::~NssUpscaler()
@@ -513,8 +655,9 @@ static std::mutex g_registryMutex;
 
 UpscalerRegistry& Registry()
 {
-    static UpscalerRegistry registry;
-    return registry;
+    // Never destructed: at process exit the game's VkDevice is already gone, so nothing may touch it.
+    static UpscalerRegistry* registry = new UpscalerRegistry();
+    return *registry;
 }
 
 unsigned int UpscalerRegistry::Add(std::unique_ptr<NssUpscaler> upscaler)
