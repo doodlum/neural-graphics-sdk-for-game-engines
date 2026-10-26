@@ -29,13 +29,26 @@ typedef struct InstanceData
     void*                                    key;
     VkInstance                               instance;
     uint32_t                                 apiVersion;
+    bool                                     emulate;  // advertise the NVIDIA-only extensions to this instance
     PFN_vkGetInstanceProcAddr                gipa;
+    PFN_GetPhysicalDeviceProcAddr            gpdpa;  // next layer's physical-device proc lookup (may be NULL)
     PFN_vkDestroyInstance                    destroyInstance;
     PFN_vkEnumerateDeviceExtensionProperties enumerateDeviceExtensions;
     PFN_vkGetPhysicalDeviceFeatures2         getFeatures2;
     PFN_vkGetPhysicalDeviceProperties        getProperties;
+    PFN_vkEnumeratePhysicalDevices           enumeratePhysicalDevices;
+    PFN_vkEnumeratePhysicalDeviceGroups      enumeratePhysicalDeviceGroups;
     struct InstanceData*                     next;
 } InstanceData;
+
+// Physical device handle -> owning instance. Dispatch keys cannot tell instances apart reliably here: a process under
+// Proton has several (game, DXVK, vkd3d-proton, helpers) and the per-instance settings must not leak between them.
+typedef struct PhysicalDeviceData
+{
+    VkPhysicalDevice           handle;
+    InstanceData*              instance;
+    struct PhysicalDeviceData* next;
+} PhysicalDeviceData;
 
 typedef struct DeviceData
 {
@@ -51,6 +64,7 @@ typedef struct DeviceData
 static pthread_mutex_t g_lock      = PTHREAD_MUTEX_INITIALIZER;
 static InstanceData*   g_instances = NULL;
 static DeviceData*     g_devices   = NULL;
+static PhysicalDeviceData* g_physicalDevices = NULL;
 
 static void* DispatchKey(const void* handle) { return *(void* const*)handle; }
 
@@ -76,8 +90,33 @@ static DeviceData* FindDevice(const void* handle)
     return it;
 }
 
-// Physical devices share their instance's dispatch table, so instance lookup works for them too.
-static InstanceData* FindInstanceForPhysicalDevice(VkPhysicalDevice pd) { return FindInstance(pd); }
+static void RememberPhysicalDevice(VkPhysicalDevice pd, InstanceData* inst)
+{
+    pthread_mutex_lock(&g_lock);
+    PhysicalDeviceData* it = g_physicalDevices;
+    while (it && it->handle != pd)
+        it = it->next;
+    if (!it)
+    {
+        it                = calloc(1, sizeof(*it));
+        it->handle        = pd;
+        it->next          = g_physicalDevices;
+        g_physicalDevices = it;
+    }
+    it->instance = inst;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static InstanceData* FindInstanceForPhysicalDevice(VkPhysicalDevice pd)
+{
+    pthread_mutex_lock(&g_lock);
+    PhysicalDeviceData* it = g_physicalDevices;
+    while (it && it->handle != pd)
+        it = it->next;
+    InstanceData* inst = it ? it->instance : NULL;
+    pthread_mutex_unlock(&g_lock);
+    return inst ? inst : FindInstance(pd);
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Instance
@@ -90,9 +129,10 @@ static VkResult VKAPI_CALL Layer_CreateInstance(const VkInstanceCreateInfo* info
     if (!chain)
         return VK_ERROR_INITIALIZATION_FAILED;
 
-    PFN_vkGetInstanceProcAddr gipa = chain->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-    chain->u.pLayerInfo            = chain->u.pLayerInfo->pNext;
-    PFN_vkCreateInstance create    = (PFN_vkCreateInstance)gipa(VK_NULL_HANDLE, "vkCreateInstance");
+    PFN_vkGetInstanceProcAddr     gipa  = chain->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+    PFN_GetPhysicalDeviceProcAddr gpdpa = chain->u.pLayerInfo->pfnNextGetPhysicalDeviceProcAddr;
+    chain->u.pLayerInfo                 = chain->u.pLayerInfo->pNext;
+    PFN_vkCreateInstance create         = (PFN_vkCreateInstance)gipa(VK_NULL_HANDLE, "vkCreateInstance");
     VkResult             res       = create(info, alloc, out);
     if (res != VK_SUCCESS)
         return res;
@@ -103,12 +143,24 @@ static VkResult VKAPI_CALL Layer_CreateInstance(const VkInstanceCreateInfo* info
     d->apiVersion                = info->pApplicationInfo && info->pApplicationInfo->apiVersion ? info->pApplicationInfo->apiVersion
                                                                                                 : VK_API_VERSION_1_0;
     d->gipa                      = gipa;
+    d->gpdpa                     = gpdpa;
+    // DXVK and vkd3d-proton switch on NVIDIA-only interop paths (CUDA, Reflex) when they see the NVX/NV extensions;
+    // the emulation is only for games that use Vulkan directly. ML features are still enabled for them.
+    const char* engine = info->pApplicationInfo ? info->pApplicationInfo->pEngineName : NULL;
+    d->emulate         = !(engine && (!strncmp(engine, "vkd3d", 5) || !strncmp(engine, "DXVK", 4)));
+    const char* emulateEnv = getenv("AISS_LAYER_EMULATE");
+    if (emulateEnv && !strcmp(emulateEnv, "0"))
+        d->emulate = false;
+    if (getenv("AISS_LAYER_LOG"))
+        fprintf(stderr, "aiss-layer: instance engine '%s' api 0x%x emulate %d\n", engine ? engine : "(null)", d->apiVersion, d->emulate);
     d->destroyInstance           = (PFN_vkDestroyInstance)gipa(*out, "vkDestroyInstance");
     d->enumerateDeviceExtensions = (PFN_vkEnumerateDeviceExtensionProperties)gipa(*out, "vkEnumerateDeviceExtensionProperties");
     d->getFeatures2              = (PFN_vkGetPhysicalDeviceFeatures2)gipa(*out, "vkGetPhysicalDeviceFeatures2");
     if (!d->getFeatures2)
         d->getFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(*out, "vkGetPhysicalDeviceFeatures2KHR");
     d->getProperties = (PFN_vkGetPhysicalDeviceProperties)gipa(*out, "vkGetPhysicalDeviceProperties");
+    d->enumeratePhysicalDevices      = (PFN_vkEnumeratePhysicalDevices)gipa(*out, "vkEnumeratePhysicalDevices");
+    d->enumeratePhysicalDeviceGroups = (PFN_vkEnumeratePhysicalDeviceGroups)gipa(*out, "vkEnumeratePhysicalDeviceGroups");
     pthread_mutex_lock(&g_lock);
     d->next     = g_instances;
     g_instances = d;
@@ -133,6 +185,27 @@ static void VKAPI_CALL Layer_DestroyInstance(VkInstance instance, const VkAlloca
     free(d);
 }
 
+static VkResult VKAPI_CALL Layer_EnumeratePhysicalDevices(VkInstance instance, uint32_t* count, VkPhysicalDevice* out)
+{
+    InstanceData* inst = FindInstance(instance);
+    VkResult      res  = inst->enumeratePhysicalDevices(instance, count, out);
+    if (out && (res == VK_SUCCESS || res == VK_INCOMPLETE))
+        for (uint32_t i = 0; i < *count; ++i)
+            RememberPhysicalDevice(out[i], inst);
+    return res;
+}
+
+static VkResult VKAPI_CALL Layer_EnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t* count, VkPhysicalDeviceGroupProperties* out)
+{
+    InstanceData* inst = FindInstance(instance);
+    VkResult      res  = inst->enumeratePhysicalDeviceGroups(instance, count, out);
+    if (out && (res == VK_SUCCESS || res == VK_INCOMPLETE))
+        for (uint32_t i = 0; i < *count; ++i)
+            for (uint32_t j = 0; j < out[i].physicalDeviceCount; ++j)
+                RememberPhysicalDevice(out[i].physicalDevices[j], inst);
+    return res;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // NVX extension emulation
 // ---------------------------------------------------------------------------------------------------------------------
@@ -144,8 +217,20 @@ static const VkExtensionProperties kFakeExtensions[] = {
 };
 #define FAKE_EXTENSION_COUNT (sizeof(kFakeExtensions) / sizeof(kFakeExtensions[0]))
 
+static bool IsFakeExtension(const char* name)
+{
+    for (uint32_t f = 0; f < FAKE_EXTENSION_COUNT; ++f)
+        if (!strcmp(name, kFakeExtensions[f].extensionName))
+            return true;
+    return false;
+}
+
+// The loader reports the extensions this layer's manifest declares as if the driver had them, so the emulated ones
+// are never taken from here: RADV has none of them (this layer targets the Steam Deck).
 static bool DriverHasExtension(InstanceData* inst, VkPhysicalDevice pd, const char* name)
 {
+    if (IsFakeExtension(name))
+        return false;
     uint32_t count = 0;
     inst->enumerateDeviceExtensions(pd, NULL, &count, NULL);
     VkExtensionProperties* props = calloc(count ? count : 1, sizeof(*props));
@@ -175,15 +260,15 @@ static VkResult VKAPI_CALL Layer_EnumerateDeviceExtensionProperties(VkPhysicalDe
         return res;
     VkExtensionProperties* all = calloc(driverCount + FAKE_EXTENSION_COUNT, sizeof(*all));
     inst->enumerateDeviceExtensions(pd, NULL, &driverCount, all);
-    uint32_t total = driverCount;
-    for (uint32_t f = 0; f < FAKE_EXTENSION_COUNT; ++f)
-    {
-        bool present = false;
-        for (uint32_t i = 0; i < driverCount && !present; ++i)
-            present = !strcmp(all[i].extensionName, kFakeExtensions[f].extensionName);
-        if (!present)
-            all[total++] = kFakeExtensions[f];
-    }
+    // Drop the emulated extensions from the loader's list (it adds them for every instance because the manifest
+    // declares them), then add them back only for instances that should see them.
+    uint32_t    total = 0;
+    const char* hide  = getenv("AISS_LAYER_HIDE");  // comma-separated extension names hidden from the app (debugging)
+    for (uint32_t i = 0; i < driverCount; ++i)
+        if (!IsFakeExtension(all[i].extensionName) && !(hide && strstr(hide, all[i].extensionName)))
+            all[total++] = all[i];
+    for (uint32_t f = 0; f < FAKE_EXTENSION_COUNT && inst->emulate; ++f)
+        all[total++] = kFakeExtensions[f];
 
     if (!out)
     {
@@ -420,9 +505,15 @@ static VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice pd, const VkDevic
             fakeNvx = true;
     }
 
+    if (getenv("AISS_LAYER_LOG"))
+        for (uint32_t f = 0; f < FAKE_EXTENSION_COUNT; ++f)
+            fprintf(stderr, "aiss-layer: createDevice inst %p emulate %d driver has %s: %d\n", (void*)inst, inst->emulate,
+                    kFakeExtensions[f].extensionName, DriverHasExtension(inst, pd, kFakeExtensions[f].extensionName));
     VkDeviceCreateInfo modified = *info;
     FeatureStorage     storage;
-    EnableMlFeatures(inst, pd, &modified, &storage, exts, &extCount);
+    const char*        featuresEnv = getenv("AISS_LAYER_FEATURES");
+    if (!featuresEnv || strcmp(featuresEnv, "0"))
+        EnableMlFeatures(inst, pd, &modified, &storage, exts, &extCount);
     modified.enabledExtensionCount   = extCount;
     modified.ppEnabledExtensionNames = exts;
 
@@ -441,8 +532,9 @@ static VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice pd, const VkDevic
     d->key           = DispatchKey(*out);
     d->gdpa          = gdpa;
     d->destroyDevice = (PFN_vkDestroyDevice)gdpa(*out, "vkDestroyDevice");
-    d->fakeNvx        = fakeNvx;
-    d->fakeLowLatency = fakeLowLatency;
+    // Never serve stubs to an instance the extensions were not advertised to (DXVK, vkd3d-proton).
+    d->fakeNvx        = fakeNvx && inst->emulate;
+    d->fakeLowLatency = fakeLowLatency && inst->emulate;
     d->signalSemaphore = (PFN_vkSignalSemaphore)gdpa(*out, "vkSignalSemaphore");
     if (!d->signalSemaphore)
         d->signalSemaphore = (PFN_vkSignalSemaphore)gdpa(*out, "vkSignalSemaphoreKHR");
@@ -492,7 +584,10 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetDeviceProcAddr(VkDevice 
         if (fake)
             return fake;
     }
-    return d ? d->gdpa(device, name) : NULL;
+    PFN_vkVoidFunction fn = d ? d->gdpa(device, name) : NULL;
+    if (!fn && getenv("AISS_LAYER_LOG"))
+        fprintf(stderr, "aiss-layer: vkGetDeviceProcAddr(%s) -> NULL (device %s)\n", name, d ? "known" : "UNKNOWN");
+    return fn;
 }
 
 EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetInstanceProcAddr(VkInstance instance, const char* name)
@@ -507,6 +602,10 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetInstanceProcAddr(VkInsta
         return (PFN_vkVoidFunction)Layer_CreateDevice;
     if (!strcmp(name, "vkEnumerateDeviceExtensionProperties"))
         return (PFN_vkVoidFunction)Layer_EnumerateDeviceExtensionProperties;
+    if (!strcmp(name, "vkEnumeratePhysicalDevices"))
+        return (PFN_vkVoidFunction)Layer_EnumeratePhysicalDevices;
+    if (!strcmp(name, "vkEnumeratePhysicalDeviceGroups") || !strcmp(name, "vkEnumeratePhysicalDeviceGroupsKHR"))
+        return (PFN_vkVoidFunction)Layer_EnumeratePhysicalDeviceGroups;
     if (!strcmp(name, "vkGetDeviceProcAddr"))
         return (PFN_vkVoidFunction)aiss_GetDeviceProcAddr;
     if (!strcmp(name, "vkDestroyDevice"))
@@ -517,12 +616,20 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetInstanceProcAddr(VkInsta
     return d ? d->gipa(instance, name) : NULL;
 }
 
+// Physical-device functions the loader has no trampoline for (newer extensions) are resolved through this chain;
+// without it they would come back NULL to DXVK/vkd3d-proton.
+EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetPhysicalDeviceProcAddr(VkInstance instance, const char* name)
+{
+    InstanceData* d = FindInstance(instance);
+    return d && d->gpdpa ? d->gpdpa(instance, name) : NULL;
+}
+
 EXPORT VKAPI_ATTR VkResult VKAPI_CALL aiss_NegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v)
 {
     if (v->loaderLayerInterfaceVersion > 2)
         v->loaderLayerInterfaceVersion = 2;
     v->pfnGetInstanceProcAddr       = aiss_GetInstanceProcAddr;
     v->pfnGetDeviceProcAddr         = aiss_GetDeviceProcAddr;
-    v->pfnGetPhysicalDeviceProcAddr = NULL;
+    v->pfnGetPhysicalDeviceProcAddr = aiss_GetPhysicalDeviceProcAddr;
     return VK_SUCCESS;
 }

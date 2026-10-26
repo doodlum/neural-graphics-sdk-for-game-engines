@@ -26,20 +26,22 @@ NVIDIA. The ML runtime still picks its kernels from the real hardware (Vulkan dr
 
 ## Performance (Steam Deck, RDNA2)
 
-The int8 `dot4` path has an RDNA2-specific register-tiled kernel (see `docs/nss_gpu_tuning.md`). NSS mid_low network,
-640x400 → 1280x800 (DLSS Performance), per-pass GPU time in a real frame of the Streamline sample:
+The int8 `dot4` path has an RDNA2-specific register-tiled kernel, and the pre/post-process shaders were reworked
+for the Deck, bit-exact against the original code (`ffx_nss_replay_test --suite --check`; see `docs/nss_gpu_tuning.md`).
+NSS mid_low network, 640x400 → 1280x800 (DLSS Performance), per-pass GPU time in a real D3D12 frame of the Streamline
+sample:
 
-| Pass | µs |
-| --- | --- |
-| Depth scatter | 32 |
-| Disocclusion mask | 204 |
-| Preprocess | 186 |
-| ML graph | 452 |
-| Postprocess | 806 |
-| **Total** | **1683** |
+| Pass | Before tuning (µs) | Now (µs) |
+| --- | --- | --- |
+| Depth scatter | 32 | 30 |
+| Disocclusion mask | 204 | 24 |
+| Preprocess | 186 | 138 |
+| ML graph | ~3000 (original dot4 kernel), 452 (first RDNA2 kernel) | 407 |
+| Postprocess | 806 | 371 |
+| **Total** | **1683** (with the RDNA2 ML kernel) | **973** |
 
 In the Streamline sample with ray tracing on, D3D12 runs at 9 FPS natively at 1280x722 and 22-24 FPS with DLSS
-Performance → NSS at 1280x800.
+Performance → NSS at 1280x800 (measured before the pre/post-process tuning).
 
 DLSS quality modes map to NSS's small (mid_low) network. NSS's QUALITY mode switches to the large network, which costs
 about 5x more on the Deck; it is only used with `AISS_NSS_QUALITY=0`.
@@ -81,13 +83,15 @@ Use the Decky plugin for this. By hand:
 | `AISS_DEBUG_VIEW=0..16` | Write NSS's internal views instead of the image (0 = 4x4 grid) |
 | `AISS_DUMP_FRAME=N` | Write output frame N to `aiss_frame_N.ppm` |
 | `FFX_PROFILE_PASSES=file` | Per-pass GPU timings |
+| `AISS_LAYER_LOG=1` | Vulkan layer: log instances, device extensions and NULL proc lookups to stderr |
+| `AISS_LAYER_FEATURES=0`, `AISS_LAYER_EMULATE=0` | Vulkan layer: don't force ML features / don't emulate the NVIDIA extensions (debugging) |
 
 ## Tested
 
 All tests use the original Streamline Sample 2.14.16 with the production Streamline plugins, cross-built with
 clang-cl, under Proton Experimental:
 
-- **D3D12**: DLSS reported supported. NSS runs inline on vkd3d-proton; the output, the debug view (depth, motion vectors, disocclusion) and the exit are clean.
+- **D3D12** (with and without the Vulkan layer): DLSS reported supported. NSS runs inline on vkd3d-proton; the output, the debug view (depth, motion vectors, disocclusion) and the exit are clean. The layer hides its emulated NVIDIA extensions from DXVK and vkd3d-proton, which would otherwise switch on Reflex/CUDA interop paths that nothing implements.
 - **Vulkan** (`-vk`): DLSS reported supported; output frame verified with `AISS_DUMP_FRAME`; clean exit.
 - **D3D11**: the sample's D3D11 path needs `fxc`, so `steamdeck/tests/ngx_d3d11_test` drives the NGX D3D11 API on DXVK instead (64 evaluations, upscaled output within 0.009 mean error of the reference).
 
