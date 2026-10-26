@@ -743,8 +743,18 @@ static FfxErrorCode nssCreate(FfxNssContext_Private* context, const FfxNssContex
         context->reducedFractionLrSize.height = renderSize.height / gcdHeight;
 
         const uint32_t lutGroupsPerTile = offsetLutGroupsPerTile(context->pipelineFlags);
-        context->offsetLutSize.width    = lutGroupsPerTile * context->reducedFractionHrSize.width;
-        context->offsetLutSize.height   = context->reducedFractionHrSize.height;
+        if (lutGroupsPerTile == 3)
+        {
+            // Dense (QUALITY) filter: separable LUT, one texel per x tile (row 0) and per y tile (row 1); see
+            // GenerateOffsetLutAxis in ffx_nss_generate_offset_lut.h.
+            context->offsetLutSize.width  = FFX_MAXIMUM(context->reducedFractionHrSize.width, context->reducedFractionHrSize.height);
+            context->offsetLutSize.height = 2;
+        }
+        else
+        {
+            context->offsetLutSize.width  = lutGroupsPerTile * context->reducedFractionHrSize.width;
+            context->offsetLutSize.height = context->reducedFractionHrSize.height;
+        }
     }
     else
     {
@@ -1692,7 +1702,10 @@ static FfxErrorCode nssDispatch(FfxNssContext_Private* context, const FfxNssDisp
 
     if (context->useDynamicOffsetLut)
     {
-        const uint32_t tileCount    = context->reducedFractionHrSize.width * context->reducedFractionHrSize.height;
+        // Dense (QUALITY) LUT is separable: one thread per x tile plus one per y tile.
+        const bool     separable    = offsetLutGroupsPerTile(context->pipelineFlags) == 3;
+        const uint32_t tileCount    = separable ? context->reducedFractionHrSize.width + context->reducedFractionHrSize.height
+                                                : context->reducedFractionHrSize.width * context->reducedFractionHrSize.height;
         const uint32_t dispatchLutX = FFX_DIVIDE_ROUNDING_UP(tileCount, 64u);
         scheduleDispatch(context, params, &context->pipelineNssGenerateOffsetLut, dispatchLutX, 1, "GenerateOffsetLut");
     }

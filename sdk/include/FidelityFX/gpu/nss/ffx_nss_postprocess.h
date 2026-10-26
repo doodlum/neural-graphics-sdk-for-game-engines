@@ -653,6 +653,15 @@ void AccumulatePackedLrOffsetTap(
 #endif
 
 #if NSS_FILTER_MODE == 2
+// Candidate rank -> tap channel (bits 0..5) and the axis offsets + 2 (x: bits 8..10, y: bits 12..14). Same order as
+// kCandidateLinear / kCandidateOffsetYx in ffx_nss_generate_offset_lut.h.
+const uint32_t kDenseRankInfo[36] = uint32_t[36](
+    0x220Eu, 0x2108u, 0x120Du, 0x320Fu, 0x2314u, 0x1107u, 0x3109u, 0x1313u, 0x3315u, 0x2002u, 0x020Cu, 0x4210u,
+    0x241Au, 0x1001u, 0x3003u, 0x0106u, 0x410Au, 0x0312u, 0x4316u, 0x1419u, 0x341Bu, 0x0000u, 0x4004u, 0x0418u,
+    0x441Cu, 0x5211u, 0x2520u, 0x510Bu, 0x5317u, 0x151Fu, 0x3521u, 0x5005u, 0x541Du, 0x051Eu, 0x4522u, 0x5523u);
+
+// Selected-tap reconstruction from the separable LUT (see GenerateOffsetLutAxis): ranks valid on both axes, lowest
+// first, at most 9 - exactly the taps the per-tile LUT packed, in the same order.
 void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 center_sample)
 {
     int32_t2 colour_max = InputDims() - int32_t2(1);
@@ -665,20 +674,40 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     half4 accum_m2 = half4(0.HF);
     center_sample  = half4(0.HF);
 
-    uint32_t4 packed_taps0 = LoadOffsetLutPacked4(tile_idx, int32_t(0));
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps0.x), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps0.y), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps0.z), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps0.w), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
+    uint32_t4 axis_x  = texelFetch(_OffsetLutUint4Tex, int32_t2(tile_idx.x, 0), 0);
+    uint32_t4 axis_y  = texelFetch(_OffsetLutUint4Tex, int32_t2(tile_idx.y, 1), 0);
+    uint32_t  rank_lo = axis_x.z & axis_y.z;
+    uint32_t  rank_hi = axis_x.w & axis_y.w;
 
-    uint32_t4 packed_taps1 = LoadOffsetLutPacked4(tile_idx, int32_t(1));
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps1.x), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps1.y), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps1.z), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps1.w), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
+    for (int32_t k = int32_t(0); k < int32_t(9); ++k)
+    {
+        if ((rank_lo | rank_hi) == uint32_t(0))
+        {
+            break;
+        }
+        int32_t rank;
+        if (rank_lo != uint32_t(0))
+        {
+            rank    = findLSB(rank_lo);
+            rank_lo &= rank_lo - uint32_t(1);
+        }
+        else
+        {
+            rank    = int32_t(32) + findLSB(rank_hi);
+            rank_hi &= rank_hi - uint32_t(1);
+        }
+        uint32_t info = kDenseRankInfo[rank];
+        int32_t  ix   = int32_t((info >> uint32_t(8)) & uint32_t(7));
+        int32_t  iy   = int32_t((info >> uint32_t(12)) & uint32_t(7));
 
-    uint32_t4 packed_taps2 = LoadOffsetLutPacked4(tile_idx, int32_t(2));
-    AccumulatePackedLrOffsetTap(DecodePackedOffsetLutTap(packed_taps2.x), lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
+        OffsetLutTap tap;
+        tap.lr_offset   = int32_t2(bitfieldExtract(int32_t(ix < int32_t(4) ? axis_x.x : axis_x.y), (ix & int32_t(3)) * int32_t(8), int32_t(8)),
+                                 bitfieldExtract(int32_t(iy < int32_t(4) ? axis_y.x : axis_y.y), (iy & int32_t(3)) * int32_t(8), int32_t(8)));
+        tap.tap_channel = int32_t(info & uint32_t(0x3F));
+        tap.valid       = true;
+        tap.center      = rank == int32_t(0);
+        AccumulatePackedLrOffsetTap(tap, lr_base, colour_max, kpn_max, accum_m1, accum_m2, center_sample);
+    }
 
     NormalizeFilterMoments(accum_m1, accum_m2, m1, m2);
 }

@@ -175,8 +175,88 @@ void StoreLutRow(int32_t tile_x, int32_t tile_y, uint32_t packed_taps[kPackedTap
 #endif
 }
 
+#if NSS_FILTER_MODE == 2
+// Dense (QUALITY) LUT in separable form. Whether a candidate tap is valid and its low-res offset depend on x and y
+// independently (LoadBaseLutSample / PackTap are per axis), and the candidate order is fixed. So instead of
+// T_W x T_H tiles of 9 packed taps (3 rgba32ui texels each), the LUT holds one texel per x tile (row 0) and one per
+// y tile (row 1):
+//   .x  int8 lr offsets for axis offsets d = -2..1 (byte d + 2)
+//   .y  int8 lr offsets for d = 2..3 (bytes 0..1)
+//   .zw 36-bit mask over the candidate ranks: bit r set when this axis' component of candidate r is valid
+// The postprocess ANDs the x and y masks and takes the first 9 set ranks, which reproduces the packed taps of the
+// per-tile LUT exactly (same arithmetic per axis, integer combination only). lut_idx < T_W: x tile, then y tiles.
+void GenerateOffsetLutAxis(int32_t lut_idx)
+{
+    int32_t idx_mod_x = max(IndexModulo().x, int32_t(1));
+    int32_t idx_mod_y = max(IndexModulo().y, int32_t(1));
+    bool    y_axis    = lut_idx >= idx_mod_x;
+    int32_t t         = y_axis ? lut_idx - idx_mod_x : lut_idx;
+    if (y_axis && t >= idx_mod_y)
+    {
+        return;
+    }
+
+    int32_t modulo    = y_axis ? idx_mod_y : idx_mod_x;
+    int32_t in_modulo = y_axis ? ReducedInputModulo().y : ReducedInputModulo().x;
+    float   scale     = y_axis ? Scale().y : Scale().x;
+    float   inv_scale = y_axis ? InvScale().y : InvScale().x;
+    float   jitter    = y_axis ? JitterOffset().y : JitterOffset().x;
+
+    uint32_t offsets_lo = uint32_t(0);
+    uint32_t offsets_hi = uint32_t(0);
+    uint32_t valid_bits = uint32_t(0);
+    for (int32_t i = int32_t(0); i < int32_t(6); ++i)
+    {
+        int32_t d  = i - int32_t(2);
+        int32_t hr = PositiveMod(t + d, modulo);
+        int32_t lr = int32_t(0);
+        if (!AxisSourceForHr(hr, in_modulo, scale, inv_scale, jitter, lr))
+        {
+            continue;
+        }
+        // LoadBaseLutSample + PackTap, one axis.
+        int32_t back_projected = int32_t(floor((float(hr) + 0.5) * inv_scale));
+        int32_t tile_offset    = lr - back_projected;
+        int32_t lr_base        = int32_t(floor(float(t) * inv_scale));
+        int32_t lr_tap         = int32_t(floor((float(t + d) + 0.5) * inv_scale + 1e-3)) + tile_offset;
+        uint32_t code          = EncodeI8(lr_tap - lr_base);
+        if (i < int32_t(4))
+        {
+            offsets_lo |= code << uint32_t(8 * i);
+        }
+        else
+        {
+            offsets_hi |= code << uint32_t(8 * (i - 4));
+        }
+        valid_bits |= uint32_t(1) << uint32_t(i);
+    }
+
+    uint32_t rank_lo = uint32_t(0);
+    uint32_t rank_hi = uint32_t(0);
+    for (int32_t r = int32_t(0); r < kCandidateCount; ++r)
+    {
+        int32_t d = y_axis ? kCandidateOffsetYx[r].x : kCandidateOffsetYx[r].y;
+        if ((valid_bits & (uint32_t(1) << uint32_t(d + 2))) != uint32_t(0))
+        {
+            if (r < int32_t(32))
+            {
+                rank_lo |= uint32_t(1) << uint32_t(r);
+            }
+            else
+            {
+                rank_hi |= uint32_t(1) << uint32_t(r - 32);
+            }
+        }
+    }
+    imageStore(rw_offset_lut, int32_t2(t, y_axis ? 1 : 0), uint32_t4(offsets_lo, offsets_hi, rank_lo, rank_hi));
+}
+#endif  // NSS_FILTER_MODE == 2
+
 void GenerateOffsetLut(int32_t lut_idx)
 {
+#if NSS_FILTER_MODE == 2
+    GenerateOffsetLutAxis(lut_idx);
+#else
     int32_t idx_mod_x  = max(IndexModulo().x, int32_t(1));
     int32_t idx_mod_y  = max(IndexModulo().y, int32_t(1));
     int32_t tile_count = idx_mod_x * idx_mod_y;
@@ -216,6 +296,7 @@ void GenerateOffsetLut(int32_t lut_idx)
     }
 
     StoreLutRow(tile_x, tile_y, packed_taps);
+#endif  // NSS_FILTER_MODE == 2
 }
 
 #else
