@@ -19,6 +19,7 @@ add_library(nvngx SHARED
     params.cpp
     nss_upscaler.cpp
     ngx_common.cpp
+    ngx_d3d11.cpp
     ngx_d3d12.cpp
     ngx_vulkan.cpp
     ngx_misc.cpp
