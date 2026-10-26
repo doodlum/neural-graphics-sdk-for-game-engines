@@ -70,10 +70,24 @@ void WriteDisocclusionMaskLqOut(int32_t2 pixel, float mask)
 void DisocclusionFindDepthMotion4x4(int32_t2 dst_pos, out float closest_depth, out float2 closest_motion, out float local_view_depth_range)
 {
     int32_t2 src_base = int32_t2(float2(dst_pos) * (float2(InputDims()) * InvDepthSize()));
-    int32_t2 src_pos  = clamp(src_base, int32_t2(0), InputDims() - int32_t2(1));
+    int32_t2 max_pos  = InputDims() - int32_t2(1);
+    int32_t2 src_pos  = clamp(src_base, int32_t2(0), max_pos);
 
-    closest_depth  = texelFetch(_DepthTex, src_pos, 0).r;
-    closest_motion = texelFetch(_MotionTex, src_pos, 0).xy * MotionVectorScale();
+    // Issue all 17 depth loads up front (clamped addresses, off-screen samples are skipped below) and fetch the
+    // motion vector once for the winning sample: the scan below picks the same sample as a sequential load-and-test
+    // loop, but the loads no longer form a dependent chain.
+    float base_depth = texelFetch(_DepthTex, src_pos, 0).r;
+    float sample_depths[16];
+    for (int y = 0; y < 4; ++y)
+    {
+        for (int x = 0; x < 4; ++x)
+        {
+            sample_depths[y * 4 + x] = texelFetch(_DepthTex, clamp(src_base + int32_t2(x, y), int32_t2(0), max_pos), 0).r;
+        }
+    }
+
+    closest_depth        = base_depth;
+    int32_t2 closest_pos = src_pos;
 
     // Grazing planes can span a large view-depth range inside one LQ footprint.
     float src_view_depth = GetViewSpaceDepth(closest_depth);
@@ -87,19 +101,20 @@ void DisocclusionFindDepthMotion4x4(int32_t2 dst_pos, out float closest_depth, o
             int32_t2 sample_pos = src_base + int32_t2(x, y);
             if (IsOnScreen(sample_pos, InputDims()))
             {
-                float sample_depth      = texelFetch(_DepthTex, sample_pos, 0).r;
+                float sample_depth      = sample_depths[y * 4 + x];
                 float sample_view_depth = GetViewSpaceDepth(sample_depth);
                 min_view_depth          = min(min_view_depth, sample_view_depth);
                 max_view_depth          = max(max_view_depth, sample_view_depth);
                 if (NSS_NEAREST_STEP(closest_depth, sample_depth) > 0.0)
                 {
-                    closest_depth  = sample_depth;
-                    closest_motion = texelFetch(_MotionTex, sample_pos, 0).xy * MotionVectorScale();
+                    closest_depth = sample_depth;
+                    closest_pos   = sample_pos;
                 }
             }
         }
     }
 
+    closest_motion         = texelFetch(_MotionTex, closest_pos, 0).xy * MotionVectorScale();
     local_view_depth_range = max_view_depth - min_view_depth;
 }
 
@@ -121,7 +136,7 @@ float DisocclusionComputeDepthClip(float2 uv, float current_depth, float local_v
     float f_depth      = 0.0;
     float f_weight_sum = 0.0;
 
-#define NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(SAMPLE_POS, SAMPLE_WEIGHT)                                                       \
+#define NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(SAMPLE_POS, SAMPLE_WEIGHT, PREV_RAW)                                                     \
     {                                                                                                                   \
         int32_t2 sample_pos = (SAMPLE_POS);                                                                             \
         float    weight     = (SAMPLE_WEIGHT);                                                                          \
@@ -129,7 +144,7 @@ float DisocclusionComputeDepthClip(float2 uv, float current_depth, float local_v
         f_weight_sum += onscreen ? 0.0 : weight;                                                                        \
         if (onscreen && weight > bilinear_weight_threshold)                                                             \
         {                                                                                                               \
-            float prev_depth      = float(texelFetch(_DepthTm1Tex, sample_pos, 0).r) * kNssLqDisocclusionInvDepthScale; \
+            float prev_depth      = float(PREV_RAW) * kNssLqDisocclusionInvDepthScale;                                  \
             float prev_view_depth = GetViewSpaceDepth(prev_depth);                                                      \
             float depth_diff      = current_view_depth - prev_view_depth;                                               \
             if (depth_diff > 0.0)                                                                                       \
@@ -143,10 +158,17 @@ float DisocclusionComputeDepthClip(float2 uv, float current_depth, float local_v
         }                                                                                                               \
     }
 
-    NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(sample_base + int32_t2(0, 0), w00);
-    NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(sample_base + int32_t2(1, 0), w10);
-    NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(sample_base + int32_t2(0, 1), w01);
-    NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(sample_base + int32_t2(1, 1), w11);
+    // The four previous-depth loads are issued together (clamped; only used for on-screen taps).
+    int32_t2 prev_max = depth_size - int32_t2(1);
+    uint32_t prev00   = texelFetch(_DepthTm1Tex, clamp(sample_base + int32_t2(0, 0), int32_t2(0), prev_max), 0).r;
+    uint32_t prev10   = texelFetch(_DepthTm1Tex, clamp(sample_base + int32_t2(1, 0), int32_t2(0), prev_max), 0).r;
+    uint32_t prev01   = texelFetch(_DepthTm1Tex, clamp(sample_base + int32_t2(0, 1), int32_t2(0), prev_max), 0).r;
+    uint32_t prev11   = texelFetch(_DepthTm1Tex, clamp(sample_base + int32_t2(1, 1), int32_t2(0), prev_max), 0).r;
+
+    NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(sample_base + int32_t2(0, 0), w00, prev00);
+    NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(sample_base + int32_t2(1, 0), w10, prev10);
+    NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(sample_base + int32_t2(0, 1), w01, prev01);
+    NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ(sample_base + int32_t2(1, 1), w11, prev11);
 
 #undef NSS_DEPTH_CLIP_SAMPLE_BLOCK_LQ
 

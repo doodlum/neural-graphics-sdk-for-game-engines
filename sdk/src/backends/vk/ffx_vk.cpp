@@ -6962,6 +6962,9 @@ FfxErrorCode ScheduleGpuJobVK(FfxInterface* backendInterface, const FfxGpuJobDes
     return FFX_OK;
 }
 
+// Set by the FFX_PROFILE_PASSES profiler when FFX_PROFILE_BARRIERS=1: timestamps the end of a job's barriers.
+static void (*s_profileAfterBarriers)(VkCommandBuffer) = nullptr;
+
 static FfxErrorCode executeGpuJobCompute(BackendContext_VK*    backendContext,
                                          FfxGpuJobDescription* job,
                                          VkCommandBuffer       vkCommandBuffer,
@@ -7268,6 +7271,8 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_VK*    backendContext,
 
     // insert all the barriers
     flushBarriers(backendContext, vkCommandBuffer);
+    if (s_profileAfterBarriers)
+        s_profileAfterBarriers(vkCommandBuffer);
 
     // update all uavs and srvs
     VulkanWrapper().vkUpdateDescriptorSets(backendContext->device, descriptorWriteIndex, writeDescriptorSets, 0, nullptr);
@@ -8310,6 +8315,15 @@ namespace
                 slot = ~0u;
         }
 
+        // Optional split point inside a job (FFX_PROFILE_BARRIERS=1): time up to the end of the job's barriers.
+        void Mark(VkCommandBuffer cmd, const char* what)
+        {
+            if (slot == ~0u || labels[slot].size() + 2 >= kMaxQueries)
+                return;
+            labels[slot].push_back(std::to_string(labels[slot].size()) + "_" + what);
+            cmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, slot * kMaxQueries + uint32_t(labels[slot].size()));
+        }
+
         void After(VkCommandBuffer cmd, const FfxGpuJobDescription& job)
         {
             if (slot == ~0u)
@@ -8373,7 +8387,14 @@ FfxErrorCode ExecuteGpuJobsVK(FfxInterface* backendInterface, FfxCommandList com
 
     JobProfiler* profiler = JobProfiler::Get(backendContext->device, backendContext->physicalDevice);
     if (profiler)
-        profiler->Begin(vkCommandBuffer, backendContext->gpuJobCount);
+    {
+        profiler->Begin(vkCommandBuffer, backendContext->gpuJobCount * 2);
+        static const bool splitBarriers = getenv("FFX_PROFILE_BARRIERS") && atoi(getenv("FFX_PROFILE_BARRIERS")) != 0;
+        static JobProfiler* active = nullptr;
+        active = profiler;
+        if (splitBarriers)
+            s_profileAfterBarriers = [](VkCommandBuffer cmd) { active->Mark(cmd, "barriers"); };
+    }
 
     // execute all renderjobs
     for (uint32_t i = 0; i < backendContext->gpuJobCount; ++i)

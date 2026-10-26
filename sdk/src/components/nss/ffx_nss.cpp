@@ -1683,8 +1683,8 @@ static FfxErrorCode nssDispatch(FfxNssContext_Private* context, const FfxNssDisp
     }
     else
     {
-        const int32_t dispatchSrcX = FFX_DIVIDE_ROUNDING_UP(context->dataGraphSize.width, FFX_NSS_THREAD_GROUP_WIDTH);
-        const int32_t dispatchSrcY = FFX_DIVIDE_ROUNDING_UP(context->dataGraphSize.height, FFX_NSS_THREAD_GROUP_HEIGHT);
+        const int32_t dispatchSrcX = FFX_DIVIDE_ROUNDING_UP(context->dataGraphSize.width, FFX_NSS_PREPROCESS_THREAD_GROUP_WIDTH);
+        const int32_t dispatchSrcY = FFX_DIVIDE_ROUNDING_UP(context->dataGraphSize.height, FFX_NSS_PREPROCESS_THREAD_GROUP_HEIGHT);
         scheduleDispatch(context, params, &context->pipelineNssPreprocess, dispatchSrcX, dispatchSrcY, "Preprocess");
     }
 
@@ -1704,8 +1704,13 @@ static FfxErrorCode nssDispatch(FfxNssContext_Private* context, const FfxNssDisp
     }
     else
     {
-        const int32_t dispatchDstX = FFX_DIVIDE_ROUNDING_UP(params->upscaleSize.width, FFX_NSS_THREAD_GROUP_WIDTH);
-        const int32_t dispatchDstY = FFX_DIVIDE_ROUNDING_UP(params->upscaleSize.height, FFX_NSS_THREAD_GROUP_HEIGHT);
+        // The exact-2x sparse (BALANCE/PERFORMANCE) compute shader handles a 2x2 output quad per thread.
+        const bool    quadPerThread = (context->pipelineFlags & NSS_SHADER_PERMUTATION_SCALE_PRESET_X2) != 0 &&
+                                   context->contextDescription.qualityMode != FFX_NSS_SHADER_QUALITY_MODE_QUALITY;
+        const uint32_t threadsX     = quadPerThread ? FFX_DIVIDE_ROUNDING_UP(params->upscaleSize.width, 2u) : params->upscaleSize.width;
+        const uint32_t threadsY     = quadPerThread ? FFX_DIVIDE_ROUNDING_UP(params->upscaleSize.height, 2u) : params->upscaleSize.height;
+        const int32_t  dispatchDstX = FFX_DIVIDE_ROUNDING_UP(threadsX, FFX_NSS_THREAD_GROUP_WIDTH);
+        const int32_t  dispatchDstY = FFX_DIVIDE_ROUNDING_UP(threadsY, FFX_NSS_THREAD_GROUP_HEIGHT);
         scheduleDispatch(context, params, &context->pipelineNssPostprocess, dispatchDstX, dispatchDstY, "Postprocess");
     }
 

@@ -62,6 +62,11 @@
 #define FFX_NSS_THREAD_GROUP_HEIGHT 16
 #define FFX_NSS_THREAD_GROUP_DEPTH  1
 
+// Pre-process (data graph resolution) workgroup. It is much smaller than the output, so smaller workgroups balance
+// better across CUs (e.g. 320x200 is 260 16x16 groups with a half-empty last row, but 1000 8x8 groups).
+#define FFX_NSS_PREPROCESS_THREAD_GROUP_WIDTH  8
+#define FFX_NSS_PREPROCESS_THREAD_GROUP_HEIGHT 8
+
 #endif  // #if defined(FFX_CPU) || defined(FFX_GPU)
 
 #endif  //!defined( FFX_NSS_RESOURCES_H )

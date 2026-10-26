@@ -928,7 +928,28 @@ void Preprocess(int32_t2 tensor_input_pixel)
     //-------------------------------------------------------------------------
     float    depth_dilated  = 0.0;
     int32_t2 nearest_offset = int32_t2(0);
+#if NSS_PREPROCESS_HALF_RES_INPUT
+    // One lane record per input pixel of the 2x2 footprint (history reprojection and the packed nearest offsets).
+    int32_t2           lane_base_input_coord = HalfResProcessCoordToBaseInputCoord(process_coord);
+    PreProcessLaneData history_lane_00       = BuildPreProcessLaneData(lane_base_input_coord);
+    PreProcessLaneData history_lane_10       = BuildPreProcessLaneData(min(lane_base_input_coord + int32_t2(1, 0), InputDims() - int32_t2(1)));
+    PreProcessLaneData history_lane_01       = BuildPreProcessLaneData(min(lane_base_input_coord + int32_t2(0, 1), InputDims() - int32_t2(1)));
+    PreProcessLaneData history_lane_11       = BuildPreProcessLaneData(min(lane_base_input_coord + int32_t2(1, 1), InputDims() - int32_t2(1)));
+
+    // The centre search normally starts at the (1,1) lane's pixel (even input sizes); reuse that search then.
+    int32_t2 centre_px = int32_t2(uv * float2(InputDims()));
+    if (all(equal(centre_px, history_lane_11.input_coord)))
+    {
+        depth_dilated  = history_lane_11.depth_dilated;
+        nearest_offset = history_lane_11.nearest_offset;
+    }
+    else
+    {
+        FindNearestDepth_4x4_FromPixel(centre_px, InputDims(), depth_dilated, nearest_offset);
+    }
+#else
     FindNearestDepth_4x4(uv, depth_dilated, nearest_offset);
+#endif
 
     //-------------------------------------------------------------------------
     // 3) Motion sampling and reprojection setup
@@ -962,19 +983,7 @@ void Preprocess(int32_t2 tensor_input_pixel)
     half3 unjittered_colour_h = LoadColourUnjittered(unjitter_uv);
     half3 lr_warped_history_h;
 #if NSS_PREPROCESS_HALF_RES_INPUT
-    {
-        int32_t2 history_base_input_coord = HalfResProcessCoordToBaseInputCoord(process_coord);
-        int32_t2 history_lane_input_00    = history_base_input_coord;
-        int32_t2 history_lane_input_10    = min(history_base_input_coord + int32_t2(1, 0), InputDims() - int32_t2(1));
-        int32_t2 history_lane_input_01    = min(history_base_input_coord + int32_t2(0, 1), InputDims() - int32_t2(1));
-        int32_t2 history_lane_input_11    = min(history_base_input_coord + int32_t2(1, 1), InputDims() - int32_t2(1));
-
-        PreProcessLaneData history_lane_00 = BuildPreProcessLaneData(history_lane_input_00);
-        PreProcessLaneData history_lane_10 = BuildPreProcessLaneData(history_lane_input_10);
-        PreProcessLaneData history_lane_01 = BuildPreProcessLaneData(history_lane_input_01);
-        PreProcessLaneData history_lane_11 = BuildPreProcessLaneData(history_lane_input_11);
-        lr_warped_history_h                = AverageWarpedHistory2x2(history_lane_00, history_lane_10, history_lane_01, history_lane_11);
-    }
+    lr_warped_history_h = AverageWarpedHistory2x2(history_lane_00, history_lane_10, history_lane_01, history_lane_11);
 #else
     lr_warped_history_h        = WarpHistory(reproj_uv);
 #endif  // NSS_PREPROCESS_HALF_RES_INPUT
@@ -1013,22 +1022,9 @@ void Preprocess(int32_t2 tensor_input_pixel)
     WriteLumaDerivativeOut(padded_coord, luma);
 
 #if NSS_PACKED_NEAREST_OFFSET_QUAD
-    int32_t2 base_input_coord  = clamp(process_coord * int32_t2(2), int32_t2(0), InputDims() - int32_t2(1));
-    int32_t2 lane_input_00     = base_input_coord;
-    int32_t2 lane_input_10     = min(base_input_coord + int32_t2(1, 0), InputDims() - int32_t2(1));
-    int32_t2 lane_input_01     = min(base_input_coord + int32_t2(0, 1), InputDims() - int32_t2(1));
-    int32_t2 lane_input_11     = min(base_input_coord + int32_t2(1, 1), InputDims() - int32_t2(1));
-    int32_t2 quad_offset_00    = int32_t2(0);
-    int32_t2 quad_offset_10    = int32_t2(0);
-    int32_t2 quad_offset_01    = int32_t2(0);
-    int32_t2 quad_offset_11    = int32_t2(0);
-    float    quad_depth_unused = 0.0;
-    FindNearestDepth_4x4_FromPixel(lane_input_00, InputDims(), quad_depth_unused, quad_offset_00);
-    FindNearestDepth_4x4_FromPixel(lane_input_10, InputDims(), quad_depth_unused, quad_offset_10);
-    FindNearestDepth_4x4_FromPixel(lane_input_01, InputDims(), quad_depth_unused, quad_offset_01);
-    FindNearestDepth_4x4_FromPixel(lane_input_11, InputDims(), quad_depth_unused, quad_offset_11);
-
-    float4 encoded_quad = EncodeNearestOffsetQuadUNormRG8(quad_offset_00, quad_offset_10, quad_offset_01, quad_offset_11);
+    // Same footprint pixels and searches as the history lanes above (the packed quad is a half-res-only path).
+    float4 encoded_quad = EncodeNearestOffsetQuadUNormRG8(
+        history_lane_00.nearest_offset, history_lane_10.nearest_offset, history_lane_01.nearest_offset, history_lane_11.nearest_offset);
     WriteNearestOffsetOut(padded_coord, encoded_quad);
 #else
     WriteNearestOffsetOut(padded_coord, float4(EncodeNearestDepthCoordUNorm(nearest_offset), 0.0, 0.0, 1.0));

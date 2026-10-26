@@ -197,3 +197,14 @@ if (FFX_GRAPHICS_API STREQUAL vk)
 else()
 	message(FATAL_ERROR "For now we only support vulkan backend.")
 endif()
+
+# Deterministic NSS replay harness: bit-exact output gate and per-pass timings for pre/post-process changes
+# (sdk/src/components/nss/test, desktop only; see docs/nss_gpu_tuning.md).
+option(FFX_NSS_BUILD_TESTS "Build the NSS replay harness" ON)
+if ((FFX_NSS OR FFX_ALL) AND FFX_NSS_BUILD_TESTS AND FFX_BUILD_AS_DLL AND FFX_GRAPHICS_API STREQUAL vk AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	add_executable(ffx_nss_replay_test ${CMAKE_CURRENT_SOURCE_DIR}/../sdk/src/components/nss/test/ffx_nss_replay_test.cpp)
+	target_include_directories(ffx_nss_replay_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+	target_link_libraries(ffx_nss_replay_test PRIVATE ${SDK_LIB_NAME} Vulkan::Vulkan)
+	target_compile_features(ffx_nss_replay_test PRIVATE cxx_std_17)
+	set_target_properties(ffx_nss_replay_test PROPERTIES BUILD_RPATH "$ORIGIN")
+endif()

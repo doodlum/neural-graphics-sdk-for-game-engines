@@ -50,7 +50,7 @@
 #include "nss/ffx_nss_preprocess.h"
 
 #ifndef FFX_NSS_NUM_THREADS
-#define FFX_NSS_NUM_THREADS layout (local_size_x = FFX_NSS_THREAD_GROUP_WIDTH, local_size_y = FFX_NSS_THREAD_GROUP_HEIGHT, local_size_z = FFX_NSS_THREAD_GROUP_DEPTH) in;
+#define FFX_NSS_NUM_THREADS layout (local_size_x = FFX_NSS_PREPROCESS_THREAD_GROUP_WIDTH, local_size_y = FFX_NSS_PREPROCESS_THREAD_GROUP_HEIGHT, local_size_z = FFX_NSS_THREAD_GROUP_DEPTH) in;
 #endif // FFX_NSS_NUM_THREADS
 
 FFX_NSS_NUM_THREADS

@@ -95,6 +95,11 @@ const float kEps_Post          = 1e-7;
 const float kMotionThreshold   = 0.1;
 const float kMotionThresholdSq = kMotionThreshold * kMotionThreshold;
 
+// Compute path, exact-2x sparse filter: one thread per 2x2 output quad (the host dispatches accordingly).
+#ifndef NSS_POSTPROCESS_QUAD
+#define NSS_POSTPROCESS_QUAD 0
+#endif
+
 #if NSS_USE_SPARSE_2X2_FILTER
 const int32_t kKpnChannels = 16;
 #else
@@ -193,7 +198,9 @@ half4 Tonemap4(half4 x)
 // Buffer alias path: tensor aliased as a std430 SSBO — read via linear NHWC indexing.
 layout(set = 0, binding = NSS_BIND_KPN_TENSOR, std430) readonly buffer KpnCoeffBuffer
 {
-    int8_t4 data[];
+    // NHWC int8, four channels per word (lowest byte = lowest channel); read as words so a channel is one
+    // bitfieldExtract instead of a per-lane select between the four bytes.
+    uint32_t data[];
 }
 r_coefficients_kpn_buffer;
 #else
@@ -205,17 +212,34 @@ layout(set = 0, binding = NSS_BIND_KPN_TENSOR) uniform readonly tensorARM<tensor
 // KPN tensor read — NSS v1 uses a single 36-channel tensor at 1/4 of dataGraph resolution.
 // Buffer alias (SSBO) path when native tensor ops are unavailable; tensorReadARM otherwise.
 // ---------------------------------------------------------------------------
+#if !NSS_SUPPORT_TENSOR
+// Signed byte `channel & 3` of KPN word `word_idx`, as an int.
+int32_t ReadKpnWordChannel(int32_t word_idx, int32_t channel)
+{
+    return bitfieldExtract(int32_t(r_coefficients_kpn_buffer.data[word_idx]), (channel & 3) << 3, 8);
+}
+#endif
+
+int32_t ReadKpnParamsFromBase(int32_t kpn_texel_base_x, int32_t kpn_y, int32_t channel)
+{
+#if !NSS_SUPPORT_TENSOR
+    // Buffer alias path: tensor stored as SSBO in NHWC layout, one word per group of 4 channels.
+    // Linear index: (y * kpn_w + x) * (kKpnChannels / 4) + channel/4
+    int32_t kpn_w      = KpnDims().x;
+    int32_t ch_group   = channel >> 2;  // which word
+    int32_t linear_idx = (kpn_y * kpn_w + kpn_texel_base_x) * (kKpnChannels / 4) + ch_group;
+    return ReadKpnWordChannel(linear_idx, channel);
+#else
+    int8_t q = int8_t(0);
+    tensorReadARM(r_coefficients_kpn_tensor, uint[](0, uint(kpn_y), uint(kpn_texel_base_x), uint(channel)), q);
+    return int32_t(q);
+#endif
+}
+
 int8_t ReadKpnParamsInt8FromBase(int32_t kpn_texel_base_x, int32_t kpn_y, int32_t channel)
 {
 #if !NSS_SUPPORT_TENSOR
-    // Buffer alias path: tensor stored as SSBO in NHWC layout, int8_t4 per group of 4 channels.
-    // Linear index: (y * kpn_w + x) * (kKpnChannels / 4) + channel/4
-    int32_t kpn_w      = KpnDims().x;
-    int32_t ch_group   = channel >> 2;  // which int8_t4 group
-    int32_t ch_within  = channel & 3;   // channel within the group
-    int32_t linear_idx = (kpn_y * kpn_w + kpn_texel_base_x) * (kKpnChannels / 4) + ch_group;
-    int8_t4 vec        = r_coefficients_kpn_buffer.data[linear_idx];
-    return vec[ch_within];
+    return int8_t(ReadKpnParamsFromBase(kpn_texel_base_x, kpn_y, channel));
 #else
     // Native tensor path: read directly via tensorReadARM using [batch, y, x, channel] indexing.
     int8_t q = int8_t(0);
@@ -232,16 +256,51 @@ int8_t ReadKpnParamsInt8(int32_t2 kpn_tap, int32_t channel)
 // ---------------------------------------------------------------------------
 // KPN coordinate mapping: input space → KPN tensor space
 // ---------------------------------------------------------------------------
+// floor(n * k / d) for n >= 0, k >= 0, d >= 1 without an integer divide (a generic 32-bit divide is ~20 VALU
+// including quarter-rate multiplies on AMD). With x = n * k + 0.5 (exact in fp32), x / d lies at least 0.5 / d away
+// from every integer, and x * (1 / d) has a relative error below 3 * 2^-23 (Vulkan allows 2.5 ulp for the division,
+// the multiply adds 0.5 ulp), i.e. an absolute error below 0.5 / d while x < 2^20: the floor is exactly the integer
+// quotient on any conformant implementation. Larger operands take the integer divide.
+int32_t4 KpnScaledCoordDiv4(int32_t4 n, int32_t k, int32_t d)
+{
+    // d an exact power-of-two multiple of k (the 2x presets, e.g. 640 -> KPN 80): floor(n * k / d) = n >> log2(d / k).
+    if (k > 0 && (d % k) == 0 && bitCount(uint32_t(d / k)) == 1)
+    {
+        return n >> findLSB(d / k);
+    }
+    if (d * k < (1 << 20))
+    {
+        return int32_t4(floor((float4(n) * float(k) + float4(0.5)) * (1.0 / float(d))));
+    }
+    return (n * int32_t4(k)) / int32_t4(d);
+}
+
+int32_t2 KpnScaledCoordDiv2(int32_t2 n, int32_t k, int32_t d)
+{
+    // d an exact power-of-two multiple of k (the 2x presets, e.g. 640 -> KPN 80): floor(n * k / d) = n >> log2(d / k).
+    if (k > 0 && (d % k) == 0 && bitCount(uint32_t(d / k)) == 1)
+    {
+        return n >> findLSB(d / k);
+    }
+    if (d * k < (1 << 20))
+    {
+        return int32_t2(floor((float2(n) * float(k) + float2(0.5)) * (1.0 / float(d))));
+    }
+    return (n * int32_t2(k)) / int32_t2(d);
+}
+
 int32_t KpnCoordFromInputCoord(int32_t input_coord, int32_t input_dim, int32_t kpn_dim)
 {
+    // input_coord is a clamped (non-negative) tap coordinate.
     int32_t safe_dim = max(input_dim, int32_t(1));
-    return min((input_coord * kpn_dim) / safe_dim, kpn_dim - int32_t(1));
+    return min(KpnScaledCoordDiv4(int32_t4(input_coord), kpn_dim, safe_dim).x, kpn_dim - int32_t(1));
 }
 
 int16_t4 KpnCoordFromInputCoord4(int16_t4 input_coord, int32_t input_dim, int32_t kpn_dim)
 {
+    // input_coord holds clamped (non-negative) tap coordinates.
     int32_t  safe_dim = max(input_dim, int32_t(1));
-    int32_t4 scaled   = (int32_t4(input_coord) * int32_t4(kpn_dim)) / int32_t4(safe_dim);
+    int32_t4 scaled   = KpnScaledCoordDiv4(int32_t4(input_coord), kpn_dim, safe_dim);
     return int16_t4(min(scaled, int32_t4(kpn_dim - int32_t(1))));
 }
 
@@ -266,16 +325,16 @@ int16_t4 KpnCoordFromScaledTap4(int16_t4 tap_coord, float scale, int32_t kpn_dim
 // ---------------------------------------------------------------------------
 half SampleKpnWeight(int32_t tap_z, int32_t2 kpn_tap)
 {
-    int8_t q = ReadKpnParamsInt8FromBase(kpn_tap.x, kpn_tap.y, tap_z);
+    int32_t q = ReadKpnParamsFromBase(kpn_tap.x, kpn_tap.y, tap_z);
     return half(max(float(Dequantize(half(q), kKpnQuant)), float(EPS)));
 }
 
 half4 SampleKpnWeight4(int16_t4 tap_z, int16_t4 kpn_x, int16_t4 kpn_y)
 {
-    int8_t4 q = int8_t4(ReadKpnParamsInt8FromBase(kpn_x.x, kpn_y.x, tap_z.x),
-                        ReadKpnParamsInt8FromBase(kpn_x.y, kpn_y.y, tap_z.y),
-                        ReadKpnParamsInt8FromBase(kpn_x.z, kpn_y.z, tap_z.z),
-                        ReadKpnParamsInt8FromBase(kpn_x.w, kpn_y.w, tap_z.w));
+    int32_t4 q = int32_t4(ReadKpnParamsFromBase(kpn_x.x, kpn_y.x, tap_z.x),
+                          ReadKpnParamsFromBase(kpn_x.y, kpn_y.y, tap_z.y),
+                          ReadKpnParamsFromBase(kpn_x.z, kpn_y.z, tap_z.z),
+                          ReadKpnParamsFromBase(kpn_x.w, kpn_y.w, tap_z.w));
     return half4(max(float4(Dequantize(half4(q), kKpnQuant)), float4(float(EPS))));
 }
 
@@ -389,16 +448,25 @@ int32_t2 DecodeNearestOffset(int32_t2 pixel)
 // ---------------------------------------------------------------------------
 // Motion loading for postprocess (uses nearest-depth dilation)
 // ---------------------------------------------------------------------------
-half2 LoadMotionPost(int32_t2 output_coord)
+int32_t2 MotionPostInputCoord(int32_t2 output_coord)
+{
+    return int32_t2(float2(output_coord) * InvScale());
+}
+
+half2 LoadMotionPostAtInput(int32_t2 input_coord)
 {
     // Reproject motion lookup using nearest-depth dilated coordinate.
-    int32_t2 input_coord     = int32_t2(float2(output_coord) * InvScale());
     int32_t2 dilation_offset = DecodeNearestOffset(input_coord);
     int32_t2 dilated_coord   = clamp(input_coord + dilation_offset, int32_t2(0), InputDims() - int32_t2(1));
 
     half2 v = half2(texelFetch(_MotionVectorTex, dilated_coord, 0).xy * MotionVectorScale()) * half2(Scale());
     v *= half(dot(float2(v), float2(v)) > kMotionThresholdSq);
     return v;
+}
+
+half2 LoadMotionPost(int32_t2 output_coord)
+{
+    return LoadMotionPostAtInput(MotionPostInputCoord(output_coord));
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +619,18 @@ int32_t2 PackedOffsetLutModulo()
     return max(int32_t2(IndexModulo()), int32_t2(1));
 }
 
+// output_px % modulo for output_px >= 0 without integer divides: exact float quotient (see KpnScaledCoordDiv4),
+// valid while output_px < 2^20; plain % otherwise.
+int32_t2 PackedOffsetLutTile(int32_t2 output_px, int32_t2 modulo)
+{
+    if (all(lessThan(OutputDims(), int32_t2(1 << 20))))
+    {
+        int32_t2 q = int32_t2(floor((float2(output_px) + float2(0.5)) * (float2(1.0) / float2(modulo))));
+        return output_px - q * modulo;
+    }
+    return output_px % modulo;
+}
+
 void AccumulatePackedLrOffsetTap(
     OffsetLutTap lut_tap, int32_t2 lr_base, int32_t2 colour_max, int32_t2 kpn_max, inout half4 accum_m1, inout half4 accum_m2, inout half4 center_sample)
 {
@@ -578,7 +658,7 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     int32_t2 colour_max = InputDims() - int32_t2(1);
     int32_t2 kpn_max    = KpnDims() - int32_t2(1);
     int32_t2 idx_mod_xy = PackedOffsetLutModulo();
-    int32_t2 tile_idx   = output_px % idx_mod_xy;
+    int32_t2 tile_idx   = PackedOffsetLutTile(output_px, idx_mod_xy);
     int32_t2 lr_base    = int32_t2(floor(float2(output_px) * InvScale()));
 
     half4 accum_m1 = half4(0.HF);
@@ -623,7 +703,7 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     int32_t2 colour_max = InputDims() - int32_t2(1);
     int32_t2 kpn_max = KpnDims() - int32_t2(1);
     int32_t2 idx_mod_xy = PackedOffsetLutModulo();
-    int32_t2 tile_idx = output_px % idx_mod_xy;
+    int32_t2 tile_idx = PackedOffsetLutTile(output_px, idx_mod_xy);
     int32_t2 lr_base = int32_t2(floor(float2(output_px) * InvScale()));
 
     half4 accum_m1 = half4(0.HF);
@@ -666,7 +746,43 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     NormalizeFilterMoments(accum_m1, accum_m2, m1, m2);
 }
 #elif (NSS_FILTER_MODE == 0) || (NSS_FILTER_MODE == 1)
+#if NSS_FILTER_MODE == 1
+// Integer tap coordinates of the exact-2x sparse filter: the 2x2 LR block {lo, hi} per axis and the KPN coordinates
+// of lo and hi (.x = lo, .y = hi).
+struct Sparse2xTaps
+{
+    int32_t2 lo;
+    int32_t2 hi;
+    int32_t2 kx;
+    int32_t2 ky;
+};
+
+int32_t2 Sparse2xKpnCoords(int32_t2 lr, int32_t input_dim, int32_t kpn_dim)
+{
+    return clamp(min(KpnScaledCoordDiv2(lr, kpn_dim, max(input_dim, 1)), int32_t2(kpn_dim - 1)), int32_t2(0), int32_t2(kpn_dim - 1));
+}
+
+Sparse2xTaps Sparse2xTapsForPixel(int32_t2 output_px)
+{
+    // kTap2x2Dx/Dy hold {d, d + 2} with d = tile - 1 per axis, so the four taps of every pattern are the 2x2 LR block
+    // {lo, lo + 1}^2 with lo = (px + tile - 1) >> 1: y-fastest, except pattern 2 which walks it x-fastest. Map the two
+    // distinct coordinates per axis to KPN space and to KPN rows once instead of once per tap (same values as the
+    // per-tap mapping, without the per-tap divides and multiplies).
+    int32_t2     colour_max = InputDims() - int32_t2(1);
+    int32_t2     tile_idx   = (output_px + LutOffset()) & int32_t2(1);
+    int32_t2     raw_lo     = (output_px + tile_idx - int32_t2(1)) >> 1;
+    Sparse2xTaps t;
+    t.lo = clamp(raw_lo, int32_t2(0), colour_max);
+    t.hi = clamp(raw_lo + int32_t2(1), int32_t2(0), colour_max);
+    t.kx = Sparse2xKpnCoords(int32_t2(t.lo.x, t.hi.x), InputDims().x, KpnDims().x);
+    t.ky = Sparse2xKpnCoords(int32_t2(t.lo.y, t.hi.y), InputDims().y, KpnDims().y);
+    return t;
+}
+
+void FilterColourSparse2x(int32_t2 output_px, Sparse2xTaps sparse_taps, out half4 m1, out half4 m2, out half4 center_sample)
+#else
 void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 center_sample)
+#endif
 {
     // NSS v1: KPN tensor is at 1/4 of dataGraph resolution; map input-space tap coords to KPN space.
     //-------------------------------------------------------------------------
@@ -692,14 +808,33 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     center_sample  = half4(0.HF);
 
 #if NSS_FILTER_MODE == 1
-    int16_t4 tap_x = clamp((int16_t4(out_px16.x) + kTap2x2Dx[lut_idx]) >> int16_t(1), zero4, colour_max_x4);
-    int16_t4 tap_y = clamp((int16_t4(out_px16.y) + kTap2x2Dy[lut_idx]) >> int16_t(1), zero4, colour_max_y4);
-    int16_t4 kpn_x = clamp(KpnCoordFromInputCoord4(tap_x, InputDims().x, KpnDims().x), zero4, kpn_max_x4);
-    int16_t4 kpn_y = clamp(KpnCoordFromInputCoord4(tap_y, InputDims().y, KpnDims().y), zero4, kpn_max_y4);
+    int32_t2 lo        = sparse_taps.lo;
+    int32_t2 hi        = sparse_taps.hi;
+    int32_t2 kx        = sparse_taps.kx;
+    int32_t2 ky        = sparse_taps.ky;
+    bool     x_fastest = lut_idx == int32_t(2);
+    int16_t4 tap_x     = x_fastest ? int16_t4(lo.x, hi.x, lo.x, hi.x) : int16_t4(lo.x, lo.x, hi.x, hi.x);
+    int16_t4 tap_y     = x_fastest ? int16_t4(lo.y, lo.y, hi.y, hi.y) : int16_t4(lo.y, hi.y, lo.y, hi.y);
+    int16_t4 kpn_ch    = kTap2x2Ch[lut_idx];
 
     f16mat4x4 taps;
     NSS_LOAD_TAPS_4(tap_x, tap_y, taps);
-    half4 weights = SampleKpnWeight4(kTap2x2Ch[lut_idx], kpn_x, kpn_y);
+#if !NSS_SUPPORT_TENSOR
+    // Word index of (x, y, channel group): (y * kpn_w + x) * 4 + channel / 4, rows computed once per distinct y.
+    int32_t2 row     = ky * int32_t2(KpnDims().x);
+    int32_t4 pix_x   = x_fastest ? int32_t4(kx.x, kx.y, kx.x, kx.y) : int32_t4(kx.x, kx.x, kx.y, kx.y);
+    int32_t4 pix_row = x_fastest ? int32_t4(row.x, row.x, row.y, row.y) : int32_t4(row.x, row.y, row.x, row.y);
+    int32_t4 word    = (pix_row + pix_x) * int32_t4(kKpnChannels / 4) + (int32_t4(kpn_ch) >> 2);
+    int32_t4 q       = int32_t4(ReadKpnWordChannel(word.x, int32_t(kpn_ch.x)),
+                          ReadKpnWordChannel(word.y, int32_t(kpn_ch.y)),
+                          ReadKpnWordChannel(word.z, int32_t(kpn_ch.z)),
+                          ReadKpnWordChannel(word.w, int32_t(kpn_ch.w)));
+    half4    weights = half4(max(float4(Dequantize(half4(q), kKpnQuant)), float4(float(EPS))));
+#else
+    int16_t4 kpn_x   = x_fastest ? int16_t4(kx.x, kx.y, kx.x, kx.y) : int16_t4(kx.x, kx.x, kx.y, kx.y);
+    int16_t4 kpn_y   = x_fastest ? int16_t4(ky.x, ky.x, ky.y, ky.y) : int16_t4(ky.x, ky.y, ky.x, ky.y);
+    half4    weights = SampleKpnWeight4(kpn_ch, kpn_x, kpn_y);
+#endif
     weights       = NormalizeSparseKernelWeights4(weights);
     center_sample = (lut_idx == int32_t(3)) ? taps[0] : half4(0.HF);
     accum_m1 += taps * weights;
@@ -765,16 +900,22 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
 #error "Unsupported NSS_FILTER_MODE"
 #endif
 
+#if NSS_FILTER_MODE == 1
+void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 center_sample)
+{
+    FilterColourSparse2x(output_px, Sparse2xTapsForPixel(output_px), m1, m2, center_sample);
+}
+#endif
+
 #undef NSS_LOAD_TAPS_4
 #undef NSS_SQ_MAT
 
 // ---------------------------------------------------------------------------
 // History warp with motion + optional Catmull-Rom
 // ---------------------------------------------------------------------------
-void WarpHistory(int32_t2 output_px, float2 uv, out half4 warped_colour, out half onscreen)
+void WarpHistory(half2 motion, float2 uv, out half4 warped_colour, out half onscreen)
 {
     // Reproject history with motion; report if sample stayed on-screen.
-    half2  motion    = LoadMotionPost(output_px);
     float2 reproj_uv = uv + (float2(motion) * InvOutputDims());
     onscreen         = half(all(greaterThanEqual(reproj_uv, float2(0.0))) && all(lessThanEqual(reproj_uv, float2(1.0))));
 #ifdef ENABLE_HISTORY_CATMULL
@@ -870,16 +1011,15 @@ void WriteColourOut(int32_t2 coord, half3 out_linear)
 // ---------------------------------------------------------------------------
 // Main postprocess entry point
 // ---------------------------------------------------------------------------
-void Postprocess(int32_t2 output_pixel)
+// motion: LoadMotionPost(output_pixel), passed in so a thread handling several pixels can share it.
+#if NSS_FILTER_MODE == 1
+#define NSS_POST_FILTER_ARGS , Sparse2xTaps sparse_taps
+#else
+#define NSS_POST_FILTER_ARGS
+#endif
+void PostprocessPixel(int32_t2 output_pixel, half2 motion NSS_POST_FILTER_ARGS)
 {
     int32_t2 output_px = output_pixel;
-    //-------------------------------------------------------------------------
-    // 1) Dispatch guard and setup
-    //-------------------------------------------------------------------------
-    if (any(greaterThanEqual(output_px, OutputDims())))
-    {
-        return;
-    }
 
     half   exposure = half(Exposure().x);
     half   reset    = half(Reset());
@@ -891,7 +1031,11 @@ void Postprocess(int32_t2 output_pixel)
     half4 m1;
     half4 m2;
     half4 center_sample;
+#if NSS_FILTER_MODE == 1
+    FilterColourSparse2x(output_px, sparse_taps, m1, m2, center_sample);
+#else
     FilterColour(output_px, m1, m2, center_sample);
+#endif
 
     //-------------------------------------------------------------------------
     // 3) Read temporal controls and reproject history
@@ -903,7 +1047,7 @@ void Postprocess(int32_t2 output_pixel)
 
     half4 warped_colour;
     half  onscreen;
-    WarpHistory(output_px, uv, warped_colour, onscreen);
+    WarpHistory(motion, uv, warped_colour, onscreen);
 
     //-------------------------------------------------------------------------
     // 4) Clamp and rectify history
@@ -929,6 +1073,90 @@ void Postprocess(int32_t2 output_pixel)
     StorePrevUpscaledColor(output_pixel, out_linear);
 #endif
 }
+
+void Postprocess(int32_t2 output_pixel)
+{
+    //-------------------------------------------------------------------------
+    // 1) Dispatch guard and setup
+    //-------------------------------------------------------------------------
+    if (any(greaterThanEqual(output_pixel, OutputDims())))
+    {
+        return;
+    }
+#if NSS_FILTER_MODE == 1
+    PostprocessPixel(output_pixel, LoadMotionPost(output_pixel), Sparse2xTapsForPixel(output_pixel));
+#else
+    PostprocessPixel(output_pixel, LoadMotionPost(output_pixel));
+#endif
+}
+
+#if NSS_POSTPROCESS_QUAD
+// One thread per 2x2 output quad (exact-2x sparse filter, compute path). At 2x the four pixels of a quad map to the
+// same input pixel, so the nearest-offset decode and dilated motion fetch are done once; the per-pixel work is
+// unchanged. Falls back to per-pixel motion when the input coordinates differ (non-2x dispatch sizes).
+void PostprocessQuad(int32_t2 quad)
+{
+    int32_t2 base = quad * int32_t2(2);
+    if (any(greaterThanEqual(base, OutputDims())))
+    {
+        return;
+    }
+
+    int32_t2 ic00 = MotionPostInputCoord(base);
+    int32_t2 ic10 = MotionPostInputCoord(base + int32_t2(1, 0));
+    int32_t2 ic01 = MotionPostInputCoord(base + int32_t2(0, 1));
+    int32_t2 ic11 = MotionPostInputCoord(base + int32_t2(1, 1));
+    half2    mv00 = LoadMotionPostAtInput(ic00);
+    half2    mv10 = mv00;
+    half2    mv01 = mv00;
+    half2    mv11 = mv00;
+    if (any(notEqual(ic10, ic00)) || any(notEqual(ic01, ic00)) || any(notEqual(ic11, ic00)))
+    {
+        mv10 = LoadMotionPostAtInput(ic10);
+        mv01 = LoadMotionPostAtInput(ic01);
+        mv11 = LoadMotionPostAtInput(ic11);
+    }
+
+    // Tap coordinates: pixel base + s has tile (s + LutOffset) & 1 (uniform per slot) and
+    // raw_lo = quad + ((s + tile - 1) >> 1), i.e. quad - 1 when s + tile == 0 and quad otherwise; so the LR/KPN
+    // coordinates of all four pixels come from {quad - 1, quad, quad + 1} per axis, mapped once per quad.
+    int32_t2 colour_max = InputDims() - int32_t2(1);
+    int32_t2 u0         = clamp(quad - int32_t2(1), int32_t2(0), colour_max);
+    int32_t2 u1         = clamp(quad, int32_t2(0), colour_max);
+    int32_t2 u2         = clamp(quad + int32_t2(1), int32_t2(0), colour_max);
+    int32_t2 kx01       = Sparse2xKpnCoords(int32_t2(u0.x, u1.x), InputDims().x, KpnDims().x);
+    int32_t2 kx12       = int32_t2(kx01.y, Sparse2xKpnCoords(int32_t2(u2.x), InputDims().x, KpnDims().x).x);
+    int32_t2 ky01       = Sparse2xKpnCoords(int32_t2(u0.y, u1.y), InputDims().y, KpnDims().y);
+    int32_t2 ky12       = int32_t2(ky01.y, Sparse2xKpnCoords(int32_t2(u2.y), InputDims().y, KpnDims().y).x);
+    bvec2    low0       = equal(LutOffset() & int32_t2(1), int32_t2(0));  // slot 0 uses (quad - 1, quad)
+    // slot 1 always has s + tile >= 1, so it uses (quad, quad + 1)
+
+    Sparse2xTaps t00, t10, t01, t11;
+    int32_t2     lo_s0 = int32_t2(low0.x ? u0.x : u1.x, low0.y ? u0.y : u1.y);
+    int32_t2     hi_s0 = int32_t2(low0.x ? u1.x : u2.x, low0.y ? u1.y : u2.y);
+    int32_t2     kx_s0 = low0.x ? kx01 : kx12;
+    int32_t2     ky_s0 = low0.y ? ky01 : ky12;
+    t00.lo = lo_s0;                     t00.hi = hi_s0;                     t00.kx = kx_s0; t00.ky = ky_s0;
+    t10.lo = int32_t2(u1.x, lo_s0.y);   t10.hi = int32_t2(u2.x, hi_s0.y);   t10.kx = kx12;  t10.ky = ky_s0;
+    t01.lo = int32_t2(lo_s0.x, u1.y);   t01.hi = int32_t2(hi_s0.x, u2.y);   t01.kx = kx_s0; t01.ky = ky12;
+    t11.lo = u1;                        t11.hi = u2;                        t11.kx = kx12;  t11.ky = ky12;
+
+    bvec2 inside = lessThan(base + int32_t2(1), OutputDims());
+    PostprocessPixel(base, mv00, t00);
+    if (inside.x)
+    {
+        PostprocessPixel(base + int32_t2(1, 0), mv10, t10);
+    }
+    if (inside.y)
+    {
+        PostprocessPixel(base + int32_t2(0, 1), mv01, t01);
+    }
+    if (inside.x && inside.y)
+    {
+        PostprocessPixel(base + int32_t2(1, 1), mv11, t11);
+    }
+}
+#endif  // NSS_POSTPROCESS_QUAD
 #endif
 
 #undef _NearestDepthOffsetTex
