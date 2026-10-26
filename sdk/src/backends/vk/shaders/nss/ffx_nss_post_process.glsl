@@ -43,6 +43,9 @@
 #define NSS_POSTPROCESS_QUAD 1
 #endif
 
+// Compute path: the dense dynamic-LUT filter (QUALITY, non-2x) shares per-column/row tap mapping through LDS.
+#define NSS_POSTPROCESS_AXIS_LDS 1
+
 #include "nss/ffx_nss_postprocess.h"
 
 #ifndef FFX_NSS_NUM_THREADS
