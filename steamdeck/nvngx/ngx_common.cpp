@@ -109,3 +109,22 @@ void NgxFreeHandle(NVSDK_NGX_Handle* handle)
 {
     delete handle;
 }
+
+NssUpscaler* NgxApplyLiveSettings(unsigned int id, NssUpscaler* current)
+{
+    const int live = LiveNssQuality();
+    if (live < 0 || live == current->Info().nssQuality)
+        return current;
+    UpscalerCreateInfo info = current->Info();
+    info.nssQuality         = live;
+    auto fresh              = NssUpscaler::Create(current->Device(), info);
+    if (!fresh)
+    {
+        LOGI("model switch to quality %d failed; keeping quality %d", live, current->Info().nssQuality);
+        return current;
+    }
+    LOGI("model switched at runtime: quality %d -> %d", current->Info().nssQuality, live);
+    Registry().CollectGarbage();
+    NssUpscaler* swapped = Registry().Replace(id, std::move(fresh));
+    return swapped ? swapped : current;
+}

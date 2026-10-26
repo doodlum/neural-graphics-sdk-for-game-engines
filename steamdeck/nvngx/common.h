@@ -28,3 +28,7 @@ struct ProxyConfig
 };
 
 const ProxyConfig& Config();
+
+// NSS shader quality requested at runtime through the control file named by AISS_CONTROL (a Linux path, written by
+// the Decky plugin): 0, 1 or 2, or -1 when there is no file or no valid value. Re-read at most twice a second.
+int LiveNssQuality();

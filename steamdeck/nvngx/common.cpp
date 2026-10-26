@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 static float EnvFloat(const char* name, float def)
 {
@@ -80,4 +81,38 @@ const ProxyConfig& Config()
         return c;
     }();
     return config;
+}
+
+int LiveNssQuality()
+{
+    static std::mutex mutex;
+    static ULONGLONG  lastCheck = 0;
+    static int        value     = -1;
+    static const std::string path = [] {
+        const char* unix = getenv("AISS_CONTROL");
+        if (!unix || unix[0] != '/')
+            return std::string();
+        std::string dos = std::string("Z:") + unix;  // Proton maps Z: to the Linux root
+        for (char& c : dos)
+            if (c == '/')
+                c = '\\';
+        return dos;
+    }();
+    if (path.empty())
+        return -1;
+    std::lock_guard<std::mutex> lock(mutex);
+    const ULONGLONG now = GetTickCount64();
+    if (lastCheck && now - lastCheck < 500)
+        return value;
+    lastCheck = now;
+    int   read = -1;
+    FILE* f    = fopen(path.c_str(), "r");
+    if (f)
+    {
+        if (fscanf(f, "%d", &read) != 1 || read < 0 || read > 2)
+            read = -1;
+        fclose(f);
+    }
+    value = read;
+    return value;
 }

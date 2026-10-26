@@ -93,19 +93,16 @@ static bool IsSampledLayout(VkImageLayout l)
 
 int NssQualityForDlss(int perfQualityValue)
 {
+    // The full (QUALITY) network by default for every DLSS mode: with the RDNA2 kernels it costs about 1.3 ms more
+    // than the small one at 640x400 -> 1280x800 on a Steam Deck. The control file (plugin, at runtime) and
+    // AISS_NSS_QUALITY (launch option) override it.
+    (void)perfQualityValue;
+    const int live = LiveNssQuality();
+    if (live >= 0)
+        return live;
     if (Config().nssQuality >= 0 && Config().nssQuality <= 2)
         return Config().nssQuality;
-    // The QUALITY shader mode switches to NSS's large network, roughly 5x the cost on a Steam Deck. Every DLSS mode
-    // therefore maps to the small network; AISS_NSS_QUALITY=0 opts in to the large one.
-    switch (perfQualityValue)
-    {
-    case 2:  // MaxQuality
-    case 4:  // UltraQuality
-    case 5:  // DLAA
-        return FFX_API_NSS_SHADER_QUALITY_MODE_BALANCED;
-    default:
-        return FFX_API_NSS_SHADER_QUALITY_MODE_PERFORMANCE;
-    }
+    return FFX_API_NSS_SHADER_QUALITY_MODE_QUALITY;
 }
 
 std::unique_ptr<NssUpscaler> NssUpscaler::Create(const VulkanDevice& device, const UpscalerCreateInfo& info)
@@ -472,7 +469,7 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     nss.cameraFovAngleVertical = Config().cameraFovY;
     nss.exposure               = d.exposure;
     nss.frameTimeDelta         = d.frameTimeMs;
-    nss.reset                  = d.reset;
+    nss.reset                  = d.reset || m_dispatchCount == 1;  // a fresh context has no history yet
     if (Config().debugView >= 0)
     {
         nss.flags         = FFX_API_NSS_DISPATCH_FLAG_DRAW_DEBUG_VIEW;
@@ -674,6 +671,22 @@ NssUpscaler* UpscalerRegistry::Get(unsigned int id)
     for (auto& e : m_entries)
         if (e.id == id && !e.released)
             return e.upscaler.get();
+    return nullptr;
+}
+
+NssUpscaler* UpscalerRegistry::Replace(unsigned int id, std::unique_ptr<NssUpscaler> fresh)
+{
+    std::lock_guard<std::mutex> lock(g_registryMutex);
+    for (auto& e : m_entries)
+        if (e.id == id && !e.released)
+        {
+            std::unique_ptr<NssUpscaler> old = std::move(e.upscaler);
+            e.upscaler                       = std::move(fresh);
+            NssUpscaler* result              = e.upscaler.get();
+            // The old context may still be in flight: retire it like a released one. (`e` is invalid after this.)
+            m_entries.push_back({0, std::move(old), true, std::chrono::steady_clock::now()});
+            return result;
+        }
     return nullptr;
 }
 

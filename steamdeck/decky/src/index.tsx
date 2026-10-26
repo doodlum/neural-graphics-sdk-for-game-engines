@@ -130,10 +130,8 @@ const STATUS_LABEL: Record<Status, string> = {
 };
 
 const QUALITY_OPTIONS = [
-  { data: -1, label: "Follow game" },
-  { data: 0, label: "0 - large network (slow)" },
-  { data: 1, label: "1" },
-  { data: 2, label: "2" },
+  { data: 0, label: "Full (best quality)" },
+  { data: 2, label: "Fast (small network, more ghosting)" },
 ];
 const LOG_OPTIONS = [
   { data: 0, label: "Off" },
@@ -261,9 +259,9 @@ function Content() {
       <PanelSection title="Global options">
         <PanelSectionRow>
           <DropdownItem
-            label="NSS quality (AISS_NSS_QUALITY)"
+            label="NSS model (switches live in-game)"
             rgOptions={QUALITY_OPTIONS}
-            selectedOption={s.quality}
+            selectedOption={s.quality === 2 ? 2 : 0}
             disabled={!!busy}
             onChange={(o) => changeSetting({ quality: o.data })}
           />

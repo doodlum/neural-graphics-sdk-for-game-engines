@@ -19,6 +19,10 @@ void NgxFillDispatch(const NgxParams& p, const UpscalerCreateInfo& info, Upscale
 
 NVSDK_NGX_Result NgxFeatureRequirement(NVSDK_NGX_Feature feature, NVSDK_NGX_FeatureRequirement* out);
 
+// Rebuilds the handle's upscaler when the NSS quality asked for at runtime (control file) differs from the one it
+// was created with; returns the upscaler to dispatch.
+NssUpscaler* NgxApplyLiveSettings(unsigned int id, NssUpscaler* current);
+
 // Allocates a handle for a created upscaler. NGX hands handles back by pointer, so they must stay valid.
 NVSDK_NGX_Handle* NgxNewHandle(unsigned int id);
 void              NgxFreeHandle(NVSDK_NGX_Handle* handle);

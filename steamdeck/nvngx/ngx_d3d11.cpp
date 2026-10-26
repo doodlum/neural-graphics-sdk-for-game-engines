@@ -300,6 +300,8 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext*
     if (!context || !handle || !params)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     NssUpscaler* upscaler = Registry().Get(handle->Id);
+    if (upscaler)
+        upscaler = NgxApplyLiveSettings(handle->Id, upscaler);
     if (!upscaler || !g_interop || !g_submitter)
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
 

@@ -321,6 +321,8 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsComman
     if (!cmdList || !handle || !params)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     NssUpscaler* upscaler = Registry().Get(handle->Id);
+    if (upscaler)
+        upscaler = NgxApplyLiveSettings(handle->Id, upscaler);
     if (!upscaler || !g_interop)
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
 

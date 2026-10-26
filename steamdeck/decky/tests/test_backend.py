@@ -26,7 +26,7 @@ import aiss_core as core  # noqa: E402
 from aiss_core import (AissCore, build_launch_options, strip_launch_options, reg_set_value,  # noqa: E402
                        reg_delete_value, reg_has_value, REG_KEY_PATH, SIG_OVERRIDE_VALUE)
 
-S0 = {"quality": -1, "log": 1}
+S0 = {"quality": 0, "log": 1}
 
 
 def bin_dir(tmp: Path) -> Path:
@@ -122,7 +122,7 @@ class LaunchOptionTests(unittest.TestCase):
         new, rec = build_launch_options("", "dxgi", S0, None)
         s2 = {"quality": 0, "log": 2}
         new2, rec2 = build_launch_options(new, "dxgi", s2, rec)
-        self.assertEqual(new2, 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_NSS_QUALITY=0 AISS_LOG=2 '
+        self.assertEqual(new2, 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_LOG=2 '
                                'WINEDLLOVERRIDES="dxgi=n,b" %command%')
         new3, rec3 = build_launch_options(new2, "dxgi", S0, rec2)
         self.assertEqual(new3, new)
@@ -457,15 +457,21 @@ class FakeLibraryTests(unittest.TestCase):
 
     def test_launch_options_flow_and_settings(self):
         self.core.install_game("1002")
+        control = self.home / ".local/share/aiss-dlss-nss/control"
         lo = self.core.launch_options("1002", "-novid", True)
-        self.assertEqual(lo["options"],
-                         'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
-        self.core.set_settings({"quality": 0, "log": 0})
+        self.assertEqual(lo["options"], f'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_CONTROL={control} '
+                                        'WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
+        # The model is switched live through the control file, not the launch options.
+        self.core.set_settings({"quality": 2, "log": 0})
+        self.assertEqual(control.read_text().strip(), "2")
+        self.core.set_settings({"quality": 0})
+        self.assertEqual(control.read_text().strip(), "0")
         with self.assertRaises(ValueError):
             self.core.set_settings({"quality": 9})
-        # An AISS_RATIO left over from an older plugin version is removed on the next sync.
-        lo2 = self.core.launch_options("1002", lo["options"].replace("AISS_LAYER=1", "AISS_LAYER=1 AISS_RATIO=2.0"), True)
-        self.assertEqual(lo2["options"], 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_NSS_QUALITY=0 '
+        # AISS_RATIO / AISS_NSS_QUALITY left over from older plugin versions are removed on the next sync.
+        old = lo["options"].replace("AISS_LAYER=1", "AISS_LAYER=1 AISS_RATIO=2.0 AISS_NSS_QUALITY=0")
+        lo2 = self.core.launch_options("1002", old, True)
+        self.assertEqual(lo2["options"], f'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_CONTROL={control} '
                                          'AISS_LOG=0 WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
         self.core = self.make_core()  # ownership record persisted
         off = self.core.launch_options("1002", lo2["options"], False)

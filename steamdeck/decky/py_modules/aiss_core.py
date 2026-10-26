@@ -63,14 +63,15 @@ BAD_EXE_SUBSTRINGS = (
 )
 
 # Launch options
-MANAGED_ENV = ("AISS_LAYER", "AISS_RATIO", "AISS_NSS_QUALITY", "AISS_LOG")  # always owned by the plugin
-# AISS_RATIO is no longer offered; it stays managed so older launch options lose it on the next sync.
+MANAGED_ENV = ("AISS_LAYER", "AISS_RATIO", "AISS_NSS_QUALITY", "AISS_LOG", "AISS_CONTROL")  # always owned by the plugin
+# AISS_RATIO and AISS_NSS_QUALITY are no longer written (the model is chosen live through AISS_CONTROL); they stay
+# managed so older launch options lose them on the next sync.
 NVAPI_ENV = "PROTON_FORCE_NVAPI"
 WDO_ENV = "WINEDLLOVERRIDES"
 COMMAND = "%command%"
 
 DEFAULT_SETTINGS = {
-    "quality": -1,       # -1 = follow the game's DLSS mode; 0 = large network (slow), 1, 2
+    "quality": 0,        # NSS model: 0 = full network (default), 2 = fast small network (more ghosting); applied live
     "log": 1,            # AISS_LOG level; 1 is the core's default and is not written out
 }
 
@@ -415,9 +416,9 @@ def _join_options(lead, wrappers, post, with_cmd: bool) -> str:
 
 def settings_env(settings: dict) -> list[str]:
     env = ["AISS_LAYER=1"]
-    q = int(settings.get("quality", -1))
-    if q in (0, 1, 2):
-        env.append(f"AISS_NSS_QUALITY={q}")
+    control = str(settings.get("control") or "")
+    if control:
+        env.append(f'AISS_CONTROL="{control}"' if " " in control else f"AISS_CONTROL={control}")
     log = int(settings.get("log", 1))
     if log != 1:
         env.append(f"AISS_LOG={log}")
@@ -1127,6 +1128,10 @@ class AissCore:
     def verify_all(self) -> list[dict]:
         """Repair enabled games (a game update can delete the shim, the prefix may exist by now, a newer plugin
         bundles newer binaries) and finish deferred registry work."""
+        try:
+            self.write_control()
+        except OSError as e:
+            self.log.warning(f"cannot write {self.control_path}: {e}")
         results = []
         apps = {a["appid"]: a for a in self.installed_apps()}
         for appid, gs in list(self.state["games"].items()):
@@ -1165,7 +1170,7 @@ class AissCore:
             shim = gs.get("shim")
             if not shim:
                 return {"ok": False, "options": current, "message": "game not set up"}
-            new, new_rec = build_launch_options(current or "", shim, self.state["settings"], rec)
+            new, new_rec = build_launch_options(current or "", shim, self.env_settings(), rec)
             gs["launch"] = new_rec
         else:
             new = strip_launch_options(current or "", rec)
@@ -1173,14 +1178,31 @@ class AissCore:
         self.save_state()
         return {"ok": True, "options": new, "changed": new != (current or "")}
 
+    # The proxy re-reads this file while the game runs, so a model change applies without restarting the game.
+    @property
+    def control_path(self) -> Path:
+        return self.home / ".local/share/aiss-dlss-nss/control"
+
+    def env_settings(self) -> dict:
+        return {**self.state["settings"], "control": str(self.control_path)}
+
+    def write_control(self) -> None:
+        q = int(self.state["settings"].get("quality", 0))
+        if q not in (0, 1, 2):
+            q = 0
+        self.control_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.control_path.with_suffix(".tmp")
+        tmp.write_text(f"{q}\n")
+        os.replace(tmp, self.control_path)
+
     def set_settings(self, settings: dict) -> dict:
         s = dict(self.state["settings"])
         s.pop("ratio", None)  # option removed; drop it from older state files
         if "quality" in settings:
             q = int(settings["quality"])
             if q not in (-1, 0, 1, 2):
-                raise ValueError("quality must be -1, 0, 1 or 2")
-            s["quality"] = q
+                raise ValueError("quality must be 0, 1 or 2")
+            s["quality"] = 0 if q == -1 else q
         if "log" in settings:
             lv = int(settings["log"])
             if not 0 <= lv <= 4:
@@ -1188,4 +1210,5 @@ class AissCore:
             s["log"] = lv
         self.state["settings"] = s
         self.save_state()
+        self.write_control()
         return s

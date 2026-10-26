@@ -61,6 +61,7 @@ public:
     bool Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d);
 
     const UpscalerCreateInfo& Info() const { return m_info; }
+    const VulkanDevice&       Device() const { return m_dev; }
 
 private:
     NssUpscaler() = default;
@@ -107,6 +108,7 @@ class UpscalerRegistry
 public:
     unsigned int Add(std::unique_ptr<NssUpscaler> upscaler);
     NssUpscaler* Get(unsigned int id);
+    NssUpscaler* Replace(unsigned int id, std::unique_ptr<NssUpscaler> fresh);  // swap in a new context for a handle
     void         Release(unsigned int id);
     void         CollectGarbage(bool force = false);
 

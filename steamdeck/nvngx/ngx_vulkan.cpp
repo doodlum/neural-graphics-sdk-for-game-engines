@@ -289,6 +289,8 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd
     if (!cmd || !handle || !params)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     NssUpscaler* upscaler = Registry().Get(handle->Id);
+    if (upscaler)
+        upscaler = NgxApplyLiveSettings(handle->Id, upscaler);
     if (!upscaler)
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
 

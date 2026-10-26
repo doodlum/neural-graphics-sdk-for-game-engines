@@ -71,8 +71,9 @@ Streamline sample (ray tracing on), 1280x800 fullscreen on the Deck, installed e
 | D3D12 | 9.9 FPS | **29.9 FPS** |
 | Vulkan | 12.1 FPS | **36.5 FPS** |
 
-DLSS quality modes map to NSS's small (mid_low) network. NSS's QUALITY mode switches to the large network, which costs
-about 5x more on the Deck; it is only used with `AISS_NSS_QUALITY=0`.
+Every DLSS mode uses NSS's full network by default. On the Deck it costs about 1.3 ms more per frame than the
+small one at 640x400 → 1280x800, and the small network ghosts visibly. The Decky plugin switches between them while the
+game runs: it writes the choice to a control file that the proxy re-reads (`AISS_CONTROL`, 0 = full, 2 = fast).
 
 ## Build
 
@@ -103,8 +104,8 @@ Use the Decky plugin for this. By hand:
 
 | Variable | Effect |
 | --- | --- |
-| `AISS_RATIO=2.0` | Render-scale divisor for every DLSS mode (default: DLSS's own ratios) |
-| `AISS_NSS_QUALITY=0/1/2` | Force NSS's shader quality (0 = large network). Default: follow the game's DLSS mode, on the small network. |
+| `AISS_NSS_QUALITY=0/1/2` | NSS model at launch: 0 = full network (default), 1/2 = small network |
+| `AISS_CONTROL=/path` | File holding 0/1/2, re-read twice a second; switches the model while the game runs (set by the plugin) |
 | `AISS_CAMERA_NEAR`, `AISS_CAMERA_FAR`, `AISS_CAMERA_FOV` | Camera values NGX does not pass. Defaults: 0.1, 100000, 60° (reversed-Z, infinite far plane). |
 | `AISS_EXPOSURE` | Exposure passed to NSS (default 1.0) |
 | `AISS_LOG=0..4` | Log to `aiss_nvngx.log` next to the exe: 1 lifecycle (default), 2 per-frame, 3 NGX calls, 4 every parameter |
