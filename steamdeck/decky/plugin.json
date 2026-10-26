@@ -1,0 +1,11 @@
+{
+  "name": "AISS DLSS-NSS",
+  "author": "AISS",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["DLSS", "upscaling", "NSS"],
+    "description": "AISS – DLSS→NSS: runs DLSS Super Resolution of installed Steam games on Arm Neural Super Sampling through a replacement NGX core.",
+    "image": ""
+  }
+}

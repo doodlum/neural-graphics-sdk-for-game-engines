@@ -1,0 +1,475 @@
+"""Standalone tests for the plugin backend (no Decky needed).
+
+    python3 steamdeck/decky/tests/test_backend.py [-v]
+
+Everything that writes happens in a temporary fake Steam tree. The real Steam library is only *scanned*
+(test_real_library_scan_readonly), with state and layer paths redirected to the temp dir.
+Set AISS_TEST_BIN to use another bin/ dir (default: ../bin, falling back to the repo build dirs).
+"""
+
+import hashlib
+import os
+import shutil
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PLUGIN = HERE.parent
+REPO = PLUGIN.parent.parent
+sys.path.insert(0, str(PLUGIN / "py_modules"))
+
+import aiss_core as core  # noqa: E402
+from aiss_core import (AissCore, build_launch_options, strip_launch_options, reg_set_value,  # noqa: E402
+                       reg_delete_value, reg_has_value, REG_KEY_PATH, SIG_OVERRIDE_VALUE)
+
+S0 = {"ratio": "", "quality": -1, "log": 1}
+
+
+def bin_dir(tmp: Path) -> Path:
+    env = os.environ.get("AISS_TEST_BIN")
+    if env:
+        return Path(env)
+    if all((PLUGIN / "bin" / n).is_file() for n in core.BIN_FILES.values()):
+        return PLUGIN / "bin"
+    d = tmp / "bin"
+    d.mkdir(exist_ok=True)
+    for src in (REPO / "build_win_nvngx/nvngx.dll", REPO / "build_win_loader/dbghelp/dbghelp.dll",
+                REPO / "build_win_loader/dxgi/dxgi.dll", REPO / "build_layer/libVkLayer_aiss_ngx.so",
+                REPO / "build_layer/VkLayer_aiss_ngx.json"):
+        shutil.copy(src, d / src.name)
+    return d
+
+
+class Quiet:
+    def __init__(self):
+        self.lines = []
+
+    def info(self, m):
+        self.lines.append(m)
+
+    warning = error = info
+
+
+# ------------------------------------------------------------------------------------------------------------------
+class LaunchOptionTests(unittest.TestCase):
+    def roundtrip(self, current, shim="dxgi", settings=S0, expect=None):
+        new, rec = build_launch_options(current, shim, settings, None)
+        if expect is not None:
+            self.assertEqual(new, expect)
+        again, rec2 = build_launch_options(new, shim, settings, rec)
+        self.assertEqual(again, new, "not idempotent")
+        self.assertEqual(strip_launch_options(again, rec2), current.strip(), "strip did not restore")
+        return new, rec2
+
+    def test_empty(self):
+        self.roundtrip("", expect='PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" %command%')
+
+    def test_args_without_command(self):
+        self.roundtrip("-dx12 -skipintro",
+                       expect='PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" %command% -dx12 -skipintro')
+
+    def test_wrapper(self):
+        self.roundtrip("gamemoderun %command% -foo",
+                       expect='PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" gamemoderun %command% -foo')
+
+    def test_existing_wdo_framegen_style(self):
+        new, _ = self.roundtrip("WINEDLLOVERRIDES=dxgi=n,b SteamDeck=0 %command%", shim="dbghelp")
+        self.assertIn('WINEDLLOVERRIDES="dxgi=n,b;dbghelp=n,b"', new)
+
+    def test_existing_wdo_already_ours(self):
+        cur = 'WINEDLLOVERRIDES="dxgi=n,b" %command%'
+        new, rec = self.roundtrip(cur)
+        self.assertFalse(rec["wdo_changed"])
+        self.assertEqual(new.count("dxgi=n,b"), 1)
+
+    def test_existing_wdo_other_mode_restored(self):
+        new, _ = self.roundtrip('WINEDLLOVERRIDES="dxgi=b;winmm=n,b" %command%')
+        self.assertIn('WINEDLLOVERRIDES="winmm=n,b;dxgi=n,b"', new)
+
+    def test_preexisting_nvapi_kept(self):
+        new, rec = self.roundtrip("PROTON_FORCE_NVAPI=1 DXVK_HUD=fps %command%")
+        self.assertFalse(rec["nvapi_added"])
+        self.assertEqual(new.count("PROTON_FORCE_NVAPI"), 1)
+
+    def test_quoted_user_values(self):
+        self.roundtrip('MANGOHUD_CONFIG="fps_limit=30, no_display" mangohud %command% --name "My Save"')
+
+    def test_settings_change(self):
+        new, rec = build_launch_options("", "dxgi", S0, None)
+        s2 = {"ratio": "2.0", "quality": 0, "log": 2}
+        new2, rec2 = build_launch_options(new, "dxgi", s2, rec)
+        self.assertEqual(new2, 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_RATIO=2.0 AISS_NSS_QUALITY=0 AISS_LOG=2 '
+                               'WINEDLLOVERRIDES="dxgi=n,b" %command%')
+        new3, rec3 = build_launch_options(new2, "dxgi", S0, rec2)
+        self.assertEqual(new3, new)
+        self.assertEqual(strip_launch_options(new3, rec3), "")
+
+    def test_user_edit_after_enable(self):
+        new, rec = build_launch_options("%command% -foo", "dxgi", S0, None)
+        edited = new.replace('"dxgi=n,b"', '"dxgi=n,b;foo=d"').replace("%command% -foo", "%command% -foo -bar")
+        self.assertEqual(strip_launch_options(edited, rec), 'WINEDLLOVERRIDES="foo=d" %command% -foo -bar')
+
+    def test_shim_switch(self):
+        new, rec = build_launch_options("-x", "dxgi", S0, None)
+        new2, rec2 = build_launch_options(new, "dbghelp", S0, rec)
+        self.assertIn('"dbghelp=n,b"', new2)
+        self.assertNotIn("dxgi", new2)
+        self.assertEqual(strip_launch_options(new2, rec2), "-x")
+
+
+# ------------------------------------------------------------------------------------------------------------------
+REG_SAMPLE = """WINE REGISTRY Version 2
+;; All keys relative to \\\\Machine
+
+#arch=win64
+
+[Software\\\\Microsoft\\\\Foo] 1700000000
+#time=1d9
+"A"="b"
+
+[Software\\\\NVIDIA Corporation\\\\Global\\\\NGXCore] 1791989093
+#time=1dd5bea929bf48a
+"FullPath"="C:\\\\Windows\\\\System32"
+
+[Software\\\\Zed] 1700000000
+"Z"=dword:00000001
+"""
+
+
+class RegistryTests(unittest.TestCase):
+    def test_add_remove_new_key(self):
+        new, created = reg_set_value(REG_SAMPLE, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01", now=1792970778)
+        self.assertTrue(created)
+        self.assertIn('[Software\\\\NVIDIA Corporation\\\\Global] 1792970778', new)
+        self.assertTrue(reg_has_value(new, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
+        self.assertFalse(reg_has_value(REG_SAMPLE, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
+        self.assertEqual(reg_delete_value(new, REG_KEY_PATH, SIG_OVERRIDE_VALUE, True), REG_SAMPLE)
+
+    def test_existing_key_without_value(self):
+        base = REG_SAMPLE.replace("[Software\\\\Zed]", "[Software\\\\NVIDIA Corporation\\\\Global] 1\n#time=5\n"
+                                  "\"Other\"=dword:1\n\n[Software\\\\Zed]")
+        new, created = reg_set_value(base, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01")
+        self.assertFalse(created)
+        self.assertIn('#time=5\n"{41FCC608-8496-4DEF-B43E-7D9BD675A6FF}"=hex:01\n"Other"', new)
+        self.assertEqual(reg_delete_value(new, REG_KEY_PATH, SIG_OVERRIDE_VALUE, False), base)
+
+    def test_real_testprefix_registry_readonly(self):
+        reg = Path("/home/deck/aiss/testprefix/pfx/system.reg")
+        if not reg.exists():
+            self.skipTest("no test prefix")
+        text = reg.read_text(encoding="utf-8", errors="surrogateescape")
+        self.assertTrue(reg_has_value(text, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
+        # removing and re-adding inside the existing key round-trips the text
+        stripped = reg_delete_value(text, REG_KEY_PATH, SIG_OVERRIDE_VALUE, False)
+        self.assertFalse(reg_has_value(stripped, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
+        self.assertEqual(reg_set_value(stripped, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01")[0], text)
+
+
+# ------------------------------------------------------------------------------------------------------------------
+def tree_digest(root: Path) -> dict:
+    out = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            out[str(p.relative_to(root))] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+
+class FakeLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aiss-test-"))
+        self.bin = bin_dir(self.tmp)
+        self.home = self.tmp / "home"
+        self.steam = self.home / ".local/share/Steam"
+        self.lib2 = self.tmp / "sdcard"
+        self.running: set[str] = set()
+        (self.steam / "steamapps/common").mkdir(parents=True)
+        (self.lib2 / "steamapps/common").mkdir(parents=True)
+        (self.steam / "steamapps/libraryfolders.vdf").write_text(f'''"libraryfolders"
+{{
+\t"0"\n\t{{\n\t\t"path"\t\t"{self.steam}"\n\t\t"apps"\n\t\t{{\n\t\t}}\n\t}}
+\t"1"\n\t{{\n\t\t"path"\t\t"{self.lib2}"\n\t}}
+\t"2"\n\t{{\n\t\t"path"\t\t"{self.tmp}/unmounted"\n\t}}
+}}
+''')
+        dlss = b"MZ fake nvidia dlss"
+        # 1001: Unreal layout, plain DLSS -> dxgi in <Game>/Binaries/Win64
+        g = self.game(self.steam, "1001", "UE Game", "UEGame", prefix=True)
+        self.put(g / "UEGame.exe")
+        self.put(g / "UEGame/Binaries/Win64/UEGame-Win64-Shipping.exe")
+        self.put(g / "Engine/Binaries/Win64/CrashReportClient.exe")
+        self.put(g / "Engine/Plugins/Runtime/Nvidia/DLSS/Binaries/ThirdParty/Win64/nvngx_dlss.dll", dlss)
+        # 1002: Streamline next to exe -> dbghelp; foreign _nvngx.dll already in the prefix
+        g = self.game(self.steam, "1002", "SL Game", "SLGame", prefix=True)
+        self.put(g / "SLGame.exe")
+        self.put(g / "sl.interposer.dll")
+        self.put(g / "nvngx_dlss.dll", dlss)
+        self.put(self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll", b"MZ someone else's core")
+        # 1003: foreign dxgi.dll (e.g. OptiScaler) -> conflict
+        g = self.game(self.steam, "1003", "Conflict Game", "ConflictGame", prefix=True)
+        self.put(g / "Conflict.exe")
+        self.put(g / "nvngx_dlss.dll", dlss)
+        self.put(g / "dxgi.dll", b"MZ OptiScaler")
+        # 1004: on the second library, never launched (no prefix)
+        g = self.game(self.lib2, "1004", "Fresh Game", "FreshGame", prefix=False)
+        self.put(g / "bin/x64/Fresh.exe")
+        self.put(g / "bin/x64/nvngx_dlss.dll", dlss)
+        self.put(g / "bin/x64/FreshLauncher.exe")
+        # 1005: no DLSS
+        g = self.game(self.steam, "1005", "No DLSS", "NoDLSS", prefix=True)
+        self.put(g / "NoDLSS.exe")
+        # 1006: DOOM-like, Streamline in a subfolder
+        g = self.game(self.steam, "1006", "DOOM Like", "DoomLike", prefix=True)
+        self.put(g / "DoomLike.exe")
+        self.put(g / "idTechLauncher.exe")
+        self.put(g / "streamline/production/sl.interposer.dll")
+        self.put(g / "streamline/production/nvngx_dlss.dll", dlss)
+        # 228980: Steamworks redistributables -> ignored by name
+        self.game(self.steam, "228980", "Steamworks Common Redistributables", "Steamworks Shared", prefix=False)
+
+        self.layer = self.home / ".local/share/vulkan/implicit_layer.d"
+        self.before_games = {k: tree_digest(self.steam / "steamapps/common" / k)
+                             for k in ("UEGame", "SLGame", "ConflictGame", "DoomLike")}
+        self.before_pfx = tree_digest(self.steam / "steamapps/compatdata")
+        self.core = self.make_core()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make_core(self):
+        return AissCore(home=self.home, bin_dir=self.bin, state_file=self.tmp / "settings/state.json",
+                        steam_roots=[self.steam], logger=Quiet(), running_check=lambda a: a in self.running)
+
+    # helpers
+    def put(self, path: Path, data: bytes = b"MZ"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    def pfx(self, lib: Path, appid: str) -> Path:
+        return lib / "steamapps/compatdata" / appid / "pfx"
+
+    def make_prefix(self, lib: Path, appid: str):
+        p = self.pfx(lib, appid)
+        (p / "drive_c/windows/system32").mkdir(parents=True, exist_ok=True)
+        (p / "system.reg").write_text(REG_SAMPLE)
+
+    def game(self, lib: Path, appid: str, name: str, installdir: str, prefix: bool) -> Path:
+        (lib / f"steamapps/appmanifest_{appid}.acf").write_text(
+            f'"AppState"\n{{\n\t"appid"\t\t"{appid}"\n\t"name"\t\t"{name}"\n\t"installdir"\t\t"{installdir}"\n'
+            f'\t"LastUpdated"\t\t"1"\n\t"buildid"\t\t"1"\n}}\n')
+        if prefix:
+            self.make_prefix(lib, appid)
+        d = lib / "steamapps/common" / installdir
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def view(self, appid):
+        return next(g for g in self.core.scan(force=True) if g["appid"] == appid)
+
+    # tests
+    def test_detection(self):
+        games = {g["appid"]: g for g in self.core.scan(force=True)}
+        self.assertEqual(sorted(games), ["1001", "1002", "1003", "1004", "1006"])
+        c = self.steam / "steamapps/common"
+        self.assertEqual(games["1001"]["shim"], "dxgi")
+        self.assertEqual(games["1001"]["targets"], [str(c / "UEGame/UEGame/Binaries/Win64")])
+        self.assertEqual(games["1002"]["shim"], "dbghelp")
+        self.assertEqual(games["1002"]["targets"], [str(c / "SLGame")])
+        self.assertEqual(games["1003"]["status"], "conflict")
+        self.assertEqual(games["1004"]["status"], "prefix_missing")
+        self.assertEqual(games["1004"]["targets"], [str(self.lib2 / "steamapps/common/FreshGame/bin/x64")])
+        self.assertEqual(games["1006"]["targets"], [str(c / "DoomLike"), str(c / "DoomLike/streamline/production")])
+        for a in ("1001", "1002", "1006"):
+            self.assertEqual(games[a]["status"], "not_installed")
+
+    def test_install_uninstall_roundtrip(self):
+        c = self.steam / "steamapps/common"
+        for a in ("1001", "1002", "1006"):
+            r = self.core.install_game(a)
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(r["status"], "installed", r)
+            self.assertEqual(self.view(a)["status"], "installed")
+        self.assertEqual((c / "UEGame/UEGame/Binaries/Win64/dxgi.dll").read_bytes(), (self.bin / "dxgi.dll").read_bytes())
+        self.assertEqual((c / "SLGame/dbghelp.dll").read_bytes(), (self.bin / "dbghelp.dll").read_bytes())
+        self.assertTrue((c / "DoomLike/dbghelp.dll").exists())
+        self.assertTrue((c / "DoomLike/streamline/production/dbghelp.dll").exists())
+        for a in ("1001", "1002", "1006"):
+            p = self.pfx(self.steam, a)
+            self.assertEqual((p / "drive_c/windows/system32/_nvngx.dll").read_bytes(),
+                             (self.bin / "nvngx.dll").read_bytes())
+            self.assertTrue(reg_has_value((p / "system.reg").read_text(), REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
+            self.assertEqual((p / "system.reg.aiss-bak").read_text(), REG_SAMPLE)
+        self.assertTrue((self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll.aiss-orig").exists())
+        self.assertTrue((self.layer / "libVkLayer_aiss_ngx.so").exists())
+        self.assertTrue((self.layer / "VkLayer_aiss_ngx.json").exists())
+        # install again: idempotent
+        self.assertEqual(self.core.install_game("1001")["status"], "installed")
+        # state survives a restart
+        self.core = self.make_core()
+        self.assertTrue(self.core.state["games"]["1002"]["enabled"])
+        for a in ("1001", "1002", "1006"):
+            r = self.core.uninstall_game(a)
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(r["message"], "")
+        for k, digest in self.before_games.items():
+            self.assertEqual(tree_digest(c / k), digest, f"{k} not restored")
+        after = tree_digest(self.steam / "steamapps/compatdata")
+        after = {k: v for k, v in after.items() if not k.endswith(".aiss-bak")}
+        self.assertEqual(after, self.before_pfx, "prefixes not restored")
+        self.core.remove_layer()
+        self.assertFalse((self.layer / "libVkLayer_aiss_ngx.so").exists())
+
+    def test_conflict_untouched(self):
+        r = self.core.install_game("1003")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["status"], "conflict")
+        self.assertEqual(tree_digest(self.steam / "steamapps/common/ConflictGame"), self.before_games["ConflictGame"])
+        self.assertFalse((self.pfx(self.steam, "1003") / "drive_c/windows/system32/_nvngx.dll").exists())
+        self.assertFalse(self.core.state["games"]["1003"]["enabled"])
+        lo = self.core.launch_options("1003", "-foo", True)
+        self.assertFalse(lo["ok"])
+
+    def test_prefix_created_later(self):
+        r = self.core.install_game("1004")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["status"], "prefix_missing")
+        self.assertTrue((self.lib2 / "steamapps/common/FreshGame/bin/x64/dxgi.dll").exists())
+        self.assertEqual(self.core.verify_all(), [])  # nothing to do yet
+        # first launch creates the prefix (Steam puts it in the game's library)
+        self.make_prefix(self.lib2, "1004")
+        res = self.core.verify_all()
+        self.assertEqual([r["status"] for r in res], ["installed"])
+        self.assertTrue((self.pfx(self.lib2, "1004") / "drive_c/windows/system32/_nvngx.dll").exists())
+        self.assertEqual(self.view("1004")["status"], "installed")
+
+    def test_repair_after_game_update(self):
+        self.core.install_game("1001")
+        shim = self.steam / "steamapps/common/UEGame/UEGame/Binaries/Win64/dxgi.dll"
+        shim.unlink()  # Steam update/verify deleted it
+        self.assertEqual(self.view("1001")["status"], "needs_repair")
+        res = self.core.verify_all()
+        self.assertEqual(res[0]["status"], "installed")
+        self.assertEqual(shim.read_bytes(), (self.bin / "dxgi.dll").read_bytes())
+        # an older build of ours (has the marker, unknown hash) is upgraded, not reported as a conflict
+        shim.write_bytes(b"MZ old build " + core.SHIM_MARKER)
+        self.assertEqual(self.view("1001")["status"], "needs_repair")
+        self.assertEqual(self.core.verify_all()[0]["status"], "installed")
+        self.assertEqual(shim.read_bytes(), (self.bin / "dxgi.dll").read_bytes())
+        # someone else's dxgi.dll replaced ours -> conflict, left alone
+        shim.write_bytes(b"MZ ReShade")
+        self.assertEqual(self.view("1001")["status"], "conflict")
+        self.assertEqual(self.core.verify_all()[0]["status"], "conflict")
+        self.assertEqual(shim.read_bytes(), b"MZ ReShade")
+        r = self.core.uninstall_game("1001")
+        self.assertIn("no longer ours", r["message"])
+        self.assertEqual(shim.read_bytes(), b"MZ ReShade")
+        self.assertEqual(self.core.verify_all(), [])  # nothing done for disabled game
+
+    def test_update_adds_streamline(self):
+        self.core.install_game("1001")
+        g = self.steam / "steamapps/common/UEGame"
+        self.put(g / "UEGame/Binaries/Win64/sl.interposer.dll")
+        (g.parent.parent / "appmanifest_1001.acf").write_text(
+            (g.parent.parent / "appmanifest_1001.acf").read_text().replace('"LastUpdated"\t\t"1"', '"LastUpdated"\t\t"2"'))
+        res = self.core.verify_all()
+        self.assertEqual(res[0]["shim"], "dbghelp")
+        self.assertFalse((g / "UEGame/Binaries/Win64/dxgi.dll").exists())
+        self.assertTrue((g / "UEGame/Binaries/Win64/dbghelp.dll").exists())
+        lo = self.core.launch_options("1001", "", True)
+        self.assertIn('"dbghelp=n,b"', lo["options"])
+
+    def test_running_game_defers_registry(self):
+        self.running.add("1002")
+        r = self.core.install_game("1002")
+        self.assertTrue(r["ok"])
+        self.assertIn("deferred", r["message"])
+        reg = self.pfx(self.steam, "1002") / "system.reg"
+        self.assertEqual(reg.read_text(), REG_SAMPLE)
+        self.assertEqual(self.core.verify_all()[0]["message"], "registry update deferred until the game exits")
+        self.running.clear()
+        self.core.verify_all()
+        self.assertTrue(reg_has_value(reg.read_text(), REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
+        self.assertFalse(self.core.state["games"]["1002"]["reg_pending"])
+        # disable while running: files go, registry waits
+        self.running.add("1002")
+        r = self.core.uninstall_game("1002")
+        self.assertIn("deferred", r["message"])
+        self.assertTrue(reg_has_value(reg.read_text(), REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
+        self.running.clear()
+        self.core.verify_all()
+        self.assertEqual(reg.read_text(), REG_SAMPLE)
+
+    def test_layer_not_ours_untouched(self):
+        self.layer.mkdir(parents=True)
+        (self.layer / "libVkLayer_aiss_ngx.so").write_bytes(b"dev build")
+        r = self.core.install_game("1002")
+        self.assertIn("left untouched", r["message"])
+        self.assertEqual((self.layer / "libVkLayer_aiss_ngx.so").read_bytes(), b"dev build")
+        self.assertTrue((self.layer / "VkLayer_aiss_ngx.json").exists())
+
+    def test_launch_options_flow_and_settings(self):
+        self.core.install_game("1002")
+        lo = self.core.launch_options("1002", "-novid", True)
+        self.assertEqual(lo["options"],
+                         'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
+        self.core.set_settings({"ratio": "2", "quality": 0, "log": 0})
+        with self.assertRaises(ValueError):
+            self.core.set_settings({"ratio": "9"})
+        lo2 = self.core.launch_options("1002", lo["options"], True)
+        self.assertEqual(lo2["options"], 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_RATIO=2.0 AISS_NSS_QUALITY=0 '
+                                         'AISS_LOG=0 WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
+        self.core = self.make_core()  # ownership record persisted
+        off = self.core.launch_options("1002", lo2["options"], False)
+        self.assertEqual(off["options"], "-novid")
+
+    def test_main_py_loads_with_stub_decky(self):
+        stub = types.ModuleType("decky")
+        stub.DECKY_PLUGIN_DIR = str(PLUGIN)
+        stub.DECKY_USER_HOME = str(self.home)
+        stub.DECKY_PLUGIN_SETTINGS_DIR = str(self.tmp / "settings")
+        stub.logger = Quiet()
+        sys.modules["decky"] = stub
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("aiss_main", PLUGIN / "main.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        import asyncio
+        p = mod.Plugin()
+        mod.Plugin.core = None
+        st = asyncio.run(p.get_state(True))
+        self.assertIn("games", st)
+        self.assertIn("settings", st)
+        r = asyncio.run(p.set_settings({"quality": 7}))
+        self.assertFalse(r["ok"])
+        mod.Plugin.core = None
+
+
+# ------------------------------------------------------------------------------------------------------------------
+class RealLibraryReadOnly(unittest.TestCase):
+    def test_real_library_scan_readonly(self):
+        home = Path("/home/deck")
+        if not (home / ".local/share/Steam/steamapps/libraryfolders.vdf").exists():
+            self.skipTest("no Steam library")
+        tmp = Path(tempfile.mkdtemp(prefix="aiss-real-"))
+        try:
+            c = AissCore(home=home, bin_dir=bin_dir(tmp), state_file=tmp / "state.json",
+                         layer_dir=tmp / "layer", logger=Quiet())
+            games = c.scan(force=True)
+            self.assertFalse((tmp / "state.json").exists(), "scan must not write")
+            print("\n  real library: %d DLSS game(s)" % len(games))
+            for g in games:
+                print(f"   {g['appid']:>8} {g['name'][:28]:28} shim={g['shim']:7} status={g['status']:14} "
+                      f"running={c.is_running(g['appid'])}")
+                for t in g["targets"]:
+                    print(f"            -> {t}/{g['shim']}.dll")
+                if g["conflicts"]:
+                    print(f"            conflicts: {g['conflicts']}")
+            self.assertTrue(all(g["shim"] in ("dbghelp", "dxgi") for g in games))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2 if "-v" in sys.argv else 1, argv=[a for a in sys.argv if a != "-v"])
