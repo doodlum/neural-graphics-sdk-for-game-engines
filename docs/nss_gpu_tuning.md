@@ -17,7 +17,7 @@ replay below. Lossy types (fp8 etc.) are not used.
 | `--width 64 --height 64` | Tiny graph: measures the fixed per-layer cost (barrier + one workgroup's latency chain). |
 | `FFX_PROFILE_PASSES=<file>` (any app using the VK backend) | Per-job GPU time of every NSS pass (labelled `<index>_<job type>`), medians rewritten every 250 executions. |
 | `FFX_PROFILE_BARRIERS=1` (with `FFX_PROFILE_PASSES`) | Adds a `<n>_barriers` timestamp after each compute job's barriers, splitting barrier/transition cost from the dispatch. |
-| `bin/ffx_nss_replay_test` (Linux, native VK, `sdk/src/components/nss/test`) | Deterministic synthetic replay through ffx-api: bit-exact gate for all Deck permutations (`--suite --save/--check DIR`) and per-pass timings without a game (`--bench N --render WxH --quality 1\|2`). |
+| `bin/ffx_nss_replay_test` (Linux, native VK, `sdk/src/components/nss/test`) | Deterministic synthetic replay through ffx-api: bit-exact gate for all Deck permutations (`--suite --save/--check DIR`, QUALITY/BALANCED/PERFORMANCE) and per-pass timings without a game (`--bench N --render WxH --quality 0\|1\|2`). |
 | Streamline_Sample `-benchmark` + `tools/nss/run_nss_vs_dlss.sh` (in the Streamline_Sample nss-upscaler branch) | Upscaler GPU time in a real frame vs DLSS. |
 | `tools/nss/nss_replay.sh record/replay` + `compare_raw.py` (Streamline_Sample nss-upscaler branch) | Bit-exact output check on identical recorded inputs (the sample's renderer is not deterministic run to run, so plain captures cannot be compared). |
 
@@ -255,3 +255,66 @@ Ideas left:
   old history by 0, and uncleared memory could hold NaNs).
 - Re-measure in the game: the harness scene's disocclusion cost was 2x the game's, the other passes matched within ~5%.
 
+
+### Full network (QUALITY), Steam Deck
+
+The Steam Deck proxy now runs QUALITY (the `high` graph, full-res preprocess, dense 9-tap filter, Catmull history) for
+every DLSS mode. Measured with the replay harness, 1280x800 output, interleaved runs of the original `steamdeck` build
+and this one (us, steady-state medians of 1500 frames):
+
+| Pass | 640x400 before | 640x400 after | 853x533 before | 853x533 after |
+| --- | --- | --- | --- | --- |
+| Depth scatter (full res) | 32 | 32 | 64 | 64 |
+| Preprocess (full res) | 245 | 247 | 432 | 442 |
+| ML graph (high) | 1531 | 1529 | 2640 | 2630 |
+| Dynamic offset LUT | - | - | **2153** | **0.1** |
+| Postprocess | 764 | 769 | **1682** | **1111** |
+| Total | 2577 | 2581 | **6981** | **4251** |
+
+640x400 is an exact 2x ratio (static LUT, NSS_FILTER_MODE 0); 853x533 is a general ratio (dynamic dense LUT, mode 2).
+All changes are bit identical: the replay suite (now 13 configs, with QUALITY at 640x400 and 853x533 -> 1280x800, HDR
+off/on), 64-frame runs at eight more QUALITY ratios (640x400, 720x450, 742x464, 853x533, 960x600, 1000x700,
+1066x666) plus BALANCED/PERFORMANCE spot checks compared by hash, and `ffx_ml_runtime_test` EXACT on every path.
+Bench labels for QUALITY: `1_compute` depth scatter, `2_compute` preprocess, `3_data_graph`, `4_compute` dynamic LUT
+(non-2x only), then postprocess.
+
+What worked:
+
+| Change | Effect |
+| --- | --- |
+| Dynamic dense LUT made separable. The LUT held 9 packed taps for each tile of the reduced fraction, which is the full 1280x800 for 853 -> 1280 (853 is prime), 48 B each, rebuilt every frame with up to 36 candidates per thread. Tap validity and LR offsets depend on x and y independently and the candidate order is fixed, so the LUT now holds one texel per x tile and one per y tile (6 offsets + a 36-bit mask over candidate ranks). The postprocess ANDs the two masks and takes the first 9 ranks: the same taps in the same order, with the per-axis float math unchanged | LUT 2153 -> 0.1 us, postprocess 1682 -> 1427 us |
+| Postprocess (mode 2): the 9 taps are resolved before any fetch, and the LR clamping + KPN mapping (~30 VALU per tap) is done once per workgroup column and row into LDS (same functions); each tap reads 2 words | 1427 -> 1100 us |
+| Graph: the activation TABLE is copied to shared memory per workgroup (one SSBO load per output value before), and at most 4 pixels per thread (the 16 -> 4 output layer) | layer 13 at 544x864: 198 -> 185 us |
+| Graph: channel blocks up to 40, so the 36-channel KPN layer is one block instead of 2 x 20 | layer 9 at 136x216: 155 -> 140 us |
+
+What did not work (measured, reverted):
+
+- Mode 2 postprocess: only unrolling the tap loop and issuing all fetches first (80 VGPRs, 12 waves): no change. The
+  pass is VALU bound (~800 VALU/pixel, which predicts ~0.97 ms against 1.1 ms measured), not latency bound.
+- Exact shift for the KPN mapping (`floor((t + 0.501) * 0.25) == t >> 2`; `_KpnScale` is always exactly 1/4): slower
+  (765 -> 808 us at 640x400) as a uniform branch inside the tap code, because ACO does not schedule loads across basic
+  blocks; neutral with the branch hoisted around the whole filter. The mapping is not the cost.
+- Mode 0 (exact 2x) postprocess, VALU bound (537 VALU/pixel, ~88% of the measured time). Timing stubs: the KPN weight
+  path (coordinates, address, byte read, dequant) is ~230 of 764 us; the colour loads only ~20 us. ACO already reduces
+  the 9 taps to 3 + 3 distinct coordinates. Staging the 11x11 LR window and its KPN words in LDS: 764 -> 891 us; KPN
+  words only in LDS: 886 us; per-column/row coordinates in LDS: neutral.
+- Preprocess (full res): sharing the 5-tap YCoCg derivative neighbours through LDS: 442 -> 458 us. The pass is at the
+  memory floor: ~55 B of unique traffic per pixel (colour, depth, motion, bilinear history at output resolution,
+  derivative/feedback/depth history, 17 B of outputs) is ~26 MB at 853x533, i.e. ~0.43 ms at ~60 GB/s.
+- Graph: 16-channel blocks for the high model at 640x400: 1.44 -> 1.84 ms. 16 pixels per thread on the narrow layers
+  (256 accumulators, spills) gave wrong results on this driver, like the earlier wave64 PX 8 x OCB 32 case; the tile
+  choice caps accumulators at 32 so it never goes there.
+
+The graph's big layers stay at ~75% of the int8 dot4 peak; the rest of its time is the quarter-rate `v_mul_hi_i32` of
+the exact rescale, the low-IC first layer and the memory-bound full-res last layer.
+
+Ideas left:
+
+- Mode 2 postprocess: the selected ranks depend only on the 6-bit x and 6-bit y validity patterns, so a 4096-entry
+  table (9 x 6-bit ranks + count) generated with the LUT would replace the per-tap `findLSB` extraction (~9% of the
+  pass by count).
+- Mode 0 postprocess: the KPN weight path is the largest exact-reducible part (~30%); a layout that groups the 9
+  channels a pixel reads, or reading the KPN as 32-bit words per tap pair, could cut the address/extract work.
+- Async compute: the history warp/Catmull part of the postprocess does not depend on the graph and could overlap the
+  graph's barriers on a second queue.
+- Graph: fusing the full-res tail (layers 12 -> 13) would remove one 1.1 MB round trip and a barrier at 640x400.
