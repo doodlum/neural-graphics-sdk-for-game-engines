@@ -40,8 +40,13 @@ sample:
 | Postprocess | 806 | 371 |
 | **Total** | **1683** (with the RDNA2 ML kernel) | **973** |
 
-In the Streamline sample with ray tracing on, D3D12 runs at 9 FPS natively at 1280x722 and 22-24 FPS with DLSS
-Performance → NSS at 1280x800 (measured before the pre/post-process tuning).
+Streamline sample (ray tracing on), 1280x800 fullscreen on the Deck, installed exactly as the Decky plugin does it
+(its bundled binaries and launch options), frame rate over 900 frames:
+
+| API | Native 1280x800 | DLSS MaxPerf → NSS (640x400 → 1280x800) |
+| --- | --- | --- |
+| D3D12 | 9.9 FPS | **29.9 FPS** |
+| Vulkan | 12.1 FPS | **36.5 FPS** |
 
 DLSS quality modes map to NSS's small (mid_low) network. NSS's QUALITY mode switches to the large network, which costs
 about 5x more on the Deck; it is only used with `AISS_NSS_QUALITY=0`.
