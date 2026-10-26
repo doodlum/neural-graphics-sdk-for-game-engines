@@ -628,6 +628,22 @@ int32_t2 PackedOffsetLutModulo()
     return max(int32_t2(IndexModulo()), int32_t2(1));
 }
 
+// output_px % modulo for output_px >= 0 without integer divides: exact float quotient estimate + remainder correction
+// (see KpnScaledCoordDiv4), valid while both are below 2^22; plain % otherwise.
+int32_t2 PackedOffsetLutTile(int32_t2 output_px, int32_t2 modulo)
+{
+    if (all(lessThan(OutputDims(), int32_t2(1 << 22))) && all(lessThan(modulo, int32_t2(1 << 22))))
+    {
+        float2 fn = float2(output_px);
+        float2 fm = float2(modulo);
+        float2 q  = floor(fn * (float2(1.0) / fm));
+        float2 r  = fn - q * fm;
+        r += mix(float2(0.0), fm, lessThan(r, float2(0.0))) - mix(float2(0.0), fm, greaterThanEqual(r, fm));
+        return int32_t2(r);
+    }
+    return output_px % modulo;
+}
+
 void AccumulatePackedLrOffsetTap(
     OffsetLutTap lut_tap, int32_t2 lr_base, int32_t2 colour_max, int32_t2 kpn_max, inout half4 accum_m1, inout half4 accum_m2, inout half4 center_sample)
 {
@@ -655,7 +671,7 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     int32_t2 colour_max = InputDims() - int32_t2(1);
     int32_t2 kpn_max    = KpnDims() - int32_t2(1);
     int32_t2 idx_mod_xy = PackedOffsetLutModulo();
-    int32_t2 tile_idx   = output_px % idx_mod_xy;
+    int32_t2 tile_idx   = PackedOffsetLutTile(output_px, idx_mod_xy);
     int32_t2 lr_base    = int32_t2(floor(float2(output_px) * InvScale()));
 
     half4 accum_m1 = half4(0.HF);
@@ -700,7 +716,7 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     int32_t2 colour_max = InputDims() - int32_t2(1);
     int32_t2 kpn_max = KpnDims() - int32_t2(1);
     int32_t2 idx_mod_xy = PackedOffsetLutModulo();
-    int32_t2 tile_idx = output_px % idx_mod_xy;
+    int32_t2 tile_idx = PackedOffsetLutTile(output_px, idx_mod_xy);
     int32_t2 lr_base = int32_t2(floor(float2(output_px) * InvScale()));
 
     half4 accum_m1 = half4(0.HF);
