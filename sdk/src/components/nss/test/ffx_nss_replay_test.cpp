@@ -13,7 +13,7 @@
 //   ffx_nss_replay_test --suite --check DIR    run it again and compare every frame/pixel/channel with DIR
 //   ffx_nss_replay_test --bench N [config]     run N frames back to back and print per-pass GPU medians
 //
-// Single config options: --quality 1|2 (BALANCED/PERFORMANCE), --render WxH, --display WxH, --hdr 0|1,
+// Single config options: --quality 0|1|2 (QUALITY/BALANCED/PERFORMANCE), --render WxH, --display WxH, --hdr 0|1,
 // --frames N, --out rgba16f|r11g11b10, --gpu N.
 
 #include <ffx_api/ffx_api.h>
@@ -734,7 +734,7 @@ namespace
 
     std::vector<Config> SuiteConfigs(int frames)
     {
-        // Every permutation the Steam Deck uses: BALANCED/PERFORMANCE (mid_low network), exact 2x and a non-2x ratio,
+        // Every permutation the Steam Deck uses: BALANCED/PERFORMANCE (mid_low network) and QUALITY (high network, below), exact 2x and a non-2x ratio,
         // HDR flag on and off. MANAGE_HISTORY, reversed + infinite depth and the compute path are always on.
         std::vector<Config> configs;
         const uint32_t      sizes[2][2] = {{640, 400}, {742, 464}};
@@ -754,6 +754,19 @@ namespace
         Config c       = configs[0];
         c.outR11G11B10 = true;
         configs.push_back(c);
+        // QUALITY (full network, the Steam Deck proxy default): Performance and Quality render sizes -> 1280x800.
+        const uint32_t fullSizes[2][2] = {{640, 400}, {853, 533}};
+        for (auto& s : fullSizes)
+            for (bool hdr : {false, true})
+            {
+                Config q;
+                q.quality = FFX_API_NSS_SHADER_QUALITY_MODE_QUALITY;
+                q.renderW = s[0];
+                q.renderH = s[1];
+                q.hdr     = hdr;
+                q.frames  = frames;
+                configs.push_back(q);
+            }
         return configs;
     }
 
@@ -798,7 +811,7 @@ int main(int argc, char** argv)
         else
         {
             fprintf(stderr,
-                    "usage: %s [--suite] [--save DIR | --check DIR] [--bench N] [--quality 1|2] [--render WxH] [--display WxH] [--hdr 0|1]\n"
+                    "usage: %s [--suite] [--save DIR | --check DIR] [--bench N] [--quality 0|1|2] [--render WxH] [--display WxH] [--hdr 0|1]\n"
                     "          [--frames N] [--out rgba16f|r11g11b10] [--gpu N]\n",
                     argv[0]);
             return 2;
