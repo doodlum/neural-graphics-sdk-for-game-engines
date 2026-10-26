@@ -38,6 +38,11 @@
 
 #define NSS_POSTPROCESS 1
 
+// Exact-2x sparse filter: one thread per 2x2 output quad (see PostprocessQuad; ffx_nss.cpp halves the dispatch).
+#if (SCALE_PRESET_MODE == 1) && (NSS_SHADER_QUALITY_MODE != 0)
+#define NSS_POSTPROCESS_QUAD 1
+#endif
+
 #include "nss/ffx_nss_postprocess.h"
 
 #ifndef FFX_NSS_NUM_THREADS
@@ -47,5 +52,9 @@
 FFX_NSS_NUM_THREADS
 void main()
 {
+#if NSS_POSTPROCESS_QUAD
+    PostprocessQuad(int32_t2(gl_GlobalInvocationID.xy));
+#else
     Postprocess(int32_t2(gl_GlobalInvocationID.xy));
+#endif
 }

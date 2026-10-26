@@ -95,6 +95,11 @@ const float kEps_Post          = 1e-7;
 const float kMotionThreshold   = 0.1;
 const float kMotionThresholdSq = kMotionThreshold * kMotionThreshold;
 
+// Compute path, exact-2x sparse filter: one thread per 2x2 output quad (the host dispatches accordingly).
+#ifndef NSS_POSTPROCESS_QUAD
+#define NSS_POSTPROCESS_QUAD 0
+#endif
+
 #if NSS_USE_SPARSE_2X2_FILTER
 const int32_t kKpnChannels = 16;
 #else
@@ -452,16 +457,25 @@ int32_t2 DecodeNearestOffset(int32_t2 pixel)
 // ---------------------------------------------------------------------------
 // Motion loading for postprocess (uses nearest-depth dilation)
 // ---------------------------------------------------------------------------
-half2 LoadMotionPost(int32_t2 output_coord)
+int32_t2 MotionPostInputCoord(int32_t2 output_coord)
+{
+    return int32_t2(float2(output_coord) * InvScale());
+}
+
+half2 LoadMotionPostAtInput(int32_t2 input_coord)
 {
     // Reproject motion lookup using nearest-depth dilated coordinate.
-    int32_t2 input_coord     = int32_t2(float2(output_coord) * InvScale());
     int32_t2 dilation_offset = DecodeNearestOffset(input_coord);
     int32_t2 dilated_coord   = clamp(input_coord + dilation_offset, int32_t2(0), InputDims() - int32_t2(1));
 
     half2 v = half2(texelFetch(_MotionVectorTex, dilated_coord, 0).xy * MotionVectorScale()) * half2(Scale());
     v *= half(dot(float2(v), float2(v)) > kMotionThresholdSq);
     return v;
+}
+
+half2 LoadMotionPost(int32_t2 output_coord)
+{
+    return LoadMotionPostAtInput(MotionPostInputCoord(output_coord));
 }
 
 // ---------------------------------------------------------------------------
@@ -858,10 +872,9 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
 // ---------------------------------------------------------------------------
 // History warp with motion + optional Catmull-Rom
 // ---------------------------------------------------------------------------
-void WarpHistory(int32_t2 output_px, float2 uv, out half4 warped_colour, out half onscreen)
+void WarpHistory(half2 motion, float2 uv, out half4 warped_colour, out half onscreen)
 {
     // Reproject history with motion; report if sample stayed on-screen.
-    half2  motion    = LoadMotionPost(output_px);
     float2 reproj_uv = uv + (float2(motion) * InvOutputDims());
     onscreen         = half(all(greaterThanEqual(reproj_uv, float2(0.0))) && all(lessThanEqual(reproj_uv, float2(1.0))));
 #ifdef ENABLE_HISTORY_CATMULL
@@ -957,16 +970,10 @@ void WriteColourOut(int32_t2 coord, half3 out_linear)
 // ---------------------------------------------------------------------------
 // Main postprocess entry point
 // ---------------------------------------------------------------------------
-void Postprocess(int32_t2 output_pixel)
+// motion: LoadMotionPost(output_pixel), passed in so a thread handling several pixels can share it.
+void PostprocessPixel(int32_t2 output_pixel, half2 motion)
 {
     int32_t2 output_px = output_pixel;
-    //-------------------------------------------------------------------------
-    // 1) Dispatch guard and setup
-    //-------------------------------------------------------------------------
-    if (any(greaterThanEqual(output_px, OutputDims())))
-    {
-        return;
-    }
 
     half   exposure = half(Exposure().x);
     half   reset    = half(Reset());
@@ -990,7 +997,7 @@ void Postprocess(int32_t2 output_pixel)
 
     half4 warped_colour;
     half  onscreen;
-    WarpHistory(output_px, uv, warped_colour, onscreen);
+    WarpHistory(motion, uv, warped_colour, onscreen);
 
     //-------------------------------------------------------------------------
     // 4) Clamp and rectify history
@@ -1016,6 +1023,62 @@ void Postprocess(int32_t2 output_pixel)
     StorePrevUpscaledColor(output_pixel, out_linear);
 #endif
 }
+
+void Postprocess(int32_t2 output_pixel)
+{
+    //-------------------------------------------------------------------------
+    // 1) Dispatch guard and setup
+    //-------------------------------------------------------------------------
+    if (any(greaterThanEqual(output_pixel, OutputDims())))
+    {
+        return;
+    }
+    PostprocessPixel(output_pixel, LoadMotionPost(output_pixel));
+}
+
+#if NSS_POSTPROCESS_QUAD
+// One thread per 2x2 output quad (exact-2x sparse filter, compute path). At 2x the four pixels of a quad map to the
+// same input pixel, so the nearest-offset decode and dilated motion fetch are done once; the per-pixel work is
+// unchanged. Falls back to per-pixel motion when the input coordinates differ (non-2x dispatch sizes).
+void PostprocessQuad(int32_t2 quad)
+{
+    int32_t2 base = quad * int32_t2(2);
+    if (any(greaterThanEqual(base, OutputDims())))
+    {
+        return;
+    }
+
+    int32_t2 ic00 = MotionPostInputCoord(base);
+    int32_t2 ic10 = MotionPostInputCoord(base + int32_t2(1, 0));
+    int32_t2 ic01 = MotionPostInputCoord(base + int32_t2(0, 1));
+    int32_t2 ic11 = MotionPostInputCoord(base + int32_t2(1, 1));
+    half2    mv00 = LoadMotionPostAtInput(ic00);
+    half2    mv10 = mv00;
+    half2    mv01 = mv00;
+    half2    mv11 = mv00;
+    if (any(notEqual(ic10, ic00)) || any(notEqual(ic01, ic00)) || any(notEqual(ic11, ic00)))
+    {
+        mv10 = LoadMotionPostAtInput(ic10);
+        mv01 = LoadMotionPostAtInput(ic01);
+        mv11 = LoadMotionPostAtInput(ic11);
+    }
+
+    bvec2 inside = lessThan(base + int32_t2(1), OutputDims());
+    PostprocessPixel(base, mv00);
+    if (inside.x)
+    {
+        PostprocessPixel(base + int32_t2(1, 0), mv10);
+    }
+    if (inside.y)
+    {
+        PostprocessPixel(base + int32_t2(0, 1), mv01);
+    }
+    if (inside.x && inside.y)
+    {
+        PostprocessPixel(base + int32_t2(1, 1), mv11);
+    }
+}
+#endif  // NSS_POSTPROCESS_QUAD
 #endif
 
 #undef _NearestDepthOffsetTex
