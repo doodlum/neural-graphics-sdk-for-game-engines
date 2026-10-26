@@ -232,16 +232,36 @@ int8_t ReadKpnParamsInt8(int32_t2 kpn_tap, int32_t channel)
 // ---------------------------------------------------------------------------
 // KPN coordinate mapping: input space → KPN tensor space
 // ---------------------------------------------------------------------------
+// floor(n * k / d) for n >= 0, k >= 0, d >= 1 without an integer divide (a generic 32-bit divide is ~20 VALU
+// including quarter-rate multiplies on AMD). The float estimate is within 1 of the quotient while n * k < 2^22
+// (rcp + mul relative error < 2^-22), every product below is an exactly representable integer, and the remainder
+// test corrects the estimate, so the result equals the integer division. The fallback keeps larger sizes exact.
+int32_t4 KpnScaledCoordDiv4(int32_t4 n, int32_t k, int32_t d)
+{
+    if (d * k < (1 << 22))
+    {
+        float  fd = float(d);
+        float4 fn = float4(n) * float(k);
+        float4 q  = floor(fn * (1.0 / fd));
+        float4 r  = fn - q * fd;
+        q += float4(greaterThanEqual(r, float4(fd))) - float4(lessThan(r, float4(0.0)));
+        return int32_t4(q);
+    }
+    return (n * int32_t4(k)) / int32_t4(d);
+}
+
 int32_t KpnCoordFromInputCoord(int32_t input_coord, int32_t input_dim, int32_t kpn_dim)
 {
+    // input_coord is a clamped (non-negative) tap coordinate.
     int32_t safe_dim = max(input_dim, int32_t(1));
-    return min((input_coord * kpn_dim) / safe_dim, kpn_dim - int32_t(1));
+    return min(KpnScaledCoordDiv4(int32_t4(input_coord), kpn_dim, safe_dim).x, kpn_dim - int32_t(1));
 }
 
 int16_t4 KpnCoordFromInputCoord4(int16_t4 input_coord, int32_t input_dim, int32_t kpn_dim)
 {
+    // input_coord holds clamped (non-negative) tap coordinates.
     int32_t  safe_dim = max(input_dim, int32_t(1));
-    int32_t4 scaled   = (int32_t4(input_coord) * int32_t4(kpn_dim)) / int32_t4(safe_dim);
+    int32_t4 scaled   = KpnScaledCoordDiv4(int32_t4(input_coord), kpn_dim, safe_dim);
     return int16_t4(min(scaled, int32_t4(kpn_dim - int32_t(1))));
 }
 
