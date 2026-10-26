@@ -257,6 +257,11 @@ int8_t ReadKpnParamsInt8(int32_t2 kpn_tap, int32_t channel)
 // test corrects the estimate, so the result equals the integer division. The fallback keeps larger sizes exact.
 int32_t4 KpnScaledCoordDiv4(int32_t4 n, int32_t k, int32_t d)
 {
+    // d an exact power-of-two multiple of k (the 2x presets, e.g. 640 -> KPN 80): floor(n * k / d) = n >> log2(d / k).
+    if (k > 0 && (d % k) == 0 && bitCount(uint32_t(d / k)) == 1)
+    {
+        return n >> findLSB(d / k);
+    }
     if (d * k < (1 << 22))
     {
         float  fd = float(d);
@@ -271,6 +276,11 @@ int32_t4 KpnScaledCoordDiv4(int32_t4 n, int32_t k, int32_t d)
 
 int32_t2 KpnScaledCoordDiv2(int32_t2 n, int32_t k, int32_t d)
 {
+    // d an exact power-of-two multiple of k (the 2x presets, e.g. 640 -> KPN 80): floor(n * k / d) = n >> log2(d / k).
+    if (k > 0 && (d % k) == 0 && bitCount(uint32_t(d / k)) == 1)
+    {
+        return n >> findLSB(d / k);
+    }
     if (d * k < (1 << 22))
     {
         float  fd = float(d);
