@@ -4,7 +4,30 @@ This branch turns the SDK into a drop-in DLSS Super Resolution replacement for S
 Games keep calling DLSS (directly through NGX, or through Streamline), and the frames are upscaled by Arm's Neural
 Super Sampling network, running on the Deck's GPU through the native compute ML path of the `universal` branch.
 
-Only the DLSS proxy idea is taken from OptiScaler. There are no other upscalers, no overlay and no frame generation.
+## Based on OptiScaler's DLSS proxy
+
+The design follows OptiScaler's DLSS (NGX) input path, and only that: no other upscalers, inputs, overlay or frame
+generation. The pieces carried over:
+
+- Replacing the NGX core (`nvngx.dll` / `_nvngx.dll`) with one that implements the NGX D3D12 / Vulkan / D3D11 entry points,
+  answers DLSS capability and optimal-settings queries, and serves the SuperSampling feature with another upscaler.
+- Getting NGX to load an unsigned core by pointing its file-signature check at an NVIDIA-signed DLL the game already ships
+  (`nvngx_dlss.dll`), from a DLL loaded early as a system-DLL proxy (here `dbghelp.dll` / `dxgi.dll`).
+- On Linux, leaving NVIDIA spoofing to Proton/dxvk-nvapi (`PROTON_FORCE_NVAPI=1`), as OptiScaler's Linux setup does.
+- A Decky plugin that sets games up, as Decky-Framegen does for OptiScaler.
+
+OptiScaler is GPL-3.0 and this SDK is MIT, so nothing is copied from it. The NGX interface declarations and all the code
+are written from scratch.
+
+## Steam Deck / Proton only, by design
+
+- Each graphics API runs only on Proton's translation layers. D3D12 needs vkd3d-proton's `ID3D12DXVKInteropDevice1`, and
+  D3D11 needs DXVK's `IDXGIVkInteropDevice`. Without them, NGX init returns `FAIL_PlatformError` ("this proxy only runs
+  under Proton"), so the game falls back.
+- The Vulkan layer is a native Linux implicit layer, and it assumes RADV for which NVIDIA extensions to emulate.
+- The ML kernels are tuned for the Deck's RDNA2 GPU (Van Gogh: int8 `dot4`, wave64, 8 CUs). The runtime picks them
+  from the Vulkan driver ID, because Proton reports the GPU as NVIDIA.
+- Setup and launch options target Steam/Proton prefixes, driven by the Decky Loader plugin.
 
 ## How it works
 
