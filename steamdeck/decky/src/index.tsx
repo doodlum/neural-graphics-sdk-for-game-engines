@@ -30,10 +30,10 @@ interface Game {
   launch_applied: boolean;
   reg_pending: boolean;
   conflicts: string[];
+  last_run: { state: "active" | "loaded" | "error"; text: string; when: number } | null;
 }
 
 interface Settings {
-  ratio: string;
   quality: number;
   log: number;
 }
@@ -114,6 +114,13 @@ async function syncAllLaunchOptions(games?: Game[]): Promise<void> {
 
 // ─── UI ────────────────────────────────────────────────────────────────────────
 
+function lastRunLine(g: Game): string {
+  if (!g.last_run) return g.enabled ? "Last run: not launched since setup (or the proxy did not load)" : "";
+  const mins = Math.max(0, Math.round((Date.now() / 1000 - g.last_run.when) / 60));
+  const ago = mins < 60 ? `${mins} min ago` : mins < 2880 ? `${Math.round(mins / 60)} h ago` : `${Math.round(mins / 1440)} d ago`;
+  return `Last run (${ago}): ${g.last_run.text}`;
+}
+
 const STATUS_LABEL: Record<Status, string> = {
   installed: "Installed",
   not_installed: "Not installed",
@@ -122,14 +129,6 @@ const STATUS_LABEL: Record<Status, string> = {
   needs_repair: "Needs repair",
 };
 
-const RATIO_OPTIONS = [
-  { data: "", label: "Follow game" },
-  { data: "1.5", label: "1.5x" },
-  { data: "1.7", label: "1.7x" },
-  { data: "2.0", label: "2.0x" },
-  { data: "2.5", label: "2.5x" },
-  { data: "3.0", label: "3.0x" },
-];
 const QUALITY_OPTIONS = [
   { data: -1, label: "Follow game" },
   { data: 0, label: "0 - large network (slow)" },
@@ -262,15 +261,6 @@ function Content() {
       <PanelSection title="Global options">
         <PanelSectionRow>
           <DropdownItem
-            label="Upscale ratio (AISS_RATIO)"
-            rgOptions={RATIO_OPTIONS}
-            selectedOption={s.ratio}
-            disabled={!!busy}
-            onChange={(o) => changeSetting({ ratio: o.data })}
-          />
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <DropdownItem
             label="NSS quality (AISS_NSS_QUALITY)"
             rgOptions={QUALITY_OPTIONS}
             selectedOption={s.quality}
@@ -306,7 +296,8 @@ function Content() {
               description={
                 `${STATUS_LABEL[g.status] ?? g.status}` +
                 (g.shim ? ` · ${g.shim}.dll` : "") +
-                (g.message ? ` · ${g.message}` : "")
+                (g.message ? ` · ${g.message}` : "") +
+                (lastRunLine(g) ? `\n${lastRunLine(g)}` : "")
               }
               checked={g.enabled}
               disabled={!!busy || (!g.enabled && g.status === "conflict")}

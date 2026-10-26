@@ -59,13 +59,64 @@ const void* const kVtable[] = {
 
 NgxParams::NgxParams() : m_vtable(kVtable) {}
 
+// NGX also addresses parameters by short keys ("#" followed by one byte, NVSDK_NGX_EParameter_*). They name the same
+// values as the long keys, so both spellings are stored under the long one.
+static const char* Canonical(const char* name)
+{
+    if (!name || name[0] != '#' || name[1] == 0 || name[2] != 0)
+        return name;
+    switch (static_cast<unsigned char>(name[1]))
+    {
+    case 0x01: return "SuperSampling.Available";
+    case 0x0f: return "Scale";
+    case 0x10: return "Width";
+    case 0x11: return "Height";
+    case 0x12: return "OutWidth";
+    case 0x13: return "OutHeight";
+    case 0x14: return "Sharpness";
+    case 0x15: return "Scratch";
+    case 0x16: return "Scratch.SizeInBytes";
+    case 0x1e: return "Color";
+    case 0x22: return "Output";
+    case 0x25: return "Reset";
+    case 0x27: return "MotionVectors";
+    case 0x2c: return "MV.Scale.X";
+    case 0x2d: return "MV.Scale.Y";
+    case 0x30: return "SizeInBytes";
+    case 0x35: return "CreationNodeMask";
+    case 0x36: return "VisibilityNodeMask";
+    case 0x37: return "PreviousOutput";
+    case 0x38: return "MV.Offset.X";
+    case 0x39: return "MV.Offset.Y";
+    case 0x3b: return "ResourceWidth";
+    case 0x3c: return "ResourceHeight";
+    case 0x3d: return "Depth";
+    case 0x3e: return "DLSSOptimalSettingsCallback";
+    case 0x3f: return "PerfQualityValue";
+    case 0x40: return "RTXValue";
+    case 0x41: return "DLSSMode";
+    case 0x44: return "Snippet.OptLevel";
+    case 0x45: return "Snippet.IsDevBranch";
+    default:   return name;
+    }
+}
+
+// Printable form of a key for the log (short keys carry a raw byte).
+static void LogMiss(const char* name)
+{
+    if (name[0] == '#' && name[1] && !name[2])
+        Log(3, "param miss: #\\x%02x", static_cast<unsigned char>(name[1]));
+    else
+        Log(3, "param miss: %s", name);
+}
+
 #define NGX_SET(Fn, T, field, tag)                         \
     void NgxParams::Fn(const char* name, T v)              \
     {                                                      \
         if (!name)                                         \
             return;                                        \
         std::lock_guard<std::mutex> lock(m_mutex);         \
-        Value& value = m_values[name];                     \
+        Value& value = m_values[Canonical(name)];          \
         value.type   = Type::tag;                          \
         value.field  = v;                                  \
     }
@@ -84,10 +135,10 @@ template <typename T> bool NgxParams::GetNumber(const char* name, T* out) const
     if (!name || !out)
         return false;
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_values.find(name);
+    auto it = m_values.find(Canonical(name));
     if (it == m_values.end())
     {
-        Log(3, "param miss: %s", name);
+        LogMiss(name);
         return false;
     }
     const Value& v = it->second;
@@ -120,10 +171,10 @@ bool NgxParams::GetPtr(const char* name, void** out) const
     if (!name || !out)
         return false;
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_values.find(name);
+    auto it = m_values.find(Canonical(name));
     if (it == m_values.end())
     {
-        Log(3, "param miss: %s", name);
+        LogMiss(name);
         return false;
     }
     if (it->second.type == Type::Ptr)

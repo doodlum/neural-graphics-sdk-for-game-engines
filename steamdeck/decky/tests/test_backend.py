@@ -11,6 +11,7 @@ import hashlib
 import os
 import shutil
 import sys
+import struct
 import tempfile
 import types
 import unittest
@@ -25,7 +26,7 @@ import aiss_core as core  # noqa: E402
 from aiss_core import (AissCore, build_launch_options, strip_launch_options, reg_set_value,  # noqa: E402
                        reg_delete_value, reg_has_value, REG_KEY_PATH, SIG_OVERRIDE_VALUE)
 
-S0 = {"ratio": "", "quality": -1, "log": 1}
+S0 = {"quality": -1, "log": 1}
 
 
 def bin_dir(tmp: Path) -> Path:
@@ -42,6 +43,26 @@ def bin_dir(tmp: Path) -> Path:
         shutil.copy(src, d / src.name)
     return d
 
+
+
+def minimal_pe(imports: list[str]) -> bytes:
+    """A PE32+ image whose import table names `imports` (enough for pe_imports)."""
+    img = bytearray(0x400)
+    img[0:2] = b"MZ"
+    struct.pack_into("<I", img, 0x3C, 0x40)
+    img[0x40:0x44] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", img, 0x44, 0x8664, 1, 0, 0, 0, 240, 0x22)
+    opt = 0x58
+    struct.pack_into("<H", img, opt, 0x20B)
+    struct.pack_into("<II", img, opt + 112 + 8, 0x1000, 20 * (len(imports) + 1))  # import directory
+    struct.pack_into("<8sIIIII", img, opt + 240, b".idata", 0x200, 0x1000, 0x200, 0x200, 0)
+    name_rva = 0x1100
+    for i, name in enumerate(imports):
+        struct.pack_into("<IIIII", img, 0x200 + 20 * i, 0, 0, 0, name_rva, 0)
+        raw = name.encode() + b"\0"
+        img[0x200 + (name_rva - 0x1000):0x200 + (name_rva - 0x1000) + len(raw)] = raw
+        name_rva += 0x20
+    return bytes(img)
 
 class Quiet:
     def __init__(self):
@@ -99,9 +120,9 @@ class LaunchOptionTests(unittest.TestCase):
 
     def test_settings_change(self):
         new, rec = build_launch_options("", "dxgi", S0, None)
-        s2 = {"ratio": "2.0", "quality": 0, "log": 2}
+        s2 = {"quality": 0, "log": 2}
         new2, rec2 = build_launch_options(new, "dxgi", s2, rec)
-        self.assertEqual(new2, 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_RATIO=2.0 AISS_NSS_QUALITY=0 AISS_LOG=2 '
+        self.assertEqual(new2, 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_NSS_QUALITY=0 AISS_LOG=2 '
                                'WINEDLLOVERRIDES="dxgi=n,b" %command%')
         new3, rec3 = build_launch_options(new2, "dxgi", S0, rec2)
         self.assertEqual(new3, new)
@@ -409,16 +430,42 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertEqual((self.layer / "libVkLayer_aiss_ngx.so").read_bytes(), b"dev build")
         self.assertTrue((self.layer / "VkLayer_aiss_ngx.json").exists())
 
+    def test_streamline_game_importing_dxgi_gets_dxgi(self):
+        # Unreal + Streamline (e.g. STAR WARS Galactic Racer): Unreal preloads its own dbghelp.dll, so the shim must
+        # be the dxgi.dll the exe imports at start-up.
+        g = self.game(self.steam, "1007", "UE SL Game", "UESL", prefix=True)
+        self.put(g / "UESL/Binaries/Win64/UESL-Win64-Shipping.exe", minimal_pe(["kernel32.dll", "dxgi.dll"]))
+        self.put(g / "Engine/Binaries/ThirdParty/DbgHelp/dbghelp.dll", b"MZ microsoft dbghelp")
+        self.put(g / "Engine/Plugins/Marketplace/DLSS/Binaries/ThirdParty/Win64/nvngx_dlss.dll", b"MZ dlss")
+        self.put(g / "Engine/Plugins/Marketplace/StreamlineCore/Binaries/ThirdParty/Win64/sl.interposer.dll")
+        games = {x["appid"]: x for x in self.core.scan(force=True)}
+        self.assertEqual(games["1007"]["shim"], "dxgi")
+        self.assertEqual(games["1007"]["targets"], [str(g / "UESL/Binaries/Win64")])
+        self.core.install_game("1007")
+        self.assertTrue((g / "UESL/Binaries/Win64/dxgi.dll").exists())
+        self.assertFalse((g / "UESL/Binaries/Win64/dbghelp.dll").exists())
+        self.assertIn('"dxgi=n,b"', self.core.launch_options("1007", "", True)["options"])
+
+    def test_vulkan_game_importing_dbghelp_gets_dbghelp(self):
+        # Enshrouded: Vulkan, no Streamline, exe imports dbghelp but not dxgi.
+        g = self.game(self.steam, "1008", "VK Game", "VKGame", prefix=True)
+        self.put(g / "vkgame.exe", minimal_pe(["kernel32.dll", "dbghelp.dll", "steam_api64.dll"]))
+        self.put(g / "nvngx_dlss.dll", b"MZ dlss")
+        games = {x["appid"]: x for x in self.core.scan(force=True)}
+        self.assertEqual(games["1008"]["shim"], "dbghelp")
+        self.assertEqual(games["1008"]["targets"], [str(g)])
+
     def test_launch_options_flow_and_settings(self):
         self.core.install_game("1002")
         lo = self.core.launch_options("1002", "-novid", True)
         self.assertEqual(lo["options"],
                          'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
-        self.core.set_settings({"ratio": "2", "quality": 0, "log": 0})
+        self.core.set_settings({"quality": 0, "log": 0})
         with self.assertRaises(ValueError):
-            self.core.set_settings({"ratio": "9"})
-        lo2 = self.core.launch_options("1002", lo["options"], True)
-        self.assertEqual(lo2["options"], 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_RATIO=2.0 AISS_NSS_QUALITY=0 '
+            self.core.set_settings({"quality": 9})
+        # An AISS_RATIO left over from an older plugin version is removed on the next sync.
+        lo2 = self.core.launch_options("1002", lo["options"].replace("AISS_LAYER=1", "AISS_LAYER=1 AISS_RATIO=2.0"), True)
+        self.assertEqual(lo2["options"], 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_NSS_QUALITY=0 '
                                          'AISS_LOG=0 WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
         self.core = self.make_core()  # ownership record persisted
         off = self.core.launch_options("1002", lo2["options"], False)

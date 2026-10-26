@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import shutil
 import tempfile
 import time
@@ -63,12 +64,12 @@ BAD_EXE_SUBSTRINGS = (
 
 # Launch options
 MANAGED_ENV = ("AISS_LAYER", "AISS_RATIO", "AISS_NSS_QUALITY", "AISS_LOG")  # always owned by the plugin
+# AISS_RATIO is no longer offered; it stays managed so older launch options lose it on the next sync.
 NVAPI_ENV = "PROTON_FORCE_NVAPI"
 WDO_ENV = "WINEDLLOVERRIDES"
 COMMAND = "%command%"
 
 DEFAULT_SETTINGS = {
-    "ratio": "",         # "" = follow the game's DLSS mode; otherwise e.g. "2.0" (1.0..3.0)
     "quality": -1,       # -1 = follow the game's DLSS mode; 0 = large network (slow), 1, 2
     "log": 1,            # AISS_LOG level; 1 is the core's default and is not written out
 }
@@ -309,6 +310,90 @@ def _wdo_remove(entries, shim: str):
     return out
 
 
+
+def pe_imports(path: str) -> set[str]:
+    """Lower-case names of the DLLs a PE file imports statically (empty on any parse problem)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+            if head[:2] != b"MZ":
+                return set()
+            pe = struct.unpack_from("<I", head, 0x3C)[0]
+            if head[pe:pe + 4] != b"PE\0\0":
+                return set()
+            nsec, optsz = struct.unpack_from("<H", head, pe + 6)[0], struct.unpack_from("<H", head, pe + 20)[0]
+            opt = pe + 24
+            magic = struct.unpack_from("<H", head, opt)[0]
+            dirs = opt + (112 if magic == 0x20B else 96)
+            secs = [struct.unpack_from("<8sIIII", head, opt + optsz + i * 40) for i in range(nsec)]
+
+            def off(rva):
+                for _, vsize, va, rsize, raw in secs:
+                    if va <= rva < va + max(vsize, rsize):
+                        return rva - va + raw
+                return None
+
+            rva = struct.unpack_from("<I", head, dirs + 8)[0]  # data directory 1: imports
+            names = set()
+            while rva and len(names) < 512:
+                o = off(rva)
+                if o is None:
+                    break
+                f.seek(o)
+                desc = f.read(20)
+                if len(desc) < 20:
+                    break
+                name_rva = struct.unpack_from("<I", desc, 12)[0]
+                if not name_rva:
+                    break
+                no = off(name_rva)
+                if no is None:
+                    break
+                f.seek(no)
+                names.add(f.read(256).split(b"\0")[0].decode("ascii", "replace").lower())
+                rva += 20
+            return names
+    except (OSError, struct.error):
+        return set()
+
+
+PROXY_LOG = "aiss_nvngx.log"  # written by the proxy next to the running exe, rewritten on every launch
+
+
+def last_run(exe_dir: str | None) -> dict | None:
+    """Summary of the proxy's log from the game's last launch, or None if it never loaded there."""
+    if not exe_dir:
+        return None
+    path = os.path.join(exe_dir, PROXY_LOG)
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.read().splitlines()
+        when = int(os.path.getmtime(path))
+    except OSError:
+        return None
+    api, size, error, upscaling = None, None, None, False
+    for line in lines:
+        m = re.search(r"\b(D3D12|D3D11|Vulkan) init\b", line)
+        if m:
+            api = m.group(1)
+        m = re.search(r"DLSS create: (\d+x\d+) -> (\d+x\d+)", line)
+        if m:
+            size = f"{m.group(1)} -> {m.group(2)}"
+        if "NSS context " in line:
+            upscaling = True
+        for bad in ("only runs under Proton", "failed", "missing or foreign", "not found"):
+            if bad in line:
+                error = line.replace("[aiss] ", "").strip()
+    if error:
+        state, text = "error", error
+    elif upscaling:
+        state, text = "active", f"DLSS on NSS ({api or '?'}, {size})"
+    elif api:
+        state, text = "loaded", f"proxy loaded ({api}); DLSS not switched on in the game"
+    else:
+        state, text = "loaded", "proxy loaded; the game did not initialise DLSS"
+    return {"state": state, "text": text, "when": when}
+
 def _split_options(current: str):
     toks = tokenize(current.strip())
     if COMMAND in toks:
@@ -330,9 +415,6 @@ def _join_options(lead, wrappers, post, with_cmd: bool) -> str:
 
 def settings_env(settings: dict) -> list[str]:
     env = ["AISS_LAYER=1"]
-    ratio = str(settings.get("ratio", "") or "").strip()
-    if ratio:
-        env.append(f"AISS_RATIO={ratio}")
     q = int(settings.get("quality", -1))
     if q in (0, 1, 2):
         env.append(f"AISS_NSS_QUALITY={q}")
@@ -704,7 +786,16 @@ class AissCore:
                     info["exe_dir"] = root
                 sl_dirs = sorted({os.path.dirname(p) for p in found["sl"]})
                 info["sl_dirs"] = sl_dirs
-                if sl_dirs:
+                # The shim must be loaded before NGX initialises, so it takes the name of a DLL the exe imports at
+                # start-up: dxgi.dll (most D3D12/D3D11 games, Unreal included) or else dbghelp.dll (e.g. Enshrouded,
+                # a Vulkan game). Only when the exe imports neither does the Streamline layout decide: Streamline's
+                # sl.interposer.dll imports dbghelp. Unreal ships and preloads its own dbghelp.dll, which is why
+                # dxgi wins when both are imported.
+                imports = pe_imports(info["exe"]) if info["exe"] else set()
+                if "dxgi.dll" in imports or "dbghelp.dll" in imports:
+                    info["shim"] = "dxgi" if "dxgi.dll" in imports else "dbghelp"
+                    info["targets"] = [info["exe_dir"]]
+                elif sl_dirs:
                     info["shim"] = "dbghelp"
                     targets = [info["exe_dir"]]
                     # also next to sl.interposer.dll when it lives elsewhere (e.g. DOOM: streamline/production)
@@ -776,6 +867,7 @@ class AissCore:
             "streamline": bool(info["sl_dirs"]), "prefix": str(pfx) if pfx else None,
             "enabled": bool(gs.get("enabled")), "message": gs.get("message", ""),
             "launch_applied": bool(gs.get("launch")), "reg_pending": bool(gs.get("reg_pending")),
+            "last_run": last_run(info["exe_dir"]),
         }
         conflicts = []
         shim_ok = True
@@ -1083,14 +1175,7 @@ class AissCore:
 
     def set_settings(self, settings: dict) -> dict:
         s = dict(self.state["settings"])
-        if "ratio" in settings:
-            r = str(settings["ratio"] or "").strip()
-            if r:
-                v = float(r)
-                if not 1.0 <= v <= 3.0:
-                    raise ValueError("ratio must be between 1.0 and 3.0")
-                r = f"{v:g}" if "." in f"{v:g}" else f"{v:.1f}"
-            s["ratio"] = r
+        s.pop("ratio", None)  # option removed; drop it from older state files
         if "quality" in settings:
             q = int(settings["quality"])
             if q not in (-1, 0, 1, 2):
