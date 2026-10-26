@@ -743,7 +743,43 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     NormalizeFilterMoments(accum_m1, accum_m2, m1, m2);
 }
 #elif (NSS_FILTER_MODE == 0) || (NSS_FILTER_MODE == 1)
+#if NSS_FILTER_MODE == 1
+// Integer tap coordinates of the exact-2x sparse filter: the 2x2 LR block {lo, hi} per axis and the KPN coordinates
+// of lo and hi (.x = lo, .y = hi).
+struct Sparse2xTaps
+{
+    int32_t2 lo;
+    int32_t2 hi;
+    int32_t2 kx;
+    int32_t2 ky;
+};
+
+int32_t2 Sparse2xKpnCoords(int32_t2 lr, int32_t input_dim, int32_t kpn_dim)
+{
+    return clamp(min(KpnScaledCoordDiv2(lr, kpn_dim, max(input_dim, 1)), int32_t2(kpn_dim - 1)), int32_t2(0), int32_t2(kpn_dim - 1));
+}
+
+Sparse2xTaps Sparse2xTapsForPixel(int32_t2 output_px)
+{
+    // kTap2x2Dx/Dy hold {d, d + 2} with d = tile - 1 per axis, so the four taps of every pattern are the 2x2 LR block
+    // {lo, lo + 1}^2 with lo = (px + tile - 1) >> 1: y-fastest, except pattern 2 which walks it x-fastest. Map the two
+    // distinct coordinates per axis to KPN space and to KPN rows once instead of once per tap (same values as the
+    // per-tap mapping, without the per-tap divides and multiplies).
+    int32_t2     colour_max = InputDims() - int32_t2(1);
+    int32_t2     tile_idx   = (output_px + LutOffset()) & int32_t2(1);
+    int32_t2     raw_lo     = (output_px + tile_idx - int32_t2(1)) >> 1;
+    Sparse2xTaps t;
+    t.lo = clamp(raw_lo, int32_t2(0), colour_max);
+    t.hi = clamp(raw_lo + int32_t2(1), int32_t2(0), colour_max);
+    t.kx = Sparse2xKpnCoords(int32_t2(t.lo.x, t.hi.x), InputDims().x, KpnDims().x);
+    t.ky = Sparse2xKpnCoords(int32_t2(t.lo.y, t.hi.y), InputDims().y, KpnDims().y);
+    return t;
+}
+
+void FilterColourSparse2x(int32_t2 output_px, Sparse2xTaps sparse_taps, out half4 m1, out half4 m2, out half4 center_sample)
+#else
 void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 center_sample)
+#endif
 {
     // NSS v1: KPN tensor is at 1/4 of dataGraph resolution; map input-space tap coords to KPN space.
     //-------------------------------------------------------------------------
@@ -769,15 +805,10 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     center_sample  = half4(0.HF);
 
 #if NSS_FILTER_MODE == 1
-    // kTap2x2Dx/Dy hold {d, d + 2} with d = tile - 1 per axis, so the four taps of every pattern are the 2x2 LR block
-    // {lo, lo + 1}^2 with lo = (px + tile - 1) >> 1: y-fastest, except pattern 2 which walks it x-fastest. Map the two
-    // distinct coordinates per axis to KPN space and to KPN rows once instead of once per tap (same values as the
-    // per-tap mapping, without the per-tap divides and multiplies).
-    int32_t2 raw_lo = (output_px + tile_idx - int32_t2(1)) >> 1;
-    int32_t2 lo     = clamp(raw_lo, int32_t2(0), colour_max);
-    int32_t2 hi     = clamp(raw_lo + int32_t2(1), int32_t2(0), colour_max);
-    int32_t2 kx     = clamp(min(KpnScaledCoordDiv2(int32_t2(lo.x, hi.x), KpnDims().x, max(InputDims().x, 1)), int32_t2(KpnDims().x - 1)), int32_t2(0), int32_t2(kpn_max.x));
-    int32_t2 ky     = clamp(min(KpnScaledCoordDiv2(int32_t2(lo.y, hi.y), KpnDims().y, max(InputDims().y, 1)), int32_t2(KpnDims().y - 1)), int32_t2(0), int32_t2(kpn_max.y));
+    int32_t2 lo        = sparse_taps.lo;
+    int32_t2 hi        = sparse_taps.hi;
+    int32_t2 kx        = sparse_taps.kx;
+    int32_t2 ky        = sparse_taps.ky;
     bool     x_fastest = lut_idx == int32_t(2);
     int16_t4 tap_x     = x_fastest ? int16_t4(lo.x, hi.x, lo.x, hi.x) : int16_t4(lo.x, lo.x, hi.x, hi.x);
     int16_t4 tap_y     = x_fastest ? int16_t4(lo.y, lo.y, hi.y, hi.y) : int16_t4(lo.y, hi.y, lo.y, hi.y);
@@ -864,6 +895,13 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
 }
 #else
 #error "Unsupported NSS_FILTER_MODE"
+#endif
+
+#if NSS_FILTER_MODE == 1
+void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 center_sample)
+{
+    FilterColourSparse2x(output_px, Sparse2xTapsForPixel(output_px), m1, m2, center_sample);
+}
 #endif
 
 #undef NSS_LOAD_TAPS_4
@@ -971,7 +1009,12 @@ void WriteColourOut(int32_t2 coord, half3 out_linear)
 // Main postprocess entry point
 // ---------------------------------------------------------------------------
 // motion: LoadMotionPost(output_pixel), passed in so a thread handling several pixels can share it.
-void PostprocessPixel(int32_t2 output_pixel, half2 motion)
+#if NSS_FILTER_MODE == 1
+#define NSS_POST_FILTER_ARGS , Sparse2xTaps sparse_taps
+#else
+#define NSS_POST_FILTER_ARGS
+#endif
+void PostprocessPixel(int32_t2 output_pixel, half2 motion NSS_POST_FILTER_ARGS)
 {
     int32_t2 output_px = output_pixel;
 
@@ -985,7 +1028,11 @@ void PostprocessPixel(int32_t2 output_pixel, half2 motion)
     half4 m1;
     half4 m2;
     half4 center_sample;
+#if NSS_FILTER_MODE == 1
+    FilterColourSparse2x(output_px, sparse_taps, m1, m2, center_sample);
+#else
     FilterColour(output_px, m1, m2, center_sample);
+#endif
 
     //-------------------------------------------------------------------------
     // 3) Read temporal controls and reproject history
@@ -1033,7 +1080,11 @@ void Postprocess(int32_t2 output_pixel)
     {
         return;
     }
+#if NSS_FILTER_MODE == 1
+    PostprocessPixel(output_pixel, LoadMotionPost(output_pixel), Sparse2xTapsForPixel(output_pixel));
+#else
     PostprocessPixel(output_pixel, LoadMotionPost(output_pixel));
+#endif
 }
 
 #if NSS_POSTPROCESS_QUAD
@@ -1063,19 +1114,43 @@ void PostprocessQuad(int32_t2 quad)
         mv11 = LoadMotionPostAtInput(ic11);
     }
 
+    // Tap coordinates: pixel base + s has tile (s + LutOffset) & 1 (uniform per slot) and
+    // raw_lo = quad + ((s + tile - 1) >> 1), i.e. quad - 1 when s + tile == 0 and quad otherwise; so the LR/KPN
+    // coordinates of all four pixels come from {quad - 1, quad, quad + 1} per axis, mapped once per quad.
+    int32_t2 colour_max = InputDims() - int32_t2(1);
+    int32_t2 u0         = clamp(quad - int32_t2(1), int32_t2(0), colour_max);
+    int32_t2 u1         = clamp(quad, int32_t2(0), colour_max);
+    int32_t2 u2         = clamp(quad + int32_t2(1), int32_t2(0), colour_max);
+    int32_t2 kx01       = Sparse2xKpnCoords(int32_t2(u0.x, u1.x), InputDims().x, KpnDims().x);
+    int32_t2 kx12       = int32_t2(kx01.y, Sparse2xKpnCoords(int32_t2(u2.x), InputDims().x, KpnDims().x).x);
+    int32_t2 ky01       = Sparse2xKpnCoords(int32_t2(u0.y, u1.y), InputDims().y, KpnDims().y);
+    int32_t2 ky12       = int32_t2(ky01.y, Sparse2xKpnCoords(int32_t2(u2.y), InputDims().y, KpnDims().y).x);
+    bvec2    low0       = equal(LutOffset() & int32_t2(1), int32_t2(0));  // slot 0 uses (quad - 1, quad)
+    // slot 1 always has s + tile >= 1, so it uses (quad, quad + 1)
+
+    Sparse2xTaps t00, t10, t01, t11;
+    int32_t2     lo_s0 = int32_t2(low0.x ? u0.x : u1.x, low0.y ? u0.y : u1.y);
+    int32_t2     hi_s0 = int32_t2(low0.x ? u1.x : u2.x, low0.y ? u1.y : u2.y);
+    int32_t2     kx_s0 = low0.x ? kx01 : kx12;
+    int32_t2     ky_s0 = low0.y ? ky01 : ky12;
+    t00.lo = lo_s0;                     t00.hi = hi_s0;                     t00.kx = kx_s0; t00.ky = ky_s0;
+    t10.lo = int32_t2(u1.x, lo_s0.y);   t10.hi = int32_t2(u2.x, hi_s0.y);   t10.kx = kx12;  t10.ky = ky_s0;
+    t01.lo = int32_t2(lo_s0.x, u1.y);   t01.hi = int32_t2(hi_s0.x, u2.y);   t01.kx = kx_s0; t01.ky = ky12;
+    t11.lo = u1;                        t11.hi = u2;                        t11.kx = kx12;  t11.ky = ky12;
+
     bvec2 inside = lessThan(base + int32_t2(1), OutputDims());
-    PostprocessPixel(base, mv00);
+    PostprocessPixel(base, mv00, t00);
     if (inside.x)
     {
-        PostprocessPixel(base + int32_t2(1, 0), mv10);
+        PostprocessPixel(base + int32_t2(1, 0), mv10, t10);
     }
     if (inside.y)
     {
-        PostprocessPixel(base + int32_t2(0, 1), mv01);
+        PostprocessPixel(base + int32_t2(0, 1), mv01, t01);
     }
     if (inside.x && inside.y)
     {
-        PostprocessPixel(base + int32_t2(1, 1), mv11);
+        PostprocessPixel(base + int32_t2(1, 1), mv11, t11);
     }
 }
 #endif  // NSS_POSTPROCESS_QUAD
