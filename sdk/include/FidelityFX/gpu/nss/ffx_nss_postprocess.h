@@ -193,7 +193,9 @@ half4 Tonemap4(half4 x)
 // Buffer alias path: tensor aliased as a std430 SSBO — read via linear NHWC indexing.
 layout(set = 0, binding = NSS_BIND_KPN_TENSOR, std430) readonly buffer KpnCoeffBuffer
 {
-    int8_t4 data[];
+    // NHWC int8, four channels per word (lowest byte = lowest channel); read as words so a channel is one
+    // bitfieldExtract instead of a per-lane select between the four bytes.
+    uint32_t data[];
 }
 r_coefficients_kpn_buffer;
 #else
@@ -205,17 +207,34 @@ layout(set = 0, binding = NSS_BIND_KPN_TENSOR) uniform readonly tensorARM<tensor
 // KPN tensor read — NSS v1 uses a single 36-channel tensor at 1/4 of dataGraph resolution.
 // Buffer alias (SSBO) path when native tensor ops are unavailable; tensorReadARM otherwise.
 // ---------------------------------------------------------------------------
+#if !NSS_SUPPORT_TENSOR
+// Signed byte `channel & 3` of KPN word `word_idx`, as an int.
+int32_t ReadKpnWordChannel(int32_t word_idx, int32_t channel)
+{
+    return bitfieldExtract(int32_t(r_coefficients_kpn_buffer.data[word_idx]), (channel & 3) << 3, 8);
+}
+#endif
+
+int32_t ReadKpnParamsFromBase(int32_t kpn_texel_base_x, int32_t kpn_y, int32_t channel)
+{
+#if !NSS_SUPPORT_TENSOR
+    // Buffer alias path: tensor stored as SSBO in NHWC layout, one word per group of 4 channels.
+    // Linear index: (y * kpn_w + x) * (kKpnChannels / 4) + channel/4
+    int32_t kpn_w      = KpnDims().x;
+    int32_t ch_group   = channel >> 2;  // which word
+    int32_t linear_idx = (kpn_y * kpn_w + kpn_texel_base_x) * (kKpnChannels / 4) + ch_group;
+    return ReadKpnWordChannel(linear_idx, channel);
+#else
+    int8_t q = int8_t(0);
+    tensorReadARM(r_coefficients_kpn_tensor, uint[](0, uint(kpn_y), uint(kpn_texel_base_x), uint(channel)), q);
+    return int32_t(q);
+#endif
+}
+
 int8_t ReadKpnParamsInt8FromBase(int32_t kpn_texel_base_x, int32_t kpn_y, int32_t channel)
 {
 #if !NSS_SUPPORT_TENSOR
-    // Buffer alias path: tensor stored as SSBO in NHWC layout, int8_t4 per group of 4 channels.
-    // Linear index: (y * kpn_w + x) * (kKpnChannels / 4) + channel/4
-    int32_t kpn_w      = KpnDims().x;
-    int32_t ch_group   = channel >> 2;  // which int8_t4 group
-    int32_t ch_within  = channel & 3;   // channel within the group
-    int32_t linear_idx = (kpn_y * kpn_w + kpn_texel_base_x) * (kKpnChannels / 4) + ch_group;
-    int8_t4 vec        = r_coefficients_kpn_buffer.data[linear_idx];
-    return vec[ch_within];
+    return int8_t(ReadKpnParamsFromBase(kpn_texel_base_x, kpn_y, channel));
 #else
     // Native tensor path: read directly via tensorReadARM using [batch, y, x, channel] indexing.
     int8_t q = int8_t(0);
@@ -248,6 +267,20 @@ int32_t4 KpnScaledCoordDiv4(int32_t4 n, int32_t k, int32_t d)
         return int32_t4(q);
     }
     return (n * int32_t4(k)) / int32_t4(d);
+}
+
+int32_t2 KpnScaledCoordDiv2(int32_t2 n, int32_t k, int32_t d)
+{
+    if (d * k < (1 << 22))
+    {
+        float  fd = float(d);
+        float2 fn = float2(n) * float(k);
+        float2 q  = floor(fn * (1.0 / fd));
+        float2 r  = fn - q * fd;
+        q += float2(greaterThanEqual(r, float2(fd))) - float2(lessThan(r, float2(0.0)));
+        return int32_t2(q);
+    }
+    return (n * int32_t2(k)) / int32_t2(d);
 }
 
 int32_t KpnCoordFromInputCoord(int32_t input_coord, int32_t input_dim, int32_t kpn_dim)
@@ -286,16 +319,16 @@ int16_t4 KpnCoordFromScaledTap4(int16_t4 tap_coord, float scale, int32_t kpn_dim
 // ---------------------------------------------------------------------------
 half SampleKpnWeight(int32_t tap_z, int32_t2 kpn_tap)
 {
-    int8_t q = ReadKpnParamsInt8FromBase(kpn_tap.x, kpn_tap.y, tap_z);
+    int32_t q = ReadKpnParamsFromBase(kpn_tap.x, kpn_tap.y, tap_z);
     return half(max(float(Dequantize(half(q), kKpnQuant)), float(EPS)));
 }
 
 half4 SampleKpnWeight4(int16_t4 tap_z, int16_t4 kpn_x, int16_t4 kpn_y)
 {
-    int8_t4 q = int8_t4(ReadKpnParamsInt8FromBase(kpn_x.x, kpn_y.x, tap_z.x),
-                        ReadKpnParamsInt8FromBase(kpn_x.y, kpn_y.y, tap_z.y),
-                        ReadKpnParamsInt8FromBase(kpn_x.z, kpn_y.z, tap_z.z),
-                        ReadKpnParamsInt8FromBase(kpn_x.w, kpn_y.w, tap_z.w));
+    int32_t4 q = int32_t4(ReadKpnParamsFromBase(kpn_x.x, kpn_y.x, tap_z.x),
+                          ReadKpnParamsFromBase(kpn_x.y, kpn_y.y, tap_z.y),
+                          ReadKpnParamsFromBase(kpn_x.z, kpn_y.z, tap_z.z),
+                          ReadKpnParamsFromBase(kpn_x.w, kpn_y.w, tap_z.w));
     return half4(max(float4(Dequantize(half4(q), kKpnQuant)), float4(float(EPS))));
 }
 
@@ -712,14 +745,38 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     center_sample  = half4(0.HF);
 
 #if NSS_FILTER_MODE == 1
-    int16_t4 tap_x = clamp((int16_t4(out_px16.x) + kTap2x2Dx[lut_idx]) >> int16_t(1), zero4, colour_max_x4);
-    int16_t4 tap_y = clamp((int16_t4(out_px16.y) + kTap2x2Dy[lut_idx]) >> int16_t(1), zero4, colour_max_y4);
-    int16_t4 kpn_x = clamp(KpnCoordFromInputCoord4(tap_x, InputDims().x, KpnDims().x), zero4, kpn_max_x4);
-    int16_t4 kpn_y = clamp(KpnCoordFromInputCoord4(tap_y, InputDims().y, KpnDims().y), zero4, kpn_max_y4);
+    // kTap2x2Dx/Dy hold {d, d + 2} with d = tile - 1 per axis, so the four taps of every pattern are the 2x2 LR block
+    // {lo, lo + 1}^2 with lo = (px + tile - 1) >> 1: y-fastest, except pattern 2 which walks it x-fastest. Map the two
+    // distinct coordinates per axis to KPN space and to KPN rows once instead of once per tap (same values as the
+    // per-tap mapping, without the per-tap divides and multiplies).
+    int32_t2 raw_lo = (output_px + tile_idx - int32_t2(1)) >> 1;
+    int32_t2 lo     = clamp(raw_lo, int32_t2(0), colour_max);
+    int32_t2 hi     = clamp(raw_lo + int32_t2(1), int32_t2(0), colour_max);
+    int32_t2 kx     = clamp(min(KpnScaledCoordDiv2(int32_t2(lo.x, hi.x), KpnDims().x, max(InputDims().x, 1)), int32_t2(KpnDims().x - 1)), int32_t2(0), int32_t2(kpn_max.x));
+    int32_t2 ky     = clamp(min(KpnScaledCoordDiv2(int32_t2(lo.y, hi.y), KpnDims().y, max(InputDims().y, 1)), int32_t2(KpnDims().y - 1)), int32_t2(0), int32_t2(kpn_max.y));
+    bool     x_fastest = lut_idx == int32_t(2);
+    int16_t4 tap_x     = x_fastest ? int16_t4(lo.x, hi.x, lo.x, hi.x) : int16_t4(lo.x, lo.x, hi.x, hi.x);
+    int16_t4 tap_y     = x_fastest ? int16_t4(lo.y, lo.y, hi.y, hi.y) : int16_t4(lo.y, hi.y, lo.y, hi.y);
+    int16_t4 kpn_ch    = kTap2x2Ch[lut_idx];
 
     f16mat4x4 taps;
     NSS_LOAD_TAPS_4(tap_x, tap_y, taps);
-    half4 weights = SampleKpnWeight4(kTap2x2Ch[lut_idx], kpn_x, kpn_y);
+#if !NSS_SUPPORT_TENSOR
+    // Word index of (x, y, channel group): (y * kpn_w + x) * 4 + channel / 4, rows computed once per distinct y.
+    int32_t2 row     = ky * int32_t2(KpnDims().x);
+    int32_t4 pix_x   = x_fastest ? int32_t4(kx.x, kx.y, kx.x, kx.y) : int32_t4(kx.x, kx.x, kx.y, kx.y);
+    int32_t4 pix_row = x_fastest ? int32_t4(row.x, row.x, row.y, row.y) : int32_t4(row.x, row.y, row.x, row.y);
+    int32_t4 word    = (pix_row + pix_x) * int32_t4(kKpnChannels / 4) + (int32_t4(kpn_ch) >> 2);
+    int32_t4 q       = int32_t4(ReadKpnWordChannel(word.x, int32_t(kpn_ch.x)),
+                          ReadKpnWordChannel(word.y, int32_t(kpn_ch.y)),
+                          ReadKpnWordChannel(word.z, int32_t(kpn_ch.z)),
+                          ReadKpnWordChannel(word.w, int32_t(kpn_ch.w)));
+    half4    weights = half4(max(float4(Dequantize(half4(q), kKpnQuant)), float4(float(EPS))));
+#else
+    int16_t4 kpn_x   = x_fastest ? int16_t4(kx.x, kx.y, kx.x, kx.y) : int16_t4(kx.x, kx.x, kx.y, kx.y);
+    int16_t4 kpn_y   = x_fastest ? int16_t4(ky.x, ky.x, ky.y, ky.y) : int16_t4(ky.x, ky.y, ky.x, ky.y);
+    half4    weights = SampleKpnWeight4(kpn_ch, kpn_x, kpn_y);
+#endif
     weights       = NormalizeSparseKernelWeights4(weights);
     center_sample = (lut_idx == int32_t(3)) ? taps[0] : half4(0.HF);
     accum_m1 += taps * weights;
