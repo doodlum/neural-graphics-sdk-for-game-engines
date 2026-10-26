@@ -4,8 +4,9 @@ How the native compute ML path (`sdk/src/backends/vk/ml`) was tuned on an RTX 40
 another GPU. Work in progress: the remaining ideas are listed at the end.
 
 **Rule: output must stay bit-identical to the original.** Every ML-kernel change is checked with `ffx_ml_runtime_test`
-(0 mismatches vs the CPU TOSA reference on every path). Every pre/post-process shader change must be checked with the
-input replay harness below (`IDENTICAL` on all frames). Lossy types (fp8 etc.) are not used.
+(0 mismatches vs the CPU TOSA reference on every path). Every pre/post-process shader change must be checked with
+`ffx_nss_replay_test --suite --check` (`ALL IDENTICAL`, see the Steam Deck pre/post-process section) or the in-app
+replay below. Lossy types (fp8 etc.) are not used.
 
 ## Tools
 
@@ -15,6 +16,8 @@ input replay harness below (`IDENTICAL` on all frames). Lossy types (fp8 etc.) a
 | `ML_PROFILE=1 ffx_ml_runtime_test.exe --iterations 300` | Per-layer times (timestamps between layers; ~1 us granularity on NVIDIA). |
 | `--width 64 --height 64` | Tiny graph: measures the fixed per-layer cost (barrier + one workgroup's latency chain). |
 | `FFX_PROFILE_PASSES=<file>` (any app using the VK backend) | Per-job GPU time of every NSS pass (labelled `<index>_<job type>`), medians rewritten every 250 executions. |
+| `FFX_PROFILE_BARRIERS=1` (with `FFX_PROFILE_PASSES`) | Adds a `<n>_barriers` timestamp after each compute job's barriers, splitting barrier/transition cost from the dispatch. |
+| `bin/ffx_nss_replay_test` (Linux, native VK, `sdk/src/components/nss/test`) | Deterministic synthetic replay through ffx-api: bit-exact gate for all Deck permutations (`--suite --save/--check DIR`) and per-pass timings without a game (`--bench N --render WxH --quality 1\|2`). |
 | Streamline_Sample `-benchmark` + `tools/nss/run_nss_vs_dlss.sh` (in the Streamline_Sample nss-upscaler branch) | Upscaler GPU time in a real frame vs DLSS. |
 | `tools/nss/nss_replay.sh record/replay` + `compare_raw.py` (Streamline_Sample nss-upscaler branch) | Bit-exact output check on identical recorded inputs (the sample's renderer is not deterministic run to run, so plain captures cannot be compared). |
 
@@ -165,3 +168,90 @@ branch and an `s_waitcnt`, and a tiny graph (32x32) cost ~20 us per layer, becau
 - A weights-in-LDS variant (VGPR weight operands, `ds_read_b128` broadcast) to take the scalar-cache latency off the
   `s_waitcnt` in the inner loop; not tried.
 - Re-measure in a real frame (`FFX_PROFILE_PASSES`) on the Deck: the pre/post passes were not touched here.
+
+### Pre/post-process passes (non-ML), Steam Deck
+
+In a real frame (Streamline sample under Proton, DLSS Performance = NSS PERFORMANCE 640x400 -> 1280x800, mid_low,
+compute path) the non-ML passes were ~73% of the 1.68 ms: depth scatter 32 us, disocclusion mask 204 us, preprocess
+186 us, ML graph 452 us, postprocess 806 us.
+
+**Harness.** `bin/ffx_nss_replay_test` creates the NSS context through ffx-api with the proxy's flags (QUANTIZED,
+MANAGE_HISTORY, DEPTH_INVERTED, DEPTH_INFINITE, HDR on/off, compute path), feeds 16 synthetic frames (gradients, stripes
+and noise, a depth field with box discontinuities, a panning camera plus a moving textured object with its own motion,
+the NSS jitter sequence, resets on frames 0 and 9) and reads the output back after every frame (RGBA16F, so stores are
+not hidden by the R11G11B10 rounding; one config also with an R11G11B10 output).
+
+    # once, with the unmodified code
+    ./bin/ffx_nss_replay_test --suite --save /path/base
+    # after every change: every frame, pixel and channel of 9 configs
+    # (BALANCED/PERFORMANCE x 640x400/742x464 -> 1280x800 x HDR off/on, + R11G11B10 output)
+    ./bin/ffx_nss_replay_test --suite --check /path/base        # must print ALL IDENTICAL
+    # per-pass GPU medians (FFX_PROFILE_PASSES), run >= 1500 frames so the Deck's clocks settle
+    ./bin/ffx_nss_replay_test --bench 2000 --render 640x400 --quality 2
+
+Labels in the bench output (no reset): `0_clear_uint`, `1_compute` depth scatter, `2_compute` disocclusion mask,
+`3_compute` preprocess, `4_data_graph`, (`5_compute` dynamic LUT for non-2x), then postprocess. The Deck drifts by
+~3% with temperature; compare builds by running them interleaved (copy `bin/libngsdk_linux_x64.so` +
+`bin/ffx_nss_replay_test` per build and alternate). `RADV_DEBUG=shaders,shaderstats` dumps ACO IR and VGPR/occupancy
+per pipeline.
+
+**Before / after** (us, medians of interleaved harness runs, PERFORMANCE unless noted; the harness reproduces the
+in-game numbers except the disocclusion mask, whose old cost depended on the scene):
+
+| Pass | 640x400 before | 640x400 after | 742x464 before | 742x464 after |
+| --- | --- | --- | --- | --- |
+| Depth scatter | 28 | 28 | 38 | 38 |
+| Disocclusion mask | 413 | **29** | 468 | **39** |
+| Preprocess | 202 | **167** | 255 | **212** |
+| ML graph (unchanged code) | 453 | 471 | 587 | 598 |
+| Dynamic offset LUT | - | - | 10 | 10 |
+| Postprocess | 803 | **415** | 886 | **634** |
+| Total | 1909 | **1115** | 2251 | **1535** |
+| Postprocess, BALANCED (Catmull history) | 932 | **544** | 1020 | **757** |
+
+The ML graph reads 2-4% slower only because the GPU is busier per unit time (shared 15 W budget, lower clocks); its
+code is untouched. All rows are bit exact against the original on every harness configuration.
+
+What each change gave (all bit exact, A/B on the Deck):
+
+| Change | Effect |
+| --- | --- |
+| Disocclusion mask: the 4x4 nearest-depth search loaded each depth and then, behind a branch, its motion vector (~36 dependent fetches per thread). Load the 17 depths up front, pick the same sample with the same comparison, fetch one motion vector; issue the 4 previous-depth loads together | 413 -> 27 us |
+| Postprocess: the LR->KPN coordinate mapping used a generic 32-bit integer divide per tap (8 per pixel, ~20 VALU each with quarter-rate multiplies). Float quotient of `n*k + 0.5` times `1/d` is exact while `n*k < 2^20` (Vulkan's 2.5 ulp division included); integer divide otherwise | 803 -> 645 us |
+| Postprocess 2x: the four sparse taps are always the 2x2 LR block {lo, lo+1}^2, so map 2 values per axis instead of 4 taps; KPN coefficients read as 32-bit words + one `bitfieldExtract` instead of a per-lane select between bytes (all modes) | 645 -> 511 us (2x), 729 -> 710 (742x464) |
+| Postprocess: power-of-two input/KPN ratio (640 -> 80, 400 -> 50, 464 -> 58) maps with a shift (uniform check) | 511 -> 469 us |
+| Preprocess (half res): the packed nearest-offset quad recomputed the 4 footprint nearest-depth searches the history lanes had just done; the centre search equals lane (1,1)'s for even sizes (checked per pixel) | 201 -> 166 us |
+| Preprocess: 8x8 workgroups (320x200 was 260 16x16 groups with a half-empty last row; 1000 groups now) | -3.5% |
+| Postprocess 2x sparse: one thread per 2x2 output quad; at exactly 2x the quad's pixels share one input pixel, so the nearest-offset decode and dilated motion fetch run once (per-pixel fallback otherwise); the tap coordinates of the quad come from {q-1, q, q+1} per axis | 478 -> 415 us |
+| Postprocess dynamic LUT: `output_px % IndexModulo` and the per-tap KPN mapping without integer divides | 683 -> 629 us (742x464) |
+
+How the bottlenecks were found: with `FFX_PROFILE_BARRIERS` the barriers before each pass are 1-5 us, so the time
+is in the shaders. Stubbing parts of the postprocess showed it was VALU bound (~530 VALU per pixel at the start: an
+empty shader is 21 us, and removing the loads changed nothing once the integer divides were gone); the disocclusion
+mask was latency bound (a chain of dependent fetches in 70 workgroups).
+
+What did not help (measured, reverted):
+
+- Workgroup shape for postprocess (8x8, 32x8 vs 16x16) and for depth scatter / disocclusion (8x8): within noise.
+- wave32 (`RADV_PERFTEST=cswave32`): postprocess unchanged, preprocess -2%; not worth a pipeline change.
+- Output format/bandwidth: RGBA16F vs R11G11B10 output costs the same, the postprocess is not store bound.
+- DCC: `RADV_DEBUG=nodcc` changes nothing (the history GENERAL <-> SHADER_READ_ONLY transitions are cheap).
+- Tracking the preprocess nearest offset as one integer code instead of a float2 blend: -5% VALU, no time change
+  (preprocess is latency/occupancy bound, 64 VGPRs = 16 waves/SIMD).
+- Precomputing KPN row offsets per quad / via fp32 FMA: within noise.
+
+Ideas left:
+
+- Preprocess (~167 us, latency bound): the four footprint searches could share one 5x5 depth window (9 gathers instead
+  of 16) and the 4-lane history chain (gathers -> nearest -> motion -> history sample, ~19 us) is the longest
+  dependency; lowering VGPRs below 64 would raise occupancy.
+- Postprocess (~415 us at 2x, VALU bound, ~300 VALU/pixel left, most of it the moments/history clamp/tonemap math
+  that must stay as is): the remaining shareable work in the quad is small. The dynamic-LUT (non-2x) path still maps
+  4 arbitrary taps per pixel.
+- Depth scatter + disocclusion (~57 us together) need a global barrier between them (scattered atomics), so they
+  cannot simply be merged.
+- The two history clears on a reset frame cost ~66 us each (1280x800 R11G11B10 `vkCmdClearColorImage`); a faster
+  clear would shave a one-frame spike on camera cuts (they cannot simply be skipped: the reset blend multiplies the
+  old history by 0, and uncleared memory could hold NaNs).
+- Re-measure in the game: the harness scene's disocclusion cost was 2x the game's, the other passes matched within ~5%.
+
