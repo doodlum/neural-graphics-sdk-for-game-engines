@@ -257,9 +257,10 @@ int8_t ReadKpnParamsInt8(int32_t2 kpn_tap, int32_t channel)
 // KPN coordinate mapping: input space → KPN tensor space
 // ---------------------------------------------------------------------------
 // floor(n * k / d) for n >= 0, k >= 0, d >= 1 without an integer divide (a generic 32-bit divide is ~20 VALU
-// including quarter-rate multiplies on AMD). The float estimate is within 1 of the quotient while n * k < 2^22
-// (rcp + mul relative error < 2^-22), every product below is an exactly representable integer, and the remainder
-// test corrects the estimate, so the result equals the integer division. The fallback keeps larger sizes exact.
+// including quarter-rate multiplies on AMD). With x = n * k + 0.5 (exact in fp32), x / d lies at least 0.5 / d away
+// from every integer, and x * (1 / d) has a relative error below 3 * 2^-23 (Vulkan allows 2.5 ulp for the division,
+// the multiply adds 0.5 ulp), i.e. an absolute error below 0.5 / d while x < 2^20: the floor is exactly the integer
+// quotient on any conformant implementation. Larger operands take the integer divide.
 int32_t4 KpnScaledCoordDiv4(int32_t4 n, int32_t k, int32_t d)
 {
     // d an exact power-of-two multiple of k (the 2x presets, e.g. 640 -> KPN 80): floor(n * k / d) = n >> log2(d / k).
@@ -267,14 +268,9 @@ int32_t4 KpnScaledCoordDiv4(int32_t4 n, int32_t k, int32_t d)
     {
         return n >> findLSB(d / k);
     }
-    if (d * k < (1 << 22))
+    if (d * k < (1 << 20))
     {
-        float  fd = float(d);
-        float4 fn = float4(n) * float(k);
-        float4 q  = floor(fn * (1.0 / fd));
-        float4 r  = fn - q * fd;
-        q += float4(greaterThanEqual(r, float4(fd))) - float4(lessThan(r, float4(0.0)));
-        return int32_t4(q);
+        return int32_t4(floor((float4(n) * float(k) + float4(0.5)) * (1.0 / float(d))));
     }
     return (n * int32_t4(k)) / int32_t4(d);
 }
@@ -286,14 +282,9 @@ int32_t2 KpnScaledCoordDiv2(int32_t2 n, int32_t k, int32_t d)
     {
         return n >> findLSB(d / k);
     }
-    if (d * k < (1 << 22))
+    if (d * k < (1 << 20))
     {
-        float  fd = float(d);
-        float2 fn = float2(n) * float(k);
-        float2 q  = floor(fn * (1.0 / fd));
-        float2 r  = fn - q * fd;
-        q += float2(greaterThanEqual(r, float2(fd))) - float2(lessThan(r, float2(0.0)));
-        return int32_t2(q);
+        return int32_t2(floor((float2(n) * float(k) + float2(0.5)) * (1.0 / float(d))));
     }
     return (n * int32_t2(k)) / int32_t2(d);
 }
@@ -628,18 +619,14 @@ int32_t2 PackedOffsetLutModulo()
     return max(int32_t2(IndexModulo()), int32_t2(1));
 }
 
-// output_px % modulo for output_px >= 0 without integer divides: exact float quotient estimate + remainder correction
-// (see KpnScaledCoordDiv4), valid while both are below 2^22; plain % otherwise.
+// output_px % modulo for output_px >= 0 without integer divides: exact float quotient (see KpnScaledCoordDiv4),
+// valid while output_px < 2^20; plain % otherwise.
 int32_t2 PackedOffsetLutTile(int32_t2 output_px, int32_t2 modulo)
 {
-    if (all(lessThan(OutputDims(), int32_t2(1 << 22))) && all(lessThan(modulo, int32_t2(1 << 22))))
+    if (all(lessThan(OutputDims(), int32_t2(1 << 20))))
     {
-        float2 fn = float2(output_px);
-        float2 fm = float2(modulo);
-        float2 q  = floor(fn * (float2(1.0) / fm));
-        float2 r  = fn - q * fm;
-        r += mix(float2(0.0), fm, lessThan(r, float2(0.0))) - mix(float2(0.0), fm, greaterThanEqual(r, fm));
-        return int32_t2(r);
+        int32_t2 q = int32_t2(floor((float2(output_px) + float2(0.5)) * (float2(1.0) / float2(modulo))));
+        return output_px - q * modulo;
     }
     return output_px % modulo;
 }
