@@ -167,8 +167,8 @@ namespace ffx_ml
                 return {4, 32, 16, 128, {MatType::Fp16, MatType::Bf16, MatType::Int8}, 128};
             case Vendor::Amd:
                 // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned). RDNA2 (no WMMA) takes the tiled dot4 kernel, tuned on the
-                // Steam Deck (Van Gogh); see docs/nss_gpu_tuning.md.
-                return {4, 32, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128, 1, 64, 32, 32, 8, 8, 4096, 4};
+                // Steam Deck (Van Gogh); see docs/nss_gpu_tuning.md. Channel blocks up to 40 keep the 36-channel KPN layer in one block.
+                return {4, 32, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128, 1, 64, 32, 40, 8, 8, 4096, 4};
             case Vendor::Intel:
                 return {8, 16, 8, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};    // Xe XMX systolic arrays, SIMD16 with 8xNxK tiles (untuned)
             default:
