@@ -651,7 +651,8 @@ namespace ffx_ml
             tile.blocks             = (oc4 + ocbMax - 1) / ocbMax;
             tile.ocb                = RoundUp((oc4 + tile.blocks - 1) / tile.blocks, 4);
             // Narrow layers (few output channels) take several pixels per thread so each input word still feeds enough dot4s.
-            uint32_t px = std::min(8u, std::max(1u, env("FFX_ML_DOT4_ACC", t.dot4Acc ? t.dot4Acc : 64) / tile.ocb));
+            // Capped at 4: the 4-channel output layer (16 -> 4 at full resolution) measured faster at 4 than at 8 pixels.
+            uint32_t px = std::min(env("FFX_ML_DOT4_PX_MAX", 4u), std::max(1u, env("FFX_ML_DOT4_ACC", t.dot4Acc ? t.dot4Acc : 64) / tile.ocb));
             if (const char* e = getenv("FFX_ML_DOT4_PX"))
                 px = std::max(1u, uint32_t(atoi(e)));
             auto threads            = [&](uint32_t p, uint32_t blocks) { return ((uint32_t(fc.outW) + p - 1) / p) * uint32_t(fc.outH) * blocks; };

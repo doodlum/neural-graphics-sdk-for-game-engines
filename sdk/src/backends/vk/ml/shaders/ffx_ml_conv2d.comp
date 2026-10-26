@@ -254,10 +254,19 @@ int OC_PARAM_STRIDE()
     return (OUT_C + 3) & ~3;
 }
 
+#if ML_DOT4_TILED
+// The 256-entry TABLE is copied to shared memory once per workgroup (one SSBO load per output value otherwise).
+shared int sTable[64];
+#endif
+
 int TableLookup(int v)
 {
     int index = v + 128;
+#if ML_DOT4_TILED
+    int word = sTable[index >> 2];
+#else
     int word  = params[3 * OC_PARAM_STRIDE() + (index >> 2)];
+#endif
     return bitfieldExtract(word, (index & 3) * 8, 8);
 }
 
@@ -488,6 +497,13 @@ void main()
     const int ocBlock = int(gl_WorkGroupID.z);
     const int cy      = min(oy, OUT_H - 1);  // out-of-range threads compute a valid row and skip the store
     const uint zp     = ZpWord();
+
+    if ((FLAGS & FLAG_TABLE) != 0)
+    {
+        for (uint i = gl_LocalInvocationIndex; i < 64u; i += WG_SIZE * WG_Y * uint(KSPLIT))
+            sTable[i] = params[3 * OC_PARAM_STRIDE() + int(i)];
+        barrier();
+    }
 
     int acc[PX * OCB];
     [[unroll]] for (int i = 0; i < PX * OCB; ++i)
