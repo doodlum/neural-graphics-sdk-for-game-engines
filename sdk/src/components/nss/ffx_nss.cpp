@@ -1683,8 +1683,8 @@ static FfxErrorCode nssDispatch(FfxNssContext_Private* context, const FfxNssDisp
     }
     else
     {
-        const int32_t dispatchSrcX = FFX_DIVIDE_ROUNDING_UP(context->dataGraphSize.width, FFX_NSS_THREAD_GROUP_WIDTH);
-        const int32_t dispatchSrcY = FFX_DIVIDE_ROUNDING_UP(context->dataGraphSize.height, FFX_NSS_THREAD_GROUP_HEIGHT);
+        const int32_t dispatchSrcX = FFX_DIVIDE_ROUNDING_UP(context->dataGraphSize.width, FFX_NSS_PREPROCESS_THREAD_GROUP_WIDTH);
+        const int32_t dispatchSrcY = FFX_DIVIDE_ROUNDING_UP(context->dataGraphSize.height, FFX_NSS_PREPROCESS_THREAD_GROUP_HEIGHT);
         scheduleDispatch(context, params, &context->pipelineNssPreprocess, dispatchSrcX, dispatchSrcY, "Preprocess");
     }
 
