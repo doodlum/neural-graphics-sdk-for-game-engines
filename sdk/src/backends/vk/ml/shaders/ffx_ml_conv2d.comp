@@ -79,6 +79,7 @@ layout(constant_id = 52) const uint NT_PER_WG = 3;  // N tiles per workgroup; gl
 layout(constant_id = 53) const uint WG_Y = 1;   // workgroup rows (threads)
 layout(constant_id = 54) const int  PX   = 4;   // output pixels per thread along x
 layout(constant_id = 55) const int  OCB  = 16;  // output channels per thread (multiple of 4); gl_WorkGroupID.z picks the block
+layout(constant_id = 61) const int  OC_FULL = 0;      // 1: OUT_C is a multiple of OCB (no padded channels in any block)
 layout(constant_id = 59) const int  S0_ZP_PIXEL = 0;  // 1: source 0 has a zero-point pixel after its H x W pixels
 layout(constant_id = 60) const int  S1_ZP_PIXEL = 0;
 layout(constant_id = 56) const int  KSPLIT = 1;  // subgroups sharing the workgroup's output tiles (local z), each summing every KSPLIT-th input word
@@ -640,12 +641,12 @@ void main()
         const int p   = idx / OCB;
         const int oc  = ocBlock * OCB + (idx - p * OCB);
         const int ox  = ox0 + p;
-        if (oc >= OUT_C || ox >= OUT_W)
+        if ((OC_FULL == 0 && oc >= OUT_C) || ox >= OUT_W)
             continue;
         ivec4 r = ivec4(0);
         [[unroll]] for (int j = 0; j < 4; ++j)
         {
-            if (oc + j < OUT_C)
+            if (OC_FULL != 0 || oc + j < OUT_C)
                 r[j] = EpilogueBiased(fin[q * 4 + j] + params[oc + j], oc + j);
         }
         dst[((oy * OUT_W + ox) * OUT_STRIDE + oc) >> 2] = PackResult(r);

@@ -999,6 +999,7 @@ namespace ffx_ml
                     spec(54, int32_t(tile.px));
                     spec(55, int32_t(tile.ocb));
                     spec(56, int32_t(tile.ksplit));
+                    spec(61, (uint32_t(fc.outC) % tile.ocb) == 0 ? 1 : 0);
                     // Cheaper exact rescale when no shift needs the low product word (the NSS models: shifts 35..49).
                     const bool hiOnly = rs.scale32 && !rs.doubleRound && minShift >= 33 && maxShift <= 62 && !getenv("FFX_ML_NO_SCALE_HI_ONLY");
                     spec(58, hiOnly ? 1 : 0);
