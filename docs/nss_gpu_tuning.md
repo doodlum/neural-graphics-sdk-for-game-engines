@@ -318,3 +318,55 @@ Ideas left:
 - Async compute: the history warp/Catmull part of the postprocess does not depend on the graph and could overlap the
   graph's barriers on a second queue.
 - Graph: fusing the full-res tail (layers 12 -> 13) would remove one 1.1 MB round trip and a barrier at 640x400.
+
+### Full network (QUALITY), Steam Deck, round 2
+
+Interleaved runs of `steamdeck` c6bc270 and this round (us, 1500-frame medians, 3 alternating runs averaged,
+1280x800 output):
+
+| Pass | 640x400 before | 640x400 after | 853x533 before | 853x533 after |
+| --- | --- | --- | --- | --- |
+| Depth scatter | 32 | 32 | 64 | 64 |
+| Preprocess | 245 | 246 | 443 | 445 |
+| ML graph (high) | 1515 | **1459** | 2630 | **2547** |
+| Dynamic offset LUT | - | - | 0.1 | 0.1 |
+| Postprocess | 762 | **675** | 1110 | **902** |
+| Total | 2560 | **2417** | 4253 | **3969** |
+
+The graph changes also apply to BALANCED/PERFORMANCE (mid_low): PERFORMANCE 640x400 graph 464 -> 435 us, BALANCED
+742x464 graph 593 -> 555 us. All bit exact: replay suite (quality 0/1/2) ALL IDENTICAL against a c6bc270 baseline,
+64-frame hashes identical at 8 more QUALITY ratios, `ffx_ml_runtime_test` EXACT on every path at 960x544, 864x544,
+640x400 and 128x128.
+
+The postprocess is VALU bound, and its time follows the VALU count closely: at 1280x800, one VALU per pixel costs about
+1.2 us (1M pixels / 16 SIMDs, wave64 = 2 cycles, 1.6 GHz). A timing stub that only removed the 9 KPN loads (adding 9
+multiplies) got 44 us slower, so memory is not the limit there.
+
+What worked:
+
+| Change | Effect |
+| --- | --- |
+| KPN tap mapping `floor((t + 0.5 + 1e-3) * scale)` replaced by `t >> 2`: `_KpnScale` is exactly 1/4 by construction (KPN = dataGraph / 4, dataGraph a multiple of 8; now asserted on the host). Last round's attempt was a runtime branch; this is unconditional (`NSS_KPN_SCALE_QUARTER`) | exact-2x postprocess 537 -> 513 VALU, 761 -> 733 us |
+| Exact-2x filter: the channel arithmetic of the 9 KPN reads (base + c, >> 2, (& 3) << 3) from 4 per-pixel values, the constant part folded into the load offset; the double clamp of KPN coordinates removed (taps are >= 0) | 513 -> 472 VALU, 735 -> 683 us |
+| KPN pixel word as y * (w * 9) + x * 9 (shared row/column parts) | 472 -> 466 VALU, ~ -5 us |
+| Dynamic-LUT filter: a 64x64 selection table (in rows 2..65 of the LUT image, written by the LUT pass) gives a pixel's taps from the 6-bit validity of its x and y tiles; replaces 9 x (findLSB on a 36-bit mask + constant-table lookup) | 853x533 postprocess 1100 -> 882 us |
+| Graph epilogue: output zero point folded into the rounding constant (`(hi + r + (zp << k)) >> k`) | high graph batched -2.5% |
+| Graph: zero-point pixel after every internal tensor (filled once), padding taps point at it, so the zero point is selected once per column instead of once per loaded word | -2% |
+| Graph: when OUT_C is a multiple of the channel block, the per-output `oc < OUT_C` guard is compile-time true (no per-output branch, descriptor reload and scalar loads) | -2% |
+
+What did not work (measured, reverted):
+
+- Dequantised KPN weights as a 256-entry LDS table (exact-2x filter): -5 us on the pass, within noise of the total.
+- Folding the conv bias into the accumulator start: slower (scalar loads + moves for 32 accumulators).
+- Hoisting the column part of the input addresses out of the kernel-row loop: no change (ACO already shares it).
+- Thread target 8192/16384 with a 16-channel floor for small layers, and wave32 for the high graph: faster per layer
+  in ML_PROFILE, not in the batched/in-frame runs.
+- Not attempted, with reasons: fusing graph layers 12 -> 13 (a 16x16 tile of layer 13 needs 10x10 layer-12 pixels
+  instead of 8x8: ~1.56x recompute of a compute-bound layer, more than the saved round trip); async compute for the
+  history warp (the ffx-api VK backend records into the caller's command buffer and never sees a queue, so this
+  needs API/proxy work); quad-per-thread exact-2x postprocess (estimated ~17 VALU/pixel, ~20 us, after the changes
+  above).
+
+Floors at 640x400: the preprocess moves ~61 B per LR pixel (~15.6 MB per frame, ~0.25 ms at ~63 GB/s); the graph's
+large layers run at ~75% of the int8 dot4 peak; the postprocess is down to ~466 VALU per pixel, most of it the
+moments/history/tonemap math that must stay as written.
