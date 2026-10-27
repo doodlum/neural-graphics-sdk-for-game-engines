@@ -101,6 +101,12 @@ class Plugin:
         except (ValueError, TypeError) as e:
             return {"ok": False, "message": str(e), "settings": self._core().state["settings"]}
 
+    async def request_capture(self) -> dict:
+        return await self._run(self._core().request_capture)
+
+    async def latest_capture(self, since: float = 0.0) -> dict | None:
+        return await self._run(self._core().latest_capture, float(since or 0.0))
+
     async def game_stopped(self, appid: str) -> list:
         """Called by the frontend when a game exits: the prefix may now exist, deferred registry edits can run."""
         return await self._run(self._core().verify_all)

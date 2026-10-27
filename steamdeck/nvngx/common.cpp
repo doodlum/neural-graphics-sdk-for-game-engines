@@ -99,13 +99,11 @@ struct LiveControl
 {
     int nssQuality = -1;
     int fastMath   = -1;
+    int capture    = -1;
 };
 
-static LiveControl ReadLiveControl()
+const std::string& ControlFilePath()
 {
-    static std::mutex  mutex;
-    static ULONGLONG   lastCheck = 0;
-    static LiveControl value;
     static const std::string path = [] {
         const char* unix = getenv("AISS_CONTROL");
         if (!unix || unix[0] != '/')
@@ -116,6 +114,15 @@ static LiveControl ReadLiveControl()
                 c = '\\';
         return dos;
     }();
+    return path;
+}
+
+static LiveControl ReadLiveControl()
+{
+    static std::mutex  mutex;
+    static ULONGLONG   lastCheck = 0;
+    static LiveControl value;
+    const std::string& path = ControlFilePath();
     if (path.empty())
         return value;
     std::lock_guard<std::mutex> lock(mutex);
@@ -127,12 +134,14 @@ static LiveControl ReadLiveControl()
     FILE*       f = fopen(path.c_str(), "r");
     if (f)
     {
-        int q = -1, fast = -1;
-        const int n = fscanf(f, "%d %d", &q, &fast);
+        int q = -1, fast = -1, capture = -1;
+        const int n = fscanf(f, "%d %d %d", &q, &fast, &capture);
         if (n >= 1 && q >= 0 && q <= 2)
             read.nssQuality = q;
         if (n >= 2 && (fast == 0 || fast == 1))
             read.fastMath = fast;
+        if (n >= 3 && capture >= 0)
+            read.capture = capture;
         fclose(f);
     }
     value = read;
@@ -147,4 +156,9 @@ int LiveNssQuality()
 int LiveFastMath()
 {
     return ReadLiveControl().fastMath;
+}
+
+int LiveCaptureRequest()
+{
+    return ReadLiveControl().capture;
 }

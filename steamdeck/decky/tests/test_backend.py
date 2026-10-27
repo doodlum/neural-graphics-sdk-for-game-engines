@@ -463,12 +463,25 @@ class FakeLibraryTests(unittest.TestCase):
                                         'WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
         # The model is switched live through the control file, not the launch options.
         self.core.set_settings({"quality": 2, "log": 0})
-        self.assertEqual(control.read_text().strip(), "2 0")
+        self.assertEqual(control.read_text().strip(), "2 0 0")
         self.core.set_settings({"quality": 0})
-        self.assertEqual(control.read_text().strip(), "0 0")
+        self.assertEqual(control.read_text().strip(), "0 0 0")
         # Fast maths also goes through the control file and keeps the launch options unchanged.
         self.core.set_settings({"fast_math": 1})
-        self.assertEqual(control.read_text().strip(), "0 1")
+        self.assertEqual(control.read_text().strip(), "0 1 0")
+        # Each capture request bumps the third value; settings changes keep it.
+        r = self.core.request_capture()
+        self.assertEqual(r["seq"], 1)
+        self.assertEqual(control.read_text().strip(), "0 1 1")
+        self.core.request_capture()
+        self.core.set_settings({"quality": 2})
+        self.assertEqual(control.read_text().strip(), "2 1 2")
+        self.assertIsNone(self.core.latest_capture())
+        cap = self.core.captures_dir / "Game_20261027_120000"
+        cap.mkdir(parents=True)
+        (cap / "000_output.raw").write_bytes(b"x")
+        self.assertEqual(self.core.latest_capture()["frames"], 1)
+        self.core.set_settings({"quality": 0})
         with self.assertRaises(ValueError):
             self.core.set_settings({"fast_math": 2})
         self.core.set_settings({"fast_math": 0})

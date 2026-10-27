@@ -1192,10 +1192,33 @@ class AissCore:
         if q not in (0, 1, 2):
             q = 0
         fast = 1 if self.state["settings"].get("fast_math") else 0
+        capture = int(self.state.get("capture_seq", 0))
         self.control_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.control_path.with_suffix(".tmp")
-        tmp.write_text(f"{q} {fast}\n")
+        tmp.write_text(f"{q} {fast} {capture}\n")
         os.replace(tmp, self.control_path)
+
+    @property
+    def captures_dir(self) -> Path:
+        return self.control_path.parent / "captures"
+
+    def request_capture(self) -> dict:
+        """Ask every running game with the proxy to save its next frames' inputs (the "Capture frames" button)."""
+        self.state["capture_seq"] = int(self.state.get("capture_seq", 0)) + 1
+        self.save_state()
+        self.write_control()
+        return {"seq": self.state["capture_seq"], "dir": str(self.captures_dir)}
+
+    def latest_capture(self, since: float = 0.0) -> dict | None:
+        """Newest capture folder modified after `since` (epoch seconds), with how many frames it holds so far."""
+        if not self.captures_dir.is_dir():
+            return None
+        dirs = [d for d in self.captures_dir.iterdir() if d.is_dir() and d.stat().st_mtime >= since]
+        if not dirs:
+            return None
+        d = max(dirs, key=lambda p: p.stat().st_mtime)
+        frames = len(list(d.glob("*_output.raw")))
+        return {"name": d.name, "path": str(d), "frames": frames}
 
     def set_settings(self, settings: dict) -> dict:
         s = dict(self.state["settings"])

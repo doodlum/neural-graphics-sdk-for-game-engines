@@ -4,6 +4,7 @@
 
 #include <cstdarg>
 #include <cstdint>
+#include <string>
 
 // AISS_LOG=0 silences the log, 1 (default) logs lifecycle events, 2 also logs every evaluation, 3 traces every NGX
 // call and every parameter the caller asked for but was not set, 4 also every parameter Set/Get.
@@ -40,3 +41,8 @@ int LiveNssQuality();
 // Optional second value of the control file: 1 = fast maths (fp32 requantisation, ~2% faster, not bit exact), 0 = exact,
 // -1 when absent.
 int LiveFastMath();
+// Optional third value: a capture request counter. The plugin's "Capture frames" button increments it; each new value
+// asks the proxy to save the next few frames' inputs. -1 when absent.
+int LiveCaptureRequest();
+// The control file as a Windows path (Z:\...), empty when AISS_CONTROL is not set.
+const std::string& ControlFilePath();

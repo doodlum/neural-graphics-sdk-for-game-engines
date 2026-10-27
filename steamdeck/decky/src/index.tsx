@@ -63,6 +63,10 @@ const setSettings = callable<[settings: Partial<Settings>], { ok: boolean; messa
   "set_settings",
 );
 const gameStopped = callable<[appid: string], OpResult[]>("game_stopped");
+const requestCapture = callable<[], { seq: number; dir: string }>("request_capture");
+const latestCapture = callable<[since: number], { name: string; path: string; frames: number } | null>(
+  "latest_capture",
+);
 
 // ─── SteamClient launch options ────────────────────────────────────────────────
 
@@ -228,6 +232,21 @@ function Content() {
     setBusy(null);
   };
 
+  const capture = async () => {
+    setBusy("capture");
+    const since = Date.now() / 1000 - 1;
+    const r = await requestCapture();
+    toaster.toast({ title: "AISS", body: "Capturing the next 8 frames of the running game..." });
+    // The game picks the request up within half a second and writes the files a few frames later.
+    await new Promise((res) => setTimeout(res, 4000));
+    const c = await latestCapture(since);
+    toaster.toast({
+      title: "AISS",
+      body: c && c.frames > 0 ? `Saved ${c.frames} frames: ${c.name}` : `No capture yet. Is a DLSS game running? (${r.dir})`,
+    });
+    setBusy(null);
+  };
+
   const repair = async () => {
     setBusy("all");
     const results = await verifyNow();
@@ -284,6 +303,16 @@ function Content() {
             disabled={!!busy}
             onChange={(o) => changeSetting({ log: o.data })}
           />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={!!busy}
+            onClick={capture}
+            description="Saves the running game's next 8 frames (colour, depth, motion vectors, output) for debugging"
+          >
+            {busy === "capture" ? "Capturing..." : "Capture frames"}
+          </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
       <PanelSection title={`DLSS games (${state.games.length})`}>

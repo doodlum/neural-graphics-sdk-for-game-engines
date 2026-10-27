@@ -3,6 +3,8 @@
 
 #include "common.h"
 
+#include <windows.h>
+
 #include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_nss.h>
 #include <ffx_api/vk/ffx_api_vk.h>
@@ -12,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 static const uint32_t kDepthCopySpirv[] = {
 #include "depth_copy.spv.inc"
@@ -92,6 +95,59 @@ static bool IsSampledLayout(VkImageLayout l)
     default:
         return false;
     }
+}
+
+// "Capture frames" (plugin button): each new request counter in the control file saves the next kCaptureFrames
+// dispatches' inputs and output to <control dir>\captures\<exe>_<time>\. A request that is already in the file when
+// the game starts is ignored.
+static constexpr int kCaptureFrames = 8;
+
+static bool NextCaptureFrame(std::string& dir, int& index)
+{
+    static std::mutex  mutex;
+    static bool        primed = false;
+    static int         seen   = -1;
+    static int         left   = 0;
+    static int         next   = 0;
+    static std::string current;
+    std::lock_guard<std::mutex> lock(mutex);
+    const int request = LiveCaptureRequest();
+    if (!primed)
+    {
+        primed = true;
+        seen   = request;
+    }
+    else if (request >= 0 && request != seen)
+    {
+        seen = request;
+        std::string base = ControlFilePath();
+        base             = base.substr(0, base.find_last_of('\\')) + "\\captures";
+        CreateDirectoryA(base.c_str(), nullptr);
+        char exe[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string stem = exe;
+        stem             = stem.substr(stem.find_last_of('\\') + 1);
+        stem             = stem.substr(0, stem.find_last_of('.'));
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        char stamp[32];
+        snprintf(stamp, sizeof(stamp), "_%04u%02u%02u_%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        current = base + "\\" + stem + stamp;
+        if (!CreateDirectoryA(current.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        {
+            LOGI("capture: cannot create %s", current.c_str());
+            return false;
+        }
+        left = kCaptureFrames;
+        next = 0;
+        LOGI("capture %d: saving %d frames to %s", request, kCaptureFrames, current.c_str());
+    }
+    if (left <= 0)
+        return false;
+    --left;
+    dir   = current;
+    index = next++;
+    return true;
 }
 
 int NssQualityForDlss(int perfQualityValue)
@@ -608,8 +664,17 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     toRead.dstAccessMask        = VK_ACCESS_SHADER_READ_BIT;
     toRead.oldLayout            = VK_IMAGE_LAYOUT_GENERAL;
     toRead.newLayout            = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    const bool dumpInputs = Config().dumpInputsFrom >= 0 && m_dispatchCount > uint64_t(Config().dumpInputsFrom) &&
-                            m_dispatchCount <= uint64_t(Config().dumpInputsFrom + Config().dumpInputsCount);
+    std::string captureDir;
+    int         captureIndex = 0;
+    const bool  captured     = NextCaptureFrame(captureDir, captureIndex);
+    const bool  dumpInputs   = captured || (Config().dumpInputsFrom >= 0 && m_dispatchCount > uint64_t(Config().dumpInputsFrom) &&
+                                         m_dispatchCount <= uint64_t(Config().dumpInputsFrom + Config().dumpInputsCount));
+    // File prefix: "<capture dir>\NNN_" for a capture, "aiss_in_NNN_" next to the game for AISS_DUMP_INPUTS.
+    char dumpPrefix[MAX_PATH];
+    if (captured)
+        snprintf(dumpPrefix, sizeof(dumpPrefix), "%s\\%03d_", captureDir.c_str(), captureIndex);
+    else
+        snprintf(dumpPrefix, sizeof(dumpPrefix), "aiss_in_%03llu_", (unsigned long long)(m_dispatchCount - 1));
     VkImageMemoryBarrier post[2] = {toRead, depthToRead};
     if (depthNeedsTransition)
     {
@@ -622,14 +687,27 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     {
         // The R32F copy is in GENERAL until the barrier below.
         fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-        char name[64];
+        char name[MAX_PATH + 16];
         const uint64_t f = m_dispatchCount - 1;
-        snprintf(name, sizeof(name), "aiss_in_%03llu_color.raw", (unsigned long long)f);
+        snprintf(name, sizeof(name), "%scolor.raw", dumpPrefix);
         RecordRaw(cmd, d.color, VK_IMAGE_ASPECT_COLOR_BIT, name);
-        snprintf(name, sizeof(name), "aiss_in_%03llu_mv.raw", (unsigned long long)f);
+        snprintf(name, sizeof(name), "%smv.raw", dumpPrefix);
         RecordRaw(cmd, d.motionVectors, VK_IMAGE_ASPECT_COLOR_BIT, name);
-        snprintf(name, sizeof(name), "aiss_in_%03llu_depth.raw", (unsigned long long)f);
+        snprintf(name, sizeof(name), "%sdepth.raw", dumpPrefix);
         RecordRaw(cmd, {m_depthImage, VK_FORMAT_R32_SFLOAT, renderW, renderH, VK_IMAGE_LAYOUT_GENERAL}, VK_IMAGE_ASPECT_COLOR_BIT, name);
+        if (captured)
+        {
+            snprintf(name, sizeof(name), "%s\\frames.txt", captureDir.c_str());
+            if (FILE* meta = fopen(name, "a"))
+            {
+                fprintf(meta, "%03d dispatch %llu render %ux%u display %ux%u jitter %.4f,%.4f mv scale %.3f,%.3f reset %d "
+                              "quality %d hdr %d inverted %d game exposure %.3f formats colour %d mv %d depth %d\n",
+                        captureIndex, (unsigned long long)f, renderW, renderH, m_info.displayWidth, m_info.displayHeight,
+                        d.jitterX, d.jitterY, d.mvScaleX, d.mvScaleY, d.reset, m_info.nssQuality, m_info.hdr,
+                        m_info.depthInverted, d.exposure, d.color.format, d.motionVectors.format, d.depth.format);
+                fclose(meta);
+            }
+        }
         LOGI("dump %llu: render %ux%u jitter %.4f,%.4f mv scale %.3f,%.3f reset %d dt %.2f, formats colour %d mv %d depth %d (%ux%u, %ux%u, %ux%u)",
              (unsigned long long)f, renderW, renderH, d.jitterX, d.jitterY, d.mvScaleX, d.mvScaleY, d.reset, d.frameTimeMs,
              d.color.format, d.motionVectors.format, d.depth.format, d.color.width, d.color.height, d.motionVectors.width,
@@ -695,8 +773,8 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
 
     if (dumpInputs)
     {
-        char name[64];
-        snprintf(name, sizeof(name), "aiss_in_%03llu_output.raw", (unsigned long long)(m_dispatchCount - 1));
+        char name[MAX_PATH + 16];
+        snprintf(name, sizeof(name), "%soutput.raw", dumpPrefix);
         RecordRaw(cmd, d.output, VK_IMAGE_ASPECT_COLOR_BIT, name);
     }
     WriteRawDumps(false);

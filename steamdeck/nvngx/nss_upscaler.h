@@ -120,7 +120,7 @@ private:
         VkDeviceMemory memory = VK_NULL_HANDLE;
         uint32_t       width = 0, height = 0, format = 0, bpp = 0;
         uint64_t       readAt = 0;
-        char           name[64] = {};
+        char           name[300] = {};
     };
     std::vector<RawDump> m_rawDumps;
     void RecordRaw(VkCommandBuffer cmd, const UpscalerImage& img, VkImageAspectFlags aspect, const char* name);
