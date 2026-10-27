@@ -33,7 +33,7 @@ def bin_dir(tmp: Path) -> Path:
     env = os.environ.get("AISS_TEST_BIN")
     if env:
         return Path(env)
-    if all((PLUGIN / "bin" / n).is_file() for n in core.BIN_FILES.values()):
+    if all((PLUGIN / "bin" / n).is_file() for k, n in core.BIN_FILES.items() if k not in core.OPTIONAL_BIN):
         return PLUGIN / "bin"
     d = tmp / "bin"
     d.mkdir(exist_ok=True)
@@ -48,8 +48,17 @@ def bin_dir(tmp: Path) -> Path:
     else:  # stand-ins: the tests only move the files around
         (d / "libxess.dll").write_bytes(b"MZ stand-in for Intel libxess.dll")
         (d / "libxess-LICENSE.txt").write_text("stand-in licence\n")
+    amd = REPO.parent / "third_party/amd/amdvkffx64.dll"
+    if amd.is_file():
+        os.symlink(amd, d / "amdvkffx64.dll")  # 72 MB: linked, not copied
+    else:
+        (d / "amdvkffx64.dll").write_bytes(b"MZ stand-in for AMD amdvkffx64.dll")
     return d
 
+
+
+def sha256_of(p: Path) -> str:
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
 
 def minimal_pe(imports: list[str]) -> bytes:
@@ -266,8 +275,8 @@ class FakeLibraryTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def make_core(self):
-        return AissCore(home=self.home, bin_dir=self.bin, state_file=self.tmp / "settings/state.json",
+    def make_core(self, bin_dir=None):
+        return AissCore(home=self.home, bin_dir=bin_dir or self.bin, state_file=self.tmp / "settings/state.json",
                         steam_roots=[self.steam], logger=Quiet(), running_check=lambda a: a in self.running)
 
     # helpers
@@ -327,9 +336,14 @@ class FakeLibraryTests(unittest.TestCase):
             p = self.pfx(self.steam, a)
             self.assertEqual((p / "drive_c/windows/system32/_nvngx.dll").read_bytes(),
                              (self.bin / "nvngx.dll").read_bytes())
-            # XeSS (Intel's binary) goes next to the core, unmodified
+            # XeSS (Intel's binary) and FSR 4 (AMD's) go next to the core, unmodified
             self.assertEqual((p / "drive_c/windows/system32/libxess.dll").read_bytes(),
                              (self.bin / "libxess.dll").read_bytes())
+            if (self.bin / "amdvkffx64.dll").is_file():
+                self.assertEqual(sha256_of(p / "drive_c/windows/system32/amdvkffx64.dll"),
+                                 sha256_of(self.bin / "amdvkffx64.dll"))
+            else:
+                self.assertFalse((p / "drive_c/windows/system32/amdvkffx64.dll").exists())
             self.assertTrue(reg_has_value((p / "system.reg").read_text(), REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
             self.assertEqual((p / "system.reg.aiss-bak").read_text(), REG_SAMPLE)
         self.assertTrue((self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll.aiss-orig").exists())
@@ -368,6 +382,39 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertEqual(self.view("1001")["status"], "installed")
         self.core.uninstall_game("1001")
         self.assertEqual((sys32 / "libxess.dll").read_bytes(), b"MZ a game's own libxess")
+        self.assertFalse((sys32 / "_nvngx.dll").exists())
+
+    def test_fsr4_dll_optional_and_foreign_kept(self):
+        sys32 = self.pfx(self.steam, "1001") / "drive_c/windows/system32"
+        # bundles with and without the AMD DLL (the build skips it when it is not available)
+        withfsr, nofsr = self.tmp / "bin_fsr4", self.tmp / "bin_nofsr4"
+        withfsr.mkdir()
+        nofsr.mkdir()
+        for f in self.bin.iterdir():
+            if f.name != "amdvkffx64.dll":
+                os.symlink(f.resolve(), withfsr / f.name)
+                os.symlink(f.resolve(), nofsr / f.name)
+        if (self.bin / "amdvkffx64.dll").is_file():
+            os.symlink((self.bin / "amdvkffx64.dll").resolve(), withfsr / "amdvkffx64.dll")
+        else:
+            (withfsr / "amdvkffx64.dll").write_bytes(b"MZ stand-in for AMD amdvkffx64.dll")
+        self.core = self.make_core(bin_dir=withfsr)
+        self.put(sys32 / "amdvkffx64.dll", b"MZ a game's own amdvkffx64")
+        self.assertEqual(self.core.install_game("1001")["status"], "installed")
+        self.assertEqual(sha256_of(sys32 / "amdvkffx64.dll"), sha256_of(withfsr / "amdvkffx64.dll"))
+        self.assertEqual((sys32 / "amdvkffx64.dll.aiss-orig").read_bytes(), b"MZ a game's own amdvkffx64")
+        self.assertTrue(self.core.bundle_info()["fsr4"])
+        self.core.uninstall_game("1001")
+        self.assertEqual((sys32 / "amdvkffx64.dll").read_bytes(), b"MZ a game's own amdvkffx64")
+        (sys32 / "amdvkffx64.dll").unlink()
+        # a bundle built without the AMD DLL: not reported missing, nothing installed for it, games still "installed"
+        self.core = self.make_core(bin_dir=nofsr)
+        self.assertEqual(self.core.bundle_missing(), [])
+        self.assertFalse(self.core.bundle_info()["fsr4"])
+        self.assertEqual(self.core.install_game("1001")["status"], "installed")
+        self.assertFalse((sys32 / "amdvkffx64.dll").exists())
+        self.assertEqual(self.view("1001")["status"], "installed")
+        self.core.uninstall_game("1001")
         self.assertFalse((sys32 / "_nvngx.dll").exists())
 
     def test_conflict_untouched(self):
@@ -504,9 +551,14 @@ class FakeLibraryTests(unittest.TestCase):
         self.core.request_capture()
         self.core.set_settings({"quality": 2})
         self.assertEqual(control.read_text().strip(), "2 1 2")
-        # 3 selects XeSS
+        # 3 selects XeSS, 4-6 the FSR 4 networks (Lite, INT8, INT8 RDNA 2)
         self.core.set_settings({"quality": 3})
         self.assertEqual(control.read_text().strip(), "3 1 2")
+        for q in (4, 5, 6):
+            self.core.set_settings({"quality": q})
+            self.assertEqual(control.read_text().strip(), f"{q} 1 2")
+        with self.assertRaises(ValueError):
+            self.core.set_settings({"quality": 7})
         self.core.set_settings({"quality": 2})
         self.assertIsNone(self.core.latest_capture())
         cap = self.core.captures_dir / "Game_20261027_120000"

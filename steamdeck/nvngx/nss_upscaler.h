@@ -42,13 +42,30 @@ struct UpscalerCreateInfo
     bool     autoExposure  = false;  // the game asked DLSS for auto exposure: its colour is not pre-exposed
     bool     highResMv     = false;  // motion vectors at display resolution (DLSS MVLowRes not set)
     int      backend       = 0;      // UpscalerBackend
+    int      fsr4Model     = 0;      // Fsr4Model, for kBackendFsr4: the one asked for
+    int      fsr4Active    = -1;     // the FSR 4 network that runs (set by the upscaler)
 };
 
 enum UpscalerBackend : int
 {
     kBackendNss  = 0,
     kBackendXess = 1,
+    kBackendFsr4 = 2,
 };
+
+// AMD FSR 4 networks in amdvkffx64.dll. Auto lets the driver pick by GPU (Lite on Van Gogh).
+enum Fsr4Model : int
+{
+    kFsr4Auto  = 0,
+    kFsr4Lite  = 1,  // INT8 Lite: AMD's handheld model (Van Gogh, Strix Point)
+    kFsr4Int8  = 2,  // INT8: the desktop RDNA 3 model
+    kFsr4Rdna2 = 3,  // INT8 for RDNA 2 desktop GPUs (Navi 2x)
+    kFsr4Fp8   = 4,  // FP8: RDNA 4
+    kFsr4ModelCount
+};
+const char* Fsr4ModelName(int model);
+// -1 when the name is not a model; accepts auto, lite, int8, rdna2 (or navi2), fp8.
+int Fsr4ModelFromName(const char* name);
 
 struct UpscalerDispatch
 {
@@ -62,7 +79,7 @@ struct UpscalerDispatch
     bool          reset = false;
 };
 
-// One upscaling context (NSS or XeSS) behind an NGX handle.
+// One upscaling context (NSS, XeSS or FSR 4) behind an NGX handle.
 class Upscaler
 {
 public:
@@ -77,10 +94,14 @@ protected:
     UpscalerCreateInfo m_info;
 };
 
-// Creates the upscaler info.backend asks for; XeSS falls back to NSS when libxess.dll is missing or fails.
+// Creates the upscaler info.backend asks for; XeSS and FSR 4 fall back to NSS when their DLL is missing or fails.
 std::unique_ptr<Upscaler> CreateUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info);
 // True once XeSS has failed to load or initialise in this process (it is not retried).
 bool XessUnavailable();
+// FSR 4 (fsr4_upscaler.cpp): nullptr when amdvkffx64.dll cannot be used or does not accept info.fsr4Model.
+std::unique_ptr<Upscaler> CreateFsr4Upscaler(const VulkanDevice& device, const UpscalerCreateInfo& info);
+// True once FSR 4 has failed for that model in this process (or for every model, when the DLL is unusable).
+bool Fsr4Unavailable(int model);
 
 class NssUpscaler : public Upscaler
 {

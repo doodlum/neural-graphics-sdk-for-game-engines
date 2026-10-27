@@ -33,17 +33,23 @@ struct ProxyConfig
     bool  fastMath;         // FFX_ML_RESCALE_FLOAT set at launch: fp32 requantisation in the ML graph (not bit exact)
     bool  xess;             // AISS_UPSCALER=xess: Intel XeSS (libxess.dll next to the proxy) instead of NSS
     int   xessQuality;      // AISS_XESS_QUALITY: xess_quality_settings_t (100-105), 0 = from the render scale
+    int   fsr4Model;        // AISS_UPSCALER=fsr4: AMD FSR 4 (amdvkffx64.dll next to the proxy), Fsr4Model from
+                            // AISS_FSR4_MODEL (auto, lite, int8, rdna2, fp8); -1 when FSR 4 is not asked for
     int   gpuTiming;        // AISS_GPU_TIMING=N: log the GPU time of the upscale, averaged over N evaluations
 };
 
 const ProxyConfig& Config();
 
 // Upscaler requested at runtime through the control file named by AISS_CONTROL (a Linux path, written by the Decky
-// plugin). Its first value is 0, 1 or 2 for NSS at that shader quality, or 3 for XeSS. Re-read at most twice a second.
-// LiveNssQuality: the NSS quality, -1 when there is no file, no valid value or XeSS is selected.
+// plugin). Its first value is 0, 1 or 2 for NSS at that shader quality, 3 for XeSS, or 4 + n for FSR 4 model n - 1
+// (4 = Lite, 5 = INT8, 6 = INT8 RDNA 2, 7 = FP8, 8 = AMD's automatic choice). Re-read at most twice a second.
+// LiveNssQuality: the NSS quality, -1 when there is no file, no valid value or another upscaler is selected.
 int LiveNssQuality();
-// LiveXess: 1 when the control file selects XeSS, 0 when it selects NSS, -1 when it selects nothing.
-int LiveXess();
+// LiveUpscaler: the control file's first value (0-8), -1 when it selects nothing.
+int LiveUpscaler();
+// Control file values for the FSR 4 models.
+int LiveCodeForFsr4(int model);
+int Fsr4ModelForLiveCode(int code);  // -1 when the code is not an FSR 4 one
 // Optional second value of the control file: 1 = fast maths (fp32 requantisation, ~2% faster, not bit exact), 0 = exact,
 // -1 when absent.
 int LiveFastMath();

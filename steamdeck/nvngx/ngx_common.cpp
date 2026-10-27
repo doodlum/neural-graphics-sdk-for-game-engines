@@ -53,7 +53,7 @@ UpscalerCreateInfo NgxCreateInfo(const NgxParams& p)
     info.nssQuality    = NssQualityForDlss(p.I32(ngxp::PerfQuality, NVSDK_NGX_PerfQuality_Value_MaxPerf));
     info.fastMath      = FastMathEnabled();
     info.highResMv     = !(flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes);
-    info.backend       = SelectedBackend();
+    info.backend       = SelectedBackend(&info.fsr4Model);
     if (!(flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes))
         LOGI("warning: game passes display-resolution motion vectors (MVLowRes not set); NSS expects render resolution, "
              "XeSS takes them as high-res motion vectors");
@@ -117,18 +117,42 @@ void NgxFreeHandle(NVSDK_NGX_Handle* handle)
     delete handle;
 }
 
-int SelectedBackend()
+int SelectedBackend(int* fsr4Model)
 {
-    const int live = LiveXess();
-    const bool xess = live >= 0 ? live == 1 : Config().xess;
-    return xess && !XessUnavailable() ? kBackendXess : kBackendNss;
+    const int live    = LiveUpscaler();
+    int       backend = kBackendNss, model = kFsr4Auto;
+    if (live >= 0)
+    {
+        backend = live == 3 ? kBackendXess : live >= 4 ? kBackendFsr4 : kBackendNss;
+        if (backend == kBackendFsr4)
+            model = Fsr4ModelForLiveCode(live);
+    }
+    else if (Config().fsr4Model >= 0)
+    {
+        backend = kBackendFsr4;
+        model   = Config().fsr4Model;
+    }
+    else if (Config().xess)
+        backend = kBackendXess;
+    if (backend == kBackendXess && XessUnavailable())
+        backend = kBackendNss;
+    if (backend == kBackendFsr4 && Fsr4Unavailable(model))
+        backend = kBackendNss;
+    if (fsr4Model)
+        *fsr4Model = backend == kBackendFsr4 ? model : kFsr4Auto;
+    return backend;
 }
 
-static const char* Describe(const UpscalerCreateInfo& i)
+const char* UpscalerName(const UpscalerCreateInfo& i)
 {
     static thread_local char text[64];
     if (i.backend == kBackendXess)
         snprintf(text, sizeof(text), "XeSS");
+    else if (i.backend == kBackendFsr4)
+        snprintf(text, sizeof(text), "FSR 4 %s%s%s%s", Fsr4ModelName(i.fsr4Model),
+                 i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? " (" : "",
+                 i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? Fsr4ModelName(i.fsr4Active) : "",
+                 i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? ")" : "");
     else
         snprintf(text, sizeof(text), "NSS quality %d%s", i.nssQuality, i.fastMath ? " fast maths" : "");
     return text;
@@ -138,7 +162,7 @@ Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current)
 {
     const UpscalerCreateInfo& old  = current->Info();
     UpscalerCreateInfo        info = old;
-    info.backend                   = SelectedBackend();
+    info.backend                   = SelectedBackend(&info.fsr4Model);
     if (info.backend == kBackendNss)
     {
         const int live = LiveNssQuality();
@@ -147,16 +171,17 @@ Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current)
         info.fastMath = FastMathEnabled();
     }
     if (info.backend == old.backend &&
-        (info.backend == kBackendXess || (info.nssQuality == old.nssQuality && info.fastMath == old.fastMath)))
+        (info.backend == kBackendXess || (info.backend == kBackendFsr4 && info.fsr4Model == old.fsr4Model) ||
+         (info.backend == kBackendNss && info.nssQuality == old.nssQuality && info.fastMath == old.fastMath)))
         return current;
-    const std::string from = Describe(old);
+    const std::string from = UpscalerName(old);
     auto fresh = CreateUpscaler(current->Device(), info);
     if (!fresh)
     {
-        LOGI("switch from %s to %s failed; keeping it", from.c_str(), Describe(info));
+        LOGI("switch from %s to %s failed; keeping it", from.c_str(), UpscalerName(info));
         return current;
     }
-    LOGI("upscaler switched at runtime: %s -> %s", from.c_str(), Describe(fresh->Info()));
+    LOGI("upscaler switched at runtime: %s -> %s", from.c_str(), UpscalerName(fresh->Info()));
     Registry().CollectGarbage();
     Upscaler* swapped = Registry().Replace(id, std::move(fresh));
     return swapped ? swapped : current;

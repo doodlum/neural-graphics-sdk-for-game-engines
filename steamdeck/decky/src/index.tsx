@@ -42,7 +42,7 @@ interface Settings {
 interface State {
   games: Game[];
   settings: Settings;
-  bundle: { missing: string[]; version: string };
+  bundle: { missing: string[]; version: string; fsr4?: boolean };
 }
 
 interface OpResult {
@@ -138,6 +138,12 @@ const UPSCALER_OPTIONS = [
   { data: 0, label: "NSS Full" },
   { data: 2, label: "NSS Fast" },
   { data: 3, label: "XeSS" },
+];
+// AMD FSR 4 networks (amdvkffx64.dll), offered when the bundle has the DLL.
+const FSR4_OPTIONS = [
+  { data: 4, label: "FSR 4 Lite" },
+  { data: 5, label: "FSR 4 INT8" },
+  { data: 6, label: "FSR 4 INT8 RDNA 2" },
 ];
 const LOG_OPTIONS = [
   { data: 0, label: "Off" },
@@ -281,9 +287,16 @@ function Content() {
         <PanelSectionRow>
           <DropdownItem
             label="Upscaler"
-            description="Switches live in-game. NSS Full: best NSS quality. NSS Fast: small network, more ghosting. XeSS: Intel XeSS (supports dynamic resolution)."
-            rgOptions={UPSCALER_OPTIONS}
-            selectedOption={s.quality === 2 || s.quality === 3 ? s.quality : 0}
+            description={
+              "Switches live in-game. NSS Full: best NSS quality. NSS Fast: small network, more ghosting. XeSS: Intel XeSS (supports dynamic resolution)." +
+              (state.bundle.fsr4
+                ? " FSR 4: AMD's networks (Lite is AMD's handheld choice; INT8 and INT8 RDNA 2 are the desktop ones, slower)."
+                : "")
+            }
+            rgOptions={state.bundle.fsr4 ? [...UPSCALER_OPTIONS, ...FSR4_OPTIONS] : UPSCALER_OPTIONS}
+            selectedOption={
+              s.quality === 2 || s.quality === 3 || (state.bundle.fsr4 && s.quality >= 4 && s.quality <= 6) ? s.quality : 0
+            }
             disabled={!!busy}
             onChange={(o) => changeSetting({ quality: o.data })}
           />
@@ -293,7 +306,7 @@ function Content() {
             label="Fast maths"
             description="NSS only: ~2% faster upscaling; output no longer bit-exact (about half an 8-bit step). Switches live."
             checked={!!s.fast_math}
-            disabled={!!busy || s.quality === 3}
+            disabled={!!busy || s.quality >= 3}
             onChange={(v) => changeSetting({ fast_math: v ? 1 : 0 })}
           />
         </PanelSectionRow>

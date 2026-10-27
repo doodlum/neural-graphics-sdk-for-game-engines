@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace
@@ -27,7 +28,9 @@ struct Timer
     double                      sum = 0;
     double                      minUs = 1e30, maxUs = 0;
     uint32_t                    samples = 0;
+    std::vector<std::string>    name = std::vector<std::string>(kSlots);
     int                         lastBackend = -1;
+    std::string                 lastName;
     uint64_t                    reportedAt  = 0;  // GetTickCount64 of the last report
 };
 
@@ -72,6 +75,7 @@ void Collect(uint32_t slot)
     {
         t.sum = 0, t.samples = 0, t.minUs = 1e30, t.maxUs = 0;
         t.lastBackend = t.backend[slot];
+        t.lastName    = t.name[slot];
         t.reportedAt  = 0;
     }
     const double us = double(r[2] - r[0]) * t.period / 1000.0;
@@ -85,7 +89,7 @@ void Collect(uint32_t slot)
         const double   fps = t.reportedAt ? t.samples * 1000.0 / double(now - t.reportedAt) : 0.0;
         t.reportedAt       = now;
         LOGI("GPU time per upscale (%s): mean %.1f us, min %.1f, max %.1f over %u evaluations, %.1f evaluations/s",
-             t.lastBackend == kBackendXess ? "XeSS" : "NSS", t.sum / t.samples, t.minUs, t.maxUs, t.samples, fps);
+             t.lastName.c_str(), t.sum / t.samples, t.minUs, t.maxUs, t.samples, fps);
         t.sum = 0, t.samples = 0, t.minUs = 1e30, t.maxUs = 0;
     }
 }
@@ -94,10 +98,18 @@ void Collect(uint32_t slot)
 bool NgxDispatch(Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerDispatch& d)
 {
     if (Config().gpuTiming <= 0)
-        return upscaler->Dispatch(cmd, d);
+    {
+        const bool ok = upscaler->Dispatch(cmd, d);
+        NgxDumpFrame(upscaler, cmd, d.output);
+        return ok;
+    }
     std::lock_guard<std::mutex> lock(g_timerMutex);
     if (!Setup(upscaler->Device()))
-        return upscaler->Dispatch(cmd, d);
+    {
+        const bool ok = upscaler->Dispatch(cmd, d);
+        NgxDumpFrame(upscaler, cmd, d.output);
+        return ok;
+    }
     const uint32_t slot = uint32_t(g_timer.written++ % Timer::kSlots);
     Collect(slot);  // recorded kSlots evaluations ago: long retired
     g_timer.reset(cmd, g_timer.pool, slot * 2, 2);
@@ -105,6 +117,8 @@ bool NgxDispatch(Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerDispatch
     const bool ok = upscaler->Dispatch(cmd, d);
     g_timer.write(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_timer.pool, slot * 2 + 1);
     g_timer.valid[slot]   = 1;
-    g_timer.backend[slot] = upscaler->Info().backend;
+    g_timer.backend[slot] = upscaler->Info().backend * 16 + upscaler->Info().fsr4Model;
+    g_timer.name[slot]    = UpscalerName(upscaler->Info());
+    NgxDumpFrame(upscaler, cmd, d.output);
     return ok;
 }

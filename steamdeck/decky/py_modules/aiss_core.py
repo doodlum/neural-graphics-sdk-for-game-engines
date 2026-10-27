@@ -7,6 +7,9 @@ Per enabled game the plugin owns:
   * pfx/drive_c/windows/system32/_nvngx.dll        the NSS NGX core (a foreign file there is backed up and restored)
   * pfx/drive_c/windows/system32/libxess.dll       Intel XeSS (unmodified Intel binary), loaded by the core when the
                                                    XeSS upscaler is selected (same backup/restore rules)
+  * pfx/drive_c/windows/system32/amdvkffx64.dll    AMD FSR 4 (unmodified file from AMD's Vulkan driver), loaded by the
+                                                   core when an FSR 4 upscaler is selected; only when the bundle has
+                                                   it (same backup/restore rules)
   * <exe dir>/dbghelp.dll or <exe dir>/dxgi.dll   the loader shim (never overwrites a file that is not ours)
   * HKLM\\Software\\NVIDIA Corporation\\Global {41FCC608-...}=hex:01 in pfx/system.reg (only while the game is not
     running, with a one-time backup of system.reg)
@@ -39,11 +42,16 @@ BIN_FILES = {
     "layer_json": "VkLayer_aiss_ngx.json",
     "xess": "libxess.dll",                  # Intel XeSS SDK binary, redistributed unmodified
     "xess_license": "libxess-LICENSE.txt",  # its licence (Intel Simplified Software License), shipped with it
+    "fsr4": "amdvkffx64.dll",               # AMD FSR 4 (AMD Vulkan driver component), redistributed unmodified
 }
+# Bundle files the plugin works without (the build skips them when they are not available locally).
+OPTIONAL_BIN = ("fsr4",)
 CORE_DEST_NAME = "_nvngx.dll"
 XESS_DEST_NAME = "libxess.dll"
+FSR4_DEST_NAME = "amdvkffx64.dll"
 # Files installed into each prefix's system32: (bundle key, file name, marker of any build of ours or None, state key).
-PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME, None, "xess"))
+PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME, None, "xess"),
+                ("fsr4", FSR4_DEST_NAME, None, "fsr4"))
 CORE_BACKUP_SUFFIX = ".aiss-orig"
 REG_BACKUP_SUFFIX = ".aiss-bak"
 
@@ -79,10 +87,14 @@ COMMAND = "%command%"
 
 DEFAULT_SETTINGS = {
     "quality": 0,        # upscaler: 0 = NSS full network (default), 2 = NSS fast small network (more ghosting),
-                         # 3 = Intel XeSS; applied live
+                         # 3 = Intel XeSS, 4 = FSR 4 Lite, 5 = FSR 4 INT8, 6 = FSR 4 INT8 RDNA 2; applied live
     "log": 1,            # AISS_LOG level; 1 is the core's default and is not written out
     "fast_math": 0,      # 1 = fp32 requantisation in the ML graph (~2% faster, not bit exact); applied live
 }
+
+# Control file upscaler values: 0-2 NSS, 3 XeSS, 4 FSR 4 Lite, 5 FSR 4 INT8, 6 FSR 4 INT8 RDNA 2 (the proxy also
+# understands 7 = FP8 and 8 = AMD's automatic choice, not offered: FP8 needs RDNA 4, auto is Lite on a Steam Deck).
+QUALITY_VALUES = (0, 1, 2, 3, 4, 5, 6)
 
 STATUS_INSTALLED = "installed"
 STATUS_NOT_INSTALLED = "not_installed"
@@ -644,10 +656,14 @@ class AissCore:
         return self._bundle_hash[key]
 
     def bundle_missing(self) -> list[str]:
-        return [name for key, name in BIN_FILES.items() if not self.bundle_path(key).is_file()]
+        return [name for key, name in BIN_FILES.items() if key not in OPTIONAL_BIN and not self.bundle_path(key).is_file()]
+
+    def prefix_files(self) -> list[tuple]:
+        """PREFIX_FILES this bundle installs (optional ones only when the bundle has them)."""
+        return [f for f in PREFIX_FILES if f[0] not in OPTIONAL_BIN or self.bundle_path(f[0]).is_file()]
 
     def bundle_info(self) -> dict:
-        info = {"missing": self.bundle_missing(), "version": ""}
+        info = {"missing": self.bundle_missing(), "version": "", "fsr4": self.bundle_path("fsr4").is_file()}
         try:
             info["version"] = (self.bin_dir / "VERSION").read_text(encoding="utf-8").strip()
         except OSError:
@@ -891,7 +907,7 @@ class AissCore:
         core_ok = False
         if pfx:
             core_ok = all(self._classify(pfx / "drive_c/windows/system32" / name, key, gs.get(f"{sk}_hash"),
-                                         self._marker(key)) == "current" for key, name, _, sk in PREFIX_FILES)
+                                         self._marker(key)) == "current" for key, name, _, sk in self.prefix_files())
         if conflicts:
             status = STATUS_CONFLICT
             view["message"] = "Existing file is not ours: " + ", ".join(conflicts)
@@ -967,8 +983,8 @@ class AissCore:
         return CORE_MARKER if key == "core" else None
 
     def _install_core(self, gs: dict, pfx: Path) -> None:
-        """_nvngx.dll and libxess.dll into the prefix's system32."""
-        for key, name, _, sk in PREFIX_FILES:
+        """_nvngx.dll, libxess.dll and (when bundled) amdvkffx64.dll into the prefix's system32."""
+        for key, name, _, sk in self.prefix_files():
             dst = pfx / "drive_c/windows/system32" / name
             c = self._classify(dst, key, gs.get(f"{sk}_hash"), self._marker(key))
             if c != "current":
@@ -1136,11 +1152,11 @@ class AissCore:
         pfx = self.find_prefix(app["appid"], app["library"])
         if pfx is None:
             return False  # nothing more to do until the game has been launched once
-        for key, name, _, sk in PREFIX_FILES:
+        for key, name, _, sk in self.prefix_files():
             if self._classify(pfx / "drive_c/windows/system32" / name, key, gs.get(f"{sk}_hash"),
                               self._marker(key)) != "current":
                 return True
-        return bool(gs.get("reg_pending")) or not all(gs.get(f"{sk}_path") for _, _, _, sk in PREFIX_FILES)
+        return bool(gs.get("reg_pending")) or not all(gs.get(f"{sk}_path") for _, _, _, sk in self.prefix_files())
 
     def verify_all(self) -> list[dict]:
         """Repair enabled games (a game update can delete the shim, the prefix may exist by now, a newer plugin
@@ -1205,7 +1221,7 @@ class AissCore:
 
     def write_control(self) -> None:
         q = int(self.state["settings"].get("quality", 0))
-        if q not in (0, 1, 2, 3):
+        if q not in QUALITY_VALUES:
             q = 0
         fast = 1 if self.state["settings"].get("fast_math") else 0
         capture = int(self.state.get("capture_seq", 0))
@@ -1241,8 +1257,8 @@ class AissCore:
         s.pop("ratio", None)  # option removed; drop it from older state files
         if "quality" in settings:
             q = int(settings["quality"])
-            if q not in (-1, 0, 1, 2, 3):
-                raise ValueError("quality must be 0, 1, 2 (NSS) or 3 (XeSS)")
+            if q != -1 and q not in QUALITY_VALUES:
+                raise ValueError("quality must be 0, 1, 2 (NSS), 3 (XeSS) or 4-6 (FSR 4 Lite / INT8 / INT8 RDNA 2)")
             s["quality"] = 0 if q == -1 else q
         if "log" in settings:
             lv = int(settings["log"])

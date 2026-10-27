@@ -23,11 +23,18 @@ NVSDK_NGX_Result NgxFeatureRequirement(NVSDK_NGX_Feature feature, NVSDK_NGX_Feat
 // one it was created with; returns the upscaler to dispatch.
 Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current);
 
-// kBackendXess when XeSS is asked for (control file, else AISS_UPSCALER) and has not failed to load, else kBackendNss.
-int SelectedBackend();
+// The upscaler asked for (control file, else AISS_UPSCALER): kBackendXess or kBackendFsr4 (with the FSR 4 model in
+// *fsr4Model) unless that one has failed to load, else kBackendNss.
+int SelectedBackend(int* fsr4Model);
+
+// "NSS quality 2", "XeSS", "FSR 4 Lite", ...
+const char* UpscalerName(const UpscalerCreateInfo& info);
 
 // Records the upscale, with GPU timestamps around it when AISS_GPU_TIMING is set.
 bool NgxDispatch(Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerDispatch& d);
+
+// AISS_DUMP_FRAME for XeSS and FSR 4 (NSS dumps its own output): call after each dispatch.
+void NgxDumpFrame(const Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerImage& output);
 
 // Allocates a handle for a created upscaler. NGX hands handles back by pointer, so they must stay valid.
 NVSDK_NGX_Handle* NgxNewHandle(unsigned int id);

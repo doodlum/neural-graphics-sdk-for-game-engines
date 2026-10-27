@@ -20,6 +20,8 @@ NVNGX_DLL="${NVNGX_DLL:-$REPO/build_win_nvngx/nvngx.dll}"
 LOADER_DIR="${LOADER_DIR:-$REPO/build_win_loader}"
 LAYER_DIR="${LAYER_DIR:-$REPO/build_layer}"
 XESS_SDK="${XESS_SDK:-$REPO/../third_party/xess/sdk}"  # Intel XeSS SDK: libxess.dll + LICENSE.txt, shipped unmodified
+# AMD FSR 4: amdvkffx64.dll from AMD's Vulkan driver (Adrenalin), shipped unmodified; optional, kept outside the repo
+FSR4_DLL="${FSR4_DLL:-$REPO/../third_party/amd/amdvkffx64.dll}"
 DISTROBOX="${DISTROBOX:-aissbuild}"
 NAME="aiss-dlss-nss"
 
@@ -34,9 +36,17 @@ chmod 0644 "$HERE/bin/VkLayer_aiss_ngx.json"
 [ -f "$XESS_SDK/bin/libxess.dll" ] && [ -f "$XESS_SDK/LICENSE.txt" ] || { echo "missing XeSS SDK at $XESS_SDK" >&2; exit 1; }
 install -m 0644 "$XESS_SDK/bin/libxess.dll" "$HERE/bin/libxess.dll"
 install -m 0644 "$XESS_SDK/LICENSE.txt" "$HERE/bin/libxess-LICENSE.txt"
+FSR4_SUM=""
+if [ -f "$FSR4_DLL" ]; then
+    install -m 0644 "$FSR4_DLL" "$HERE/bin/amdvkffx64.dll"
+    FSR4_SUM=amdvkffx64.dll
+else
+    rm -f "$HERE/bin/amdvkffx64.dll"
+    echo "warning: $FSR4_DLL not found - building without FSR 4 (the plugin hides its upscaler options)" >&2
+fi
 echo "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$REPO" diff --quiet 2>/dev/null || echo -dirty) built $(date -u +%Y-%m-%dT%H:%MZ)" > "$HERE/bin/VERSION"
 (cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_aiss_ngx.so VkLayer_aiss_ngx.json libxess.dll \
-    libxess-LICENSE.txt > SHA256SUMS)
+    libxess-LICENSE.txt $FSR4_SUM > SHA256SUMS)
 
 if [ "${SKIP_FRONTEND:-0}" != 1 ]; then
     echo "== frontend"

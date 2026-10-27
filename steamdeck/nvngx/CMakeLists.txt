@@ -44,6 +44,9 @@ add_library(nvngx SHARED
     ngx_vulkan.cpp
     ngx_misc.cpp
     xess_upscaler.cpp
+    fsr4_upscaler.cpp
+    spirv_half_images.cpp
+    frame_dump.cpp
     gpu_timing.cpp
     "${SPV_INC}"
     "${EXPOSURE_SPV_INC}"

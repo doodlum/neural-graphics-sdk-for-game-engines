@@ -11,7 +11,11 @@
 //    with mutableDescriptorType, shaderStorageImageWriteWithoutFormat, scalarBlockLayout, plus shaderInt8 and
 //    shaderIntegerDotProduct from (2). This is what xessVKGetRequiredDeviceExtensions/Features (XeSS 2.0.2) return on
 //    a Steam Deck under Proton (no instance extensions, Vulkan 1.3); the layer is native and cannot call the Windows
-//    library, so the list is fixed here.
+//    library, so the list is fixed here. AISS_LAYER_XESS=0 leaves these out.
+// 4. Enables what AMD FSR 4 (amdvkffx64.dll, the other alternative upscaler) needs: VK_KHR_compute_shader_derivatives
+//    with computeDerivativeGroupLinear, shaderStorageImageExtendedFormats and shaderStorageImageWriteWithoutFormat,
+//    plus shaderInt8, shaderFloat16 and shaderIntegerDotProduct from (2): the capabilities its SPIR-V declares (Lite,
+//    INT8 and INT8 RDNA 2 networks). AISS_LAYER_FSR4=0 leaves these out.
 //
 // Enabled with AISS_LAYER=1 (see VkLayer_aiss_ngx.json); applies to the game's devices and to DXVK/vkd3d-proton's.
 // SPDX-License-Identifier: MIT
@@ -368,6 +372,7 @@ typedef struct FeatureStorage
     VkPhysicalDeviceSubgroupSizeControlFeatures     subgroup;
     VkPhysicalDeviceScalarBlockLayoutFeatures       scalar;
     VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableDesc;
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives;
     VkPhysicalDeviceFeatures2                       features2;
     VkPhysicalDeviceFeatures                        features;
 } FeatureStorage;
@@ -412,8 +417,11 @@ static void EnableMlFeatures(InstanceData* inst, VkPhysicalDevice pd, VkDeviceCr
     VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mdt   = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT};
     if (DriverHasExtension(inst, pd, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME))
         mdt.pNext = &sbl;
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR csd = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
+    const bool hasDerivatives = DriverHasExtension(inst, pd, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+    csd.pNext = mdt.pNext ? (void*)&mdt : (void*)&sbl;
     VkPhysicalDeviceFeatures2                       all    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-                                                              mdt.pNext ? (void*)&mdt : (void*)&sbl};
+                                                              hasDerivatives ? (void*)&csd : csd.pNext};
     inst->getFeatures2(pd, &all);
 
     VkPhysicalDeviceProperties props;
@@ -481,16 +489,17 @@ static void EnableMlFeatures(InstanceData* inst, VkPhysicalDevice pd, VkDeviceCr
                      VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, VK_API_VERSION_1_3,
                      t->subgroupSizeControl = VK_TRUE; t->computeFullSubgroups = VK_TRUE;);
 
-    // XeSS (see the top of the file).
+    // XeSS and FSR 4 (see the top of the file); AISS_LAYER_XESS=0 / AISS_LAYER_FSR4=0 opt out.
     const char* xessEnv = getenv("AISS_LAYER_XESS");
-    if (xessEnv && !strcmp(xessEnv, "0"))
-        return;
-    if (sbl.scalarBlockLayout)
+    const char* fsr4Env = getenv("AISS_LAYER_FSR4");
+    const bool  xess    = !(xessEnv && !strcmp(xessEnv, "0"));
+    const bool  fsr4    = !(fsr4Env && !strcmp(fsr4Env, "0"));
+    if (xess && sbl.scalarBlockLayout)
         ENABLE_GROUP(v12, VkPhysicalDeviceVulkan12Features, VkPhysicalDeviceScalarBlockLayoutFeatures,
                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, scalar,
                      VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, VK_API_VERSION_1_2,
                      t->scalarBlockLayout = VK_TRUE;);
-    if (mdt.mutableDescriptorType)
+    if (xess && mdt.mutableDescriptorType)
     {
         // Never core: always the extension (VALVE's alias shares the feature structure).
         VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT* t = (VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT*)FindInChain(
@@ -505,24 +514,50 @@ static void EnableMlFeatures(InstanceData* inst, VkPhysicalDevice pd, VkDeviceCr
         t->mutableDescriptorType = VK_TRUE;
         AddExtension(exts, extCount, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
     }
-    if (all.features.shaderStorageImageWriteWithoutFormat)
+    // FSR 4's shaders (amdvkffx64.dll, as probed under Proton on a Steam Deck) use SPV_KHR_compute_shader_derivatives
+    // (DerivativeGroupLinear) and storage images with extended formats, besides the int8 / fp16 / integer dot product
+    // features above.
+    if (fsr4 && hasDerivatives && csd.computeDerivativeGroupLinear)
     {
+        // Never core: the KHR extension (the NV one shares the feature structure).
+        VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR* t = (VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR*)FindInChain(
+            info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR);
+        if (!t)
+        {
+            t = &st->derivatives;
+            memset(t, 0, sizeof(*t));
+            t->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+            Append(info, t);
+            AddExtension(exts, extCount, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+        }
+        t->computeDerivativeGroupLinear = VK_TRUE;
+    }
+    // Core features: storage image writes without a format (XeSS, FSR 4), extended storage image formats (FSR 4).
+    const VkBool32 writeNoFormat = (xess || fsr4) && all.features.shaderStorageImageWriteWithoutFormat;
+    const VkBool32 extFormats    = fsr4 && all.features.shaderStorageImageExtendedFormats;
+    if (writeNoFormat || extFormats)
+    {
+        VkPhysicalDeviceFeatures* f = NULL;
         VkPhysicalDeviceFeatures2* f2 = (VkPhysicalDeviceFeatures2*)FindInChain(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
         if (f2)
-            f2->features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+            f = &f2->features;
         else if (info->pEnabledFeatures)
         {
-            st->features                                      = *info->pEnabledFeatures;
-            st->features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-            info->pEnabledFeatures                            = &st->features;
+            st->features           = *info->pEnabledFeatures;
+            info->pEnabledFeatures = &st->features;
+            f                      = &st->features;
         }
         else
         {
             memset(&st->features2, 0, sizeof(st->features2));
-            st->features2.sType                                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            st->features2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+            st->features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
             Append(info, &st->features2);
+            f = &st->features2.features;
         }
+        if (writeNoFormat)
+            f->shaderStorageImageWriteWithoutFormat = VK_TRUE;
+        if (extFormats)
+            f->shaderStorageImageExtendedFormats = VK_TRUE;
     }
 #undef ENABLE_GROUP
 }

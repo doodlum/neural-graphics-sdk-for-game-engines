@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "common.h"
 
+#include "nss_upscaler.h"
+
 #include <windows.h>
 
 #include <cstdio>
@@ -75,6 +77,20 @@ const ProxyConfig& Config()
         if (const char* v = getenv("AISS_UPSCALER"))
             c.xess = !strcmp(v, "xess") || !strcmp(v, "XeSS") || !strcmp(v, "XESS") || !strcmp(v, "3");
         c.xessQuality      = EnvInt("AISS_XESS_QUALITY", 0);
+        c.fsr4Model        = -1;
+        if (const char* v = getenv("AISS_UPSCALER"))
+        {
+            // fsr4 (model from AISS_FSR4_MODEL), or fsr4-<model> / the control file's codes 4-8
+            if (!_strnicmp(v, "fsr4", 4))
+            {
+                const char* m = v[4] == '-' || v[4] == '_' || v[4] == ':' ? v + 5 : getenv("AISS_FSR4_MODEL");
+                c.fsr4Model   = Fsr4ModelFromName(m ? m : "auto");
+                if (c.fsr4Model < 0)
+                    c.fsr4Model = kFsr4Auto;
+            }
+            else if (v[0] >= '4' && v[0] <= '8' && !v[1])
+                c.fsr4Model = Fsr4ModelForLiveCode(v[0] - '0');
+        }
         c.gpuTiming        = EnvInt("AISS_GPU_TIMING", 0);
         c.cameraNear       = EnvFloat("AISS_CAMERA_NEAR", 0.1f);
         c.cameraFar        = EnvFloat("AISS_CAMERA_FAR", 100000.0f);
@@ -141,8 +157,8 @@ static LiveControl ReadLiveControl()
     {
         int q = -1, fast = -1, capture = -1;
         const int n = fscanf(f, "%d %d %d", &q, &fast, &capture);
-        if (n >= 1 && q >= 0 && q <= 3)
-            read.nssQuality = q;  // 3 = XeSS
+        if (n >= 1 && q >= 0 && q <= 8)
+            read.nssQuality = q;  // 3 = XeSS, 4-8 = FSR 4
         if (n >= 2 && (fast == 0 || fast == 1))
             read.fastMath = fast;
         if (n >= 3 && capture >= 0)
@@ -159,10 +175,19 @@ int LiveNssQuality()
     return q <= 2 ? q : -1;
 }
 
-int LiveXess()
+int LiveUpscaler()
 {
-    const int q = ReadLiveControl().nssQuality;
-    return q < 0 ? -1 : q == 3 ? 1 : 0;
+    return ReadLiveControl().nssQuality;
+}
+
+int LiveCodeForFsr4(int model)
+{
+    return model == kFsr4Auto ? 8 : 3 + model;
+}
+
+int Fsr4ModelForLiveCode(int code)
+{
+    return code == 8 ? kFsr4Auto : code >= 4 && code <= 7 ? code - 3 : -1;
 }
 
 int LiveFastMath()

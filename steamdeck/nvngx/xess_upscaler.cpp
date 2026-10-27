@@ -335,6 +335,12 @@ bool XessUnavailable()
 
 std::unique_ptr<Upscaler> CreateUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info)
 {
+    if (info.backend == kBackendFsr4)
+    {
+        if (auto fsr4 = CreateFsr4Upscaler(device, info))
+            return fsr4;
+        LOGI("FSR 4 (%s) unavailable; falling back to NSS", Fsr4ModelName(info.fsr4Model));
+    }
     if (info.backend == kBackendXess)
     {
         if (auto xess = XessUpscaler::Create(device, info))
@@ -347,5 +353,6 @@ std::unique_ptr<Upscaler> CreateUpscaler(const VulkanDevice& device, const Upsca
     }
     UpscalerCreateInfo nss = info;
     nss.backend            = kBackendNss;
+    nss.fsr4Model          = kFsr4Auto;
     return NssUpscaler::Create(device, nss);
 }
