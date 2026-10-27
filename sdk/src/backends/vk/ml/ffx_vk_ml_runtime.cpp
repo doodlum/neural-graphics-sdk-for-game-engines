@@ -5,6 +5,7 @@
 #include "ffx_vk_ml_graph.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -52,6 +53,7 @@ namespace ffx_ml
             PFN_vkCmdDispatch                                       CmdDispatch;
             PFN_vkCmdPipelineBarrier                                CmdPipelineBarrier;
             PFN_vkCmdCopyBuffer                                     CmdCopyBuffer;
+            PFN_vkCmdFillBuffer                                     CmdFillBuffer;
             PFN_vkCmdWriteTimestamp                                 CmdWriteTimestamp;
 
             bool Load(const DeviceContext& ctx)
@@ -90,6 +92,7 @@ namespace ffx_ml
                 FFX_ML_DEVICE_FN(CmdDispatch);
                 FFX_ML_DEVICE_FN(CmdPipelineBarrier);
                 FFX_ML_DEVICE_FN(CmdCopyBuffer);
+                FFX_ML_DEVICE_FN(CmdFillBuffer);
                 FFX_ML_DEVICE_FN(CmdWriteTimestamp);
 #undef FFX_ML_INSTANCE_FN
 #undef FFX_ML_DEVICE_FN
@@ -558,6 +561,10 @@ namespace ffx_ml
         VkShaderModule        module         = VK_NULL_HANDLE;
         std::vector<Layer>    layers;
         std::vector<Allocation> internals;
+        // Tiled dot4: internal tensors get one extra pixel holding their consumers' input zero point, so padding taps
+        // read it instead of selecting the zero point per loaded word. INT32_MIN: no zero-point pixel.
+        std::vector<int32_t>    internalZp;
+        std::vector<VkDeviceSize> internalZpOffset;
         Allocation            constantsDevice;
         Allocation            constantsStaging;
         bool                  constantsUploaded = false;
@@ -760,6 +767,21 @@ namespace ffx_ml
 
             // Internal tensors.
             internals.resize(lowered.internalTensorCount);
+            internalZp.assign(lowered.internalTensorCount, INT32_MIN);
+            internalZpOffset.assign(lowered.internalTensorCount, 0);
+            const bool zpPixels = selection.path == Path::Dot4 && selection.dot4Tiled && !getenv("FFX_ML_NO_ZP_PIXEL");
+            if (zpPixels)
+            {
+                for (const FusedConv& fc : lowered.convs)
+                    for (const ConvSource& src : fc.sources)
+                    {
+                        const StoredTensor& t = lowered.tensors[src.tensor];
+                        if (t.external)
+                            continue;
+                        int32_t& zp = internalZp[t.internalIndex];
+                        zp          = (zp == INT32_MIN || zp == fc.conv->inputZp) ? fc.conv->inputZp : -1000;  // -1000: conflict
+                    }
+            }
             for (const StoredTensor& t : lowered.tensors)
             {
                 if (t.external)
@@ -767,8 +789,14 @@ namespace ffx_ml
                     shapes[t.binding] = {1, t.h, t.w, t.c};
                     continue;
                 }
-                const VkDeviceSize bytes = VkDeviceSize(t.h) * t.w * t.channelStride;
-                if (!Allocate(internals[t.internalIndex], bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                VkDeviceSize bytes = VkDeviceSize(t.h) * t.w * t.channelStride;
+                internalZpOffset[t.internalIndex] = bytes;
+                const int32_t zp = internalZp[t.internalIndex];
+                if (zp >= -128 && zp <= 127)
+                    bytes += t.channelStride;  // the zero-point pixel
+                else
+                    internalZp[t.internalIndex] = INT32_MIN;  // not used by a tiled kernel, or consumers disagree
+                if (!Allocate(internals[t.internalIndex], bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
                     return fail("failed to allocate an intermediate tensor");
             }
 
@@ -1023,6 +1051,8 @@ namespace ffx_ml
                     spec(base + 2, t.c);
                     spec(base + 3, t.channelStride);
                     spec(base + 4, src.resize ? 1 : 0);
+                    if (tiled)
+                        spec(s == 0 ? 59 : 60, (!t.external && internalZp[t.internalIndex] != INT32_MIN) ? 1 : 0);
                     spec(base + 5, src.scale[0]);
                     spec(base + 6, src.scale[1]);
                     spec(base + 7, src.offset[0]);
@@ -1197,6 +1227,15 @@ namespace ffx_ml
             {
                 VkBufferCopy copy = {0, 0, constantsStaging.size};
                 fn.CmdCopyBuffer(cmd, constantsStaging.buffer, constantsDevice.buffer, 1, &copy);
+                // Zero-point pixels after the internal tensors (never written by the layers).
+                for (const StoredTensor& t : lowered.tensors)
+                {
+                    if (t.external || internalZp[t.internalIndex] == INT32_MIN)
+                        continue;
+                    const uint32_t b = uint32_t(internalZp[t.internalIndex]) & 0xFFu;
+                    fn.CmdFillBuffer(cmd, internals[t.internalIndex].buffer, internalZpOffset[t.internalIndex], VkDeviceSize(t.channelStride),
+                                     b | (b << 8) | (b << 16) | (b << 24));
+                }
                 VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
                 fn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
                 constantsUploaded = true;

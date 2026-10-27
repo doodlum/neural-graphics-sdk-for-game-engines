@@ -79,6 +79,8 @@ layout(constant_id = 52) const uint NT_PER_WG = 3;  // N tiles per workgroup; gl
 layout(constant_id = 53) const uint WG_Y = 1;   // workgroup rows (threads)
 layout(constant_id = 54) const int  PX   = 4;   // output pixels per thread along x
 layout(constant_id = 55) const int  OCB  = 16;  // output channels per thread (multiple of 4); gl_WorkGroupID.z picks the block
+layout(constant_id = 59) const int  S0_ZP_PIXEL = 0;  // 1: source 0 has a zero-point pixel after its H x W pixels
+layout(constant_id = 60) const int  S1_ZP_PIXEL = 0;
 layout(constant_id = 56) const int  KSPLIT = 1;  // subgroups sharing the workgroup's output tiles (local z), each summing every KSPLIT-th input word
 layout(local_size_x_id = 0, local_size_y_id = 53, local_size_z_id = 56) in;
 #else
@@ -551,10 +553,15 @@ void main()
             valid[j]      = rowOk && vx >= 0 && vx < IN_W;
             const int sx0 = S0_RESIZE != 0 ? NearestCoord(vxc, S0_SCALE_X_N, S0_SCALE_X_D, S0_OFFSET_X, S0_W) : vxc;
             base0[j]      = ((sy0 * S0_W + sx0) * S0_STRIDE) >> 2;
+            // Padding taps read the zero-point pixel instead of selecting the zero point per word (one select per column).
+            if (S0_ZP_PIXEL != 0)
+                base0[j] = valid[j] ? base0[j] : ((S0_H * S0_W * S0_STRIDE) >> 2);
             if (NUM_SOURCES > 1)
             {
                 const int sx1 = S1_RESIZE != 0 ? NearestCoord(vxc, S1_SCALE_X_N, S1_SCALE_X_D, S1_OFFSET_X, S1_W) : vxc;
                 base1[j]      = ((sy1 * S1_W + sx1) * S1_STRIDE) >> 2;
+                if (S1_ZP_PIXEL != 0)
+                    base1[j] = valid[j] ? base1[j] : ((S1_H * S1_W * S1_STRIDE) >> 2);
             }
             else
                 base1[j] = 0;
@@ -576,7 +583,7 @@ void main()
         {
             uint x[COLS];
             [[unroll]] for (int j = 0; j < COLS; ++j)
-                x[j] = valid[j] ? xn[j] : zp;
+                x[j] = (S0_ZP_PIXEL != 0 || valid[j]) ? xn[j] : zp;
             const int wn = min(w + KSPLIT, s0Words - 1);
             [[unroll]] for (int j = 0; j < COLS; ++j)
                 xn[j] = src0[base0[j] + wn];
@@ -591,7 +598,7 @@ void main()
             {
                 uint x[COLS];
                 [[unroll]] for (int j = 0; j < COLS; ++j)
-                    x[j] = valid[j] ? xn[j] : zp;
+                    x[j] = (S1_ZP_PIXEL != 0 || valid[j]) ? xn[j] : zp;
                 const int wn = min(w + KSPLIT, s1End - 1) - s0Words;
                 [[unroll]] for (int j = 0; j < COLS; ++j)
                     xn[j] = src1[base1[j] + wn];
