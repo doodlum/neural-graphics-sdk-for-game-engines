@@ -25,7 +25,8 @@
 #include <cfloat>     // for FLT_EPSILON
 #include <cmath>      // for fabs, abs, sinf, sqrt, etc.
 #include <cstdio>     // for snprintf
-#include <string.h>   // for memset
+#include <string.h>
+#include <cstdlib>   // for memset
 #include <cstdint>
 
 #include "FidelityFX/host/ffx_nss.h"
@@ -403,6 +404,20 @@ static FfxErrorCode createPipelineStates(FfxNssContext_Private* context, const F
     const auto CreatePipeline                   = [&](FfxPass pass, const char* name, FfxPipelineState* pipeline, bool useFragment) -> FfxErrorCode {
         ffxSafeReleasePipeline(&context->contextDescription.backendInterface, pipeline, context->effectContextId);
 
+        // NOT BIT EXACT, experiment: FFX_NSS_FP16_PASSES="scatter,disocc,pre,lut,post" selects the 16-bit (FFX_HALF=1)
+        // permutation for those passes only (FFX_NSS_CONTEXT_FLAG_ALLOW_16BIT selects it for all of them).
+        uint32_t passFlags = context->pipelineFlags;
+        if (const char* fp16Passes = getenv("FFX_NSS_FP16_PASSES"))
+        {
+            const char* passName = pass == FFX_NSS_PASS_DEPTH_SCATTER ? "scatter" : pass == FFX_NSS_PASS_DISOCCLUSION_MASK ? "disocc" :
+                                   pass == FFX_NSS_PASS_PREPROCESS ? "pre" : pass == FFX_NSS_PASS_GENERATE_OFFSET_LUT ? "lut" :
+                                   pass == FFX_NSS_PASS_POSTPROCESS ? "post" : "";
+            FfxDeviceCapabilities caps;
+            context->contextDescription.backendInterface.fpGetDeviceCapabilities(&context->contextDescription.backendInterface, &caps);
+            if (*passName && strstr(fp16Passes, passName) && caps.fp16Supported)
+                passFlags |= NSS_SHADER_PERMUTATION_ALLOW_16BIT;
+        }
+
         strncpy(pipelineDescription.name, name, FFX_RESOURCE_NAME_SIZE - 1);
         pipelineDescription.name[FFX_RESOURCE_NAME_SIZE - 1] = '\0';
 
@@ -432,7 +447,7 @@ static FfxErrorCode createPipelineStates(FfxNssContext_Private* context, const F
             FFX_VALIDATE(context->contextDescription.backendInterface.fpCreateGraphicsPipeline(&context->contextDescription.backendInterface,
                                                                                                FFX_EFFECT_NSS,
                                                                                                pass,
-                                                                                               context->pipelineFlags,
+                                                                                               passFlags,
                                                                                                &pipelineDescription,
                                                                                                context->effectContextId,
                                                                                                pipeline));
@@ -442,7 +457,7 @@ static FfxErrorCode createPipelineStates(FfxNssContext_Private* context, const F
             FFX_VALIDATE(context->contextDescription.backendInterface.fpCreateComputePipeline(&context->contextDescription.backendInterface,
                                                                                               FFX_EFFECT_NSS,
                                                                                               pass,
-                                                                                              context->pipelineFlags,
+                                                                                              passFlags,
                                                                                               &pipelineDescription,
                                                                                               context->effectContextId,
                                                                                               pipeline));
