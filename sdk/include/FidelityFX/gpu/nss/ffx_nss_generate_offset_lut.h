@@ -181,14 +181,51 @@ void StoreLutRow(int32_t tile_x, int32_t tile_y, uint32_t packed_taps[kPackedTap
 // T_W x T_H tiles of 9 packed taps (3 rgba32ui texels each), the LUT holds one texel per x tile (row 0) and one per
 // y tile (row 1):
 //   .x  int8 lr offsets for axis offsets d = -2..1 (byte d + 2)
-//   .y  int8 lr offsets for d = 2..3 (bytes 0..1)
+//   .y  int8 lr offsets for d = 2..3 (bytes 0..1), bits 16..21: validity of d = -2..3
 //   .zw 36-bit mask over the candidate ranks: bit r set when this axis' component of candidate r is valid
-// The postprocess ANDs the x and y masks and takes the first 9 set ranks, which reproduces the packed taps of the
-// per-tile LUT exactly (same arithmetic per axis, integer combination only). lut_idx < T_W: x tile, then y tiles.
+// Rows 2..65 hold the selection table: texel (x_valid, 2 + y_valid) for the 6-bit validity patterns of the two axes
+// lists the selected taps (at most 9, candidate order) as 6-bit (x index | y index << 3) codes, taps 0..4 in .x and
+// 5..8 in .y bits 0..23, the tap count in .y bits 24..27. lut_idx >= T_W + T_H fills it.
+// The postprocess either ANDs the x and y rank masks and takes the first 9 set ranks, or (compute path) looks the
+// taps up in the selection table; both reproduce the packed taps of the per-tile LUT exactly (same arithmetic per
+// axis, integer combination only). lut_idx < T_W: x tile, then y tiles, then the table.
 void GenerateOffsetLutAxis(int32_t lut_idx)
 {
     int32_t idx_mod_x = max(IndexModulo().x, int32_t(1));
     int32_t idx_mod_y = max(IndexModulo().y, int32_t(1));
+    if (lut_idx >= idx_mod_x + idx_mod_y)
+    {
+        int32_t e = lut_idx - (idx_mod_x + idx_mod_y);
+        if (e >= int32_t(4096))
+        {
+            return;
+        }
+        uint32_t x_valid = uint32_t(e & int32_t(63));
+        uint32_t y_valid = uint32_t(e >> int32_t(6));
+        uint32_t lo      = uint32_t(0);
+        uint32_t hi      = uint32_t(0);
+        int32_t  count   = int32_t(0);
+        for (int32_t r = int32_t(0); r < kCandidateCount && count < kPackedTapCount; ++r)
+        {
+            int32_t ix = kCandidateOffsetYx[r].y + int32_t(2);
+            int32_t iy = kCandidateOffsetYx[r].x + int32_t(2);
+            if (((x_valid >> uint32_t(ix)) & (y_valid >> uint32_t(iy)) & uint32_t(1)) != uint32_t(0))
+            {
+                uint32_t code = uint32_t(ix | (iy << int32_t(3)));
+                if (count < int32_t(5))
+                {
+                    lo |= code << uint32_t(6 * count);
+                }
+                else
+                {
+                    hi |= code << uint32_t(6 * (count - 5));
+                }
+                ++count;
+            }
+        }
+        imageStore(rw_offset_lut, int32_t2(int32_t(x_valid), int32_t(2) + int32_t(y_valid)), uint32_t4(lo, hi | (uint32_t(count) << uint32_t(24)), 0, 0));
+        return;
+    }
     bool    y_axis    = lut_idx >= idx_mod_x;
     int32_t t         = y_axis ? lut_idx - idx_mod_x : lut_idx;
     if (y_axis && t >= idx_mod_y)
@@ -248,7 +285,7 @@ void GenerateOffsetLutAxis(int32_t lut_idx)
             }
         }
     }
-    imageStore(rw_offset_lut, int32_t2(t, y_axis ? 1 : 0), uint32_t4(offsets_lo, offsets_hi, rank_lo, rank_hi));
+    imageStore(rw_offset_lut, int32_t2(t, y_axis ? 1 : 0), uint32_t4(offsets_lo, offsets_hi | (valid_bits << uint32_t(16)), rank_lo, rank_hi));
 }
 #endif  // NSS_FILTER_MODE == 2
 

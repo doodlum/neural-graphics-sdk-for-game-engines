@@ -688,8 +688,8 @@ shared int32_t  s_axis_lr_x[kAxisLdsW * 6];
 shared int32_t  s_axis_kpn_x[kAxisLdsW * 6];   // kpn_x * words per KPN pixel
 shared int32_t  s_axis_lr_y[kAxisLdsH * 6];
 shared int32_t  s_axis_kpn_y[kAxisLdsH * 6];   // kpn_y * kpn_w * words per KPN pixel
-shared uint32_t s_axis_rank_x[kAxisLdsW * 2];
-shared uint32_t s_axis_rank_y[kAxisLdsH * 2];
+shared uint32_t s_axis_valid_x[kAxisLdsW];   // 6-bit validity of the column's x offsets
+shared uint32_t s_axis_valid_y[kAxisLdsH];
 
 void PrepareDenseFilterAxes()
 {
@@ -712,8 +712,7 @@ void PrepareDenseFilterAxes()
         s_axis_kpn_x[li]   = KpnCoordForDenseFilter(int32_t2(lr, 0), kpn_max).x * (kKpnChannels / 4);
         if (i == int32_t(0))
         {
-            s_axis_rank_x[c * 2]     = axis.z;
-            s_axis_rank_x[c * 2 + 1] = axis.w;
+            s_axis_valid_x[c] = (axis.y >> uint32_t(16)) & uint32_t(63);
         }
     }
     else if (li < (kAxisLdsW + kAxisLdsH) * 6)
@@ -731,8 +730,7 @@ void PrepareDenseFilterAxes()
         s_axis_kpn_y[e]    = KpnCoordForDenseFilter(int32_t2(0, lr), kpn_max).y * KpnDims().x * (kKpnChannels / 4);
         if (i == int32_t(0))
         {
-            s_axis_rank_y[r * 2]     = axis.z;
-            s_axis_rank_y[r * 2 + 1] = axis.w;
+            s_axis_valid_y[r] = (axis.y >> uint32_t(16)) & uint32_t(63);
         }
     }
     barrier();
@@ -747,8 +745,11 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     half4 accum_m2 = half4(0.HF);
     center_sample  = half4(0.HF);
 
-    uint32_t rank_lo = s_axis_rank_x[col * 2] & s_axis_rank_y[row * 2];
-    uint32_t rank_hi = s_axis_rank_x[col * 2 + 1] & s_axis_rank_y[row * 2 + 1];
+    // Selected taps for this pixel's (x, y) validity patterns, in candidate order (see GenerateOffsetLutAxis).
+    uint32_t2 sel    = texelFetch(_OffsetLutUint4Tex, int32_t2(int32_t(s_axis_valid_x[col]), int32_t(2 + s_axis_valid_y[row])), 0).xy;
+    int32_t   count  = int32_t(sel.y >> uint32_t(24));
+    int32_t   col6   = col * 6;
+    int32_t   row6   = row * 6;
 
     int32_t2 lr_tap[9];
     int32_t  kpn_word[9];
@@ -757,26 +758,17 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     bool     tap_center[9];
     for (int32_t k = int32_t(0); k < int32_t(9); ++k)
     {
-        tap_valid[k] = (rank_lo | rank_hi) != uint32_t(0);
-        int32_t rank;
-        if (rank_lo != uint32_t(0))
-        {
-            rank    = findLSB(rank_lo);
-            rank_lo &= rank_lo - uint32_t(1);
-        }
-        else
-        {
-            rank    = int32_t(32) + findLSB(rank_hi);  // findLSB(0) = -1: rank 31 for a missing tap (not accumulated)
-            rank_hi &= rank_hi - uint32_t(1);
-        }
-        uint32_t info = kDenseRankInfo[clamp(rank, int32_t(0), int32_t(35))];
-        int32_t  xi   = col * 6 + int32_t((info >> uint32_t(8)) & uint32_t(7));
-        int32_t  yi   = row * 6 + int32_t((info >> uint32_t(12)) & uint32_t(7));
-        channel[k]    = int32_t(info & uint32_t(0x3F));
+        uint32_t code = bitfieldExtract(k < int32_t(5) ? sel.x : sel.y, (k < int32_t(5) ? k : k - int32_t(5)) * int32_t(6), int32_t(6));
+        int32_t  ix   = int32_t(code & uint32_t(7));
+        int32_t  iy   = int32_t(code >> uint32_t(3));
+        int32_t  xi   = col6 + ix;
+        int32_t  yi   = row6 + iy;
+        tap_valid[k]  = k < count;
+        channel[k]    = ix * int32_t(6) + iy;  // kCandidateLinear
         lr_tap[k]     = int32_t2(s_axis_lr_x[xi], s_axis_lr_y[yi]);
         // (kpn_y * kpn_w + kpn_x) * words + channel / 4, as in ReadKpnParamsFromBase.
         kpn_word[k]   = s_axis_kpn_y[yi] + s_axis_kpn_x[xi] + (channel[k] >> 2);
-        tap_center[k] = rank == int32_t(0);
+        tap_center[k] = code == uint32_t(2 | (2 << 3));  // offset (0, 0) is candidate rank 0
     }
 
     half4 tap_col[9];
