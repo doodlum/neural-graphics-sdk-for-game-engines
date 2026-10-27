@@ -78,16 +78,30 @@ const ProxyConfig& Config()
         c.mlFeaturesForced = EnvInt("AISS_LAYER", 0) != 0;
         c.debugView        = EnvInt("AISS_DEBUG_VIEW", -1);
         c.dumpFrame        = EnvInt("AISS_DUMP_FRAME", -1);
+        c.fastMath         = getenv("FFX_ML_RESCALE_FLOAT") != nullptr;
+        auto pair = [](const char* name, float* out) {
+            out[0] = out[1] = 1.0f;
+            if (const char* v = getenv(name))
+                sscanf(v, "%f,%f", &out[0], &out[1]);
+        };
+        pair("AISS_JITTER_SIGN", c.jitterSign);
+        pair("AISS_MV_SIGN", c.mvSign);
         return c;
     }();
     return config;
 }
 
-int LiveNssQuality()
+struct LiveControl
 {
-    static std::mutex mutex;
-    static ULONGLONG  lastCheck = 0;
-    static int        value     = -1;
+    int nssQuality = -1;
+    int fastMath   = -1;
+};
+
+static LiveControl ReadLiveControl()
+{
+    static std::mutex  mutex;
+    static ULONGLONG   lastCheck = 0;
+    static LiveControl value;
     static const std::string path = [] {
         const char* unix = getenv("AISS_CONTROL");
         if (!unix || unix[0] != '/')
@@ -99,20 +113,34 @@ int LiveNssQuality()
         return dos;
     }();
     if (path.empty())
-        return -1;
+        return value;
     std::lock_guard<std::mutex> lock(mutex);
     const ULONGLONG now = GetTickCount64();
     if (lastCheck && now - lastCheck < 500)
         return value;
     lastCheck = now;
-    int   read = -1;
-    FILE* f    = fopen(path.c_str(), "r");
+    LiveControl read;
+    FILE*       f = fopen(path.c_str(), "r");
     if (f)
     {
-        if (fscanf(f, "%d", &read) != 1 || read < 0 || read > 2)
-            read = -1;
+        int q = -1, fast = -1;
+        const int n = fscanf(f, "%d %d", &q, &fast);
+        if (n >= 1 && q >= 0 && q <= 2)
+            read.nssQuality = q;
+        if (n >= 2 && (fast == 0 || fast == 1))
+            read.fastMath = fast;
         fclose(f);
     }
     value = read;
     return value;
+}
+
+int LiveNssQuality()
+{
+    return ReadLiveControl().nssQuality;
+}
+
+int LiveFastMath()
+{
+    return ReadLiveControl().fastMath;
 }

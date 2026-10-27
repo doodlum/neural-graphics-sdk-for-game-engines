@@ -112,6 +112,8 @@ Use the Decky plugin for this. By hand:
 | `AISS_DEBUG_VIEW=0..16` | Write NSS's internal views instead of the image (0 = 4x4 grid) |
 | `AISS_DUMP_FRAME=N` | Write output frame N to `aiss_frame_N.ppm` |
 | `FFX_PROFILE_PASSES=file` | Per-pass GPU timings |
+| `FFX_ML_RESCALE_FLOAT=1` | Fast maths: fp32 requantisation in the ML graph, ~1-2% faster, not bit exact (the plugin's "Fast maths" toggle sets it live through the control file) |
+| `AISS_JITTER_SIGN=x,y`, `AISS_MV_SIGN=x,y` | Multipliers on the jitter / motion vector scale handed to NSS (convention debugging) |
 | `AISS_LAYER_LOG=1` | Vulkan layer: log instances, device extensions and NULL proc lookups to stderr |
 | `AISS_LAYER_FEATURES=0`, `AISS_LAYER_EMULATE=0` | Vulkan layer: don't force ML features / don't emulate the NVIDIA extensions (debugging) |
 

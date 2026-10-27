@@ -73,6 +73,7 @@ COMMAND = "%command%"
 DEFAULT_SETTINGS = {
     "quality": 0,        # NSS model: 0 = full network (default), 2 = fast small network (more ghosting); applied live
     "log": 1,            # AISS_LOG level; 1 is the core's default and is not written out
+    "fast_math": 0,      # 1 = fp32 requantisation in the ML graph (~2% faster, not bit exact); applied live
 }
 
 STATUS_INSTALLED = "installed"
@@ -1190,9 +1191,10 @@ class AissCore:
         q = int(self.state["settings"].get("quality", 0))
         if q not in (0, 1, 2):
             q = 0
+        fast = 1 if self.state["settings"].get("fast_math") else 0
         self.control_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.control_path.with_suffix(".tmp")
-        tmp.write_text(f"{q}\n")
+        tmp.write_text(f"{q} {fast}\n")
         os.replace(tmp, self.control_path)
 
     def set_settings(self, settings: dict) -> dict:
@@ -1208,6 +1210,11 @@ class AissCore:
             if not 0 <= lv <= 4:
                 raise ValueError("log must be 0..4")
             s["log"] = lv
+        if "fast_math" in settings:
+            fm = int(settings["fast_math"])
+            if fm not in (0, 1):
+                raise ValueError("fast_math must be 0 or 1")
+            s["fast_math"] = fm
         self.state["settings"] = s
         self.save_state()
         self.write_control()

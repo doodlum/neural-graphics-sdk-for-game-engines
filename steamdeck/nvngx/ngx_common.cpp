@@ -48,6 +48,7 @@ UpscalerCreateInfo NgxCreateInfo(const NgxParams& p)
     info.hdr           = (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0;
     info.depthInverted = (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
     info.nssQuality    = NssQualityForDlss(p.I32(ngxp::PerfQuality, NVSDK_NGX_PerfQuality_Value_MaxPerf));
+    info.fastMath      = FastMathEnabled();
     if (!(flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes))
         LOGI("warning: game passes display-resolution motion vectors (MVLowRes not set); NSS expects render resolution");
     LOGI("DLSS create: %ux%u -> %ux%u, flags 0x%x, perf quality %d", info.renderWidth, info.renderHeight,
@@ -112,18 +113,23 @@ void NgxFreeHandle(NVSDK_NGX_Handle* handle)
 
 NssUpscaler* NgxApplyLiveSettings(unsigned int id, NssUpscaler* current)
 {
-    const int live = LiveNssQuality();
-    if (live < 0 || live == current->Info().nssQuality)
+    const UpscalerCreateInfo& old  = current->Info();
+    const int                 live = LiveNssQuality();
+    UpscalerCreateInfo        info = old;
+    if (live >= 0)
+        info.nssQuality = live;
+    info.fastMath = FastMathEnabled();
+    if (info.nssQuality == old.nssQuality && info.fastMath == old.fastMath)
         return current;
-    UpscalerCreateInfo info = current->Info();
-    info.nssQuality         = live;
-    auto fresh              = NssUpscaler::Create(current->Device(), info);
+    auto fresh = NssUpscaler::Create(current->Device(), info);
     if (!fresh)
     {
-        LOGI("model switch to quality %d failed; keeping quality %d", live, current->Info().nssQuality);
+        LOGI("switch to quality %d, fast maths %d failed; keeping quality %d, fast maths %d", info.nssQuality,
+             info.fastMath, old.nssQuality, old.fastMath);
         return current;
     }
-    LOGI("model switched at runtime: quality %d -> %d", current->Info().nssQuality, live);
+    LOGI("model switched at runtime: quality %d -> %d, fast maths %d -> %d", old.nssQuality, info.nssQuality,
+         old.fastMath, info.fastMath);
     Registry().CollectGarbage();
     NssUpscaler* swapped = Registry().Replace(id, std::move(fresh));
     return swapped ? swapped : current;

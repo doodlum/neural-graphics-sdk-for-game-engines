@@ -26,7 +26,7 @@ import aiss_core as core  # noqa: E402
 from aiss_core import (AissCore, build_launch_options, strip_launch_options, reg_set_value,  # noqa: E402
                        reg_delete_value, reg_has_value, REG_KEY_PATH, SIG_OVERRIDE_VALUE)
 
-S0 = {"quality": 0, "log": 1}
+S0 = {"quality": 0, "log": 1, "fast_math": 0}
 
 
 def bin_dir(tmp: Path) -> Path:
@@ -463,9 +463,15 @@ class FakeLibraryTests(unittest.TestCase):
                                         'WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
         # The model is switched live through the control file, not the launch options.
         self.core.set_settings({"quality": 2, "log": 0})
-        self.assertEqual(control.read_text().strip(), "2")
+        self.assertEqual(control.read_text().strip(), "2 0")
         self.core.set_settings({"quality": 0})
-        self.assertEqual(control.read_text().strip(), "0")
+        self.assertEqual(control.read_text().strip(), "0 0")
+        # Fast maths also goes through the control file and keeps the launch options unchanged.
+        self.core.set_settings({"fast_math": 1})
+        self.assertEqual(control.read_text().strip(), "0 1")
+        with self.assertRaises(ValueError):
+            self.core.set_settings({"fast_math": 2})
+        self.core.set_settings({"fast_math": 0})
         with self.assertRaises(ValueError):
             self.core.set_settings({"quality": 9})
         # AISS_RATIO / AISS_NSS_QUALITY left over from older plugin versions are removed on the next sync.

@@ -36,6 +36,7 @@ interface Game {
 interface Settings {
   quality: number;
   log: number;
+  fast_math: number;
 }
 
 interface State {
@@ -264,6 +265,15 @@ function Content() {
             selectedOption={s.quality === 2 ? 2 : 0}
             disabled={!!busy}
             onChange={(o) => changeSetting({ quality: o.data })}
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ToggleField
+            label="Fast maths"
+            description="~2% faster upscaling; output no longer bit-exact (about half an 8-bit step). Switches live."
+            checked={!!s.fast_math}
+            disabled={!!busy}
+            onChange={(v) => changeSetting({ fast_math: v ? 1 : 0 })}
           />
         </PanelSectionRow>
         <PanelSectionRow>

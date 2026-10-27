@@ -105,6 +105,12 @@ int NssQualityForDlss(int perfQualityValue)
     return FFX_API_NSS_SHADER_QUALITY_MODE_QUALITY;
 }
 
+bool FastMathEnabled()
+{
+    const int live = LiveFastMath();
+    return live >= 0 ? live != 0 : Config().fastMath;
+}
+
 std::unique_ptr<NssUpscaler> NssUpscaler::Create(const VulkanDevice& device, const UpscalerCreateInfo& info)
 {
     std::unique_ptr<NssUpscaler> up(new NssUpscaler());
@@ -186,6 +192,11 @@ bool NssUpscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& inf
     nss.header.pNext     = &backend.header;
     backend.header.pNext = &ml.header;
 
+    // The ML runtime reads FFX_ML_RESCALE_FLOAT while it builds the graph's pipelines. Config() has already captured
+    // the launch value, so setting it here only selects the mode for this context.
+    (void)Config();
+    _putenv_s("FFX_ML_RESCALE_FLOAT", info.fastMath ? "1" : "");
+
     ffxContext ctx = nullptr;
     const ffxReturnCode_t rc = ffxCreateContext(&ctx, &nss.header, nullptr);
     if (rc != FFX_API_RETURN_OK)
@@ -194,9 +205,9 @@ bool NssUpscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& inf
         return false;
     }
     m_context = ctx;
-    LOGI("NSS context %ux%u -> %ux%u, quality %d, hdr %d, inverted depth %d, ML features 0x%x", info.renderWidth,
-         info.renderHeight, info.displayWidth, info.displayHeight, info.nssQuality, info.hdr, info.depthInverted,
-         device.mlFeatures);
+    LOGI("NSS context %ux%u -> %ux%u, quality %d, hdr %d, inverted depth %d, fast maths %d, ML features 0x%x",
+         info.renderWidth, info.renderHeight, info.displayWidth, info.displayHeight, info.nssQuality, info.hdr,
+         info.depthInverted, info.fastMath, device.mlFeatures);
     return true;
 }
 
@@ -460,8 +471,8 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
                                 0, nullptr, fix.count, fix.before);
 
     // NSS's jitter is the negative of the DLSS pixel offset on both axes.
-    nss.jitterOffset           = {-d.jitterX, -d.jitterY};
-    nss.motionVectorScale      = {d.mvScaleX, d.mvScaleY};
+    nss.jitterOffset           = {-d.jitterX * Config().jitterSign[0], -d.jitterY * Config().jitterSign[1]};
+    nss.motionVectorScale      = {d.mvScaleX * Config().mvSign[0], d.mvScaleY * Config().mvSign[1]};
     nss.renderSize             = {renderW, renderH};
     nss.upscaleSize            = {m_info.displayWidth, m_info.displayHeight};
     nss.cameraNear             = Config().cameraNear;

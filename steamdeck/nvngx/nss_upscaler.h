@@ -38,6 +38,7 @@ struct UpscalerCreateInfo
     bool     hdr           = false;
     bool     depthInverted = false;
     int      nssQuality    = 2;  // FfxApiNssShaderQualityMode
+    bool     fastMath      = false;  // fp32 requantisation in the ML graph: ~2% faster, not bit exact
 };
 
 struct UpscalerDispatch
@@ -128,3 +129,6 @@ UpscalerRegistry& Registry();
 
 // Maps the game's DLSS quality mode to an NSS shader quality, honouring AISS_NSS_QUALITY.
 int NssQualityForDlss(int perfQualityValue);
+
+// Fast maths (FFX_ML_RESCALE_FLOAT) for new upscalers: the control file's value, else the launch environment.
+bool FastMathEnabled();
