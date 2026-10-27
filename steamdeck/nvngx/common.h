@@ -21,10 +21,12 @@ struct ProxyConfig
     float cameraNear;
     float cameraFar;
     float cameraFovY;       // radians
-    float exposure;         // 0 = use the game's pre-exposure when given, else 1
+    float exposure;         // AISS_EXPOSURE: > 0 forces NSS's exposure; 0 = auto exposure when the game asks DLSS for it, else 1
     bool  mlFeaturesForced; // AISS_LAYER=1: the Vulkan layer enabled int8/dot-product device features
     int   debugView;        // AISS_DEBUG_VIEW: -1 off, 0 = NSS's 4x4 grid of internal views, 1-16 = one view
     int   dumpFrame;        // AISS_DUMP_FRAME: evaluation index whose output is written to aiss_frame_<n>.ppm, -1 off
+    int   dumpInputsFrom;   // AISS_DUMP_INPUTS=first,count: raw colour/depth/MV/output per dispatch (aiss_in_*.raw), -1 off
+    int   dumpInputsCount;
     float jitterSign[2];    // AISS_JITTER_SIGN=x,y: multipliers on the jitter handed to NSS (convention debugging)
     float mvSign[2];        // AISS_MV_SIGN=x,y: multipliers on the motion vector scale (convention debugging)
     bool  fastMath;         // FFX_ML_RESCALE_FLOAT set at launch: fp32 requantisation in the ML graph (not bit exact)

@@ -47,6 +47,7 @@ UpscalerCreateInfo NgxCreateInfo(const NgxParams& p)
     info.displayHeight = p.U32(ngxp::OutHeight);
     info.hdr           = (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0;
     info.depthInverted = (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+    info.autoExposure  = (flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) != 0;
     info.nssQuality    = NssQualityForDlss(p.I32(ngxp::PerfQuality, NVSDK_NGX_PerfQuality_Value_MaxPerf));
     info.fastMath      = FastMathEnabled();
     if (!(flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes))

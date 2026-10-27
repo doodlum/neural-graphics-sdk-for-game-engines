@@ -39,6 +39,7 @@ struct UpscalerCreateInfo
     bool     depthInverted = false;
     int      nssQuality    = 2;  // FfxApiNssShaderQualityMode
     bool     fastMath      = false;  // fp32 requantisation in the ML graph: ~2% faster, not bit exact
+    bool     autoExposure  = false;  // the game asked DLSS for auto exposure: its colour is not pre-exposed
 };
 
 struct UpscalerDispatch
@@ -68,6 +69,8 @@ private:
     NssUpscaler() = default;
     bool Init(const VulkanDevice& device, const UpscalerCreateInfo& info);
     bool CreateDepthCopy();
+    bool CreateAutoExposure();
+    float AutoExposure(VkCommandBuffer cmd, const UpscalerImage& color, uint32_t width, uint32_t height);
     VkImageView CreateView(VkImage image, VkFormat format, VkImageAspectFlags aspect);
     uint32_t    FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags);
     void        RecordDump(VkCommandBuffer cmd, const UpscalerImage& output);
@@ -95,6 +98,33 @@ private:
     VkDescriptorSet m_sets[kRing]       = {};
     VkImageView     m_gameViews[kRing]  = {};
     uint64_t        m_dispatchCount     = 0;
+
+    // Auto exposure (DLSS AutoExposure flag): log-average luminance per dispatch into a host-visible ring, read back
+    // kExposureLatency dispatches later (the proxy cannot wait on the game's queue), smoothed over frames.
+    static constexpr uint32_t kExposureLatency = 6;
+    VkDescriptorSetLayout m_aeSetLayout   = VK_NULL_HANDLE;
+    VkPipelineLayout      m_aePipeLayout  = VK_NULL_HANDLE;
+    VkPipeline            m_aePipeline    = VK_NULL_HANDLE;
+    VkDescriptorPool      m_aePool        = VK_NULL_HANDLE;
+    VkDescriptorSet       m_aeSets[kRing] = {};
+    VkImageView           m_aeViews[kRing] = {};
+    VkBuffer              m_aeBuffer      = VK_NULL_HANDLE;
+    VkDeviceMemory        m_aeMemory      = VK_NULL_HANDLE;
+    float*                m_aeResults     = nullptr;  // kRing x {sum log2 lum, count, tag, 0}
+    float                 m_exposure      = 0.0f;     // 0 until the first readback
+
+    // AISS_DUMP_INPUTS: raw copies of the dispatch inputs and output, read back a few frames later.
+    struct RawDump
+    {
+        VkBuffer       buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        uint32_t       width = 0, height = 0, format = 0, bpp = 0;
+        uint64_t       readAt = 0;
+        char           name[64] = {};
+    };
+    std::vector<RawDump> m_rawDumps;
+    void RecordRaw(VkCommandBuffer cmd, const UpscalerImage& img, VkImageAspectFlags aspect, const char* name);
+    void WriteRawDumps(bool all);
 
     // AISS_DUMP_FRAME readback of one output frame.
     VkBuffer       m_dumpBuffer = VK_NULL_HANDLE;

@@ -13,6 +13,12 @@ add_custom_command(
     COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -mfmt=num -o "${SPV_INC}" "${CMAKE_CURRENT_SOURCE_DIR}/depth_copy.comp"
     DEPENDS depth_copy.comp
     COMMENT "Compiling depth_copy.comp")
+set(EXPOSURE_SPV_INC "${CMAKE_CURRENT_BINARY_DIR}/exposure.spv.inc")
+add_custom_command(
+    OUTPUT "${EXPOSURE_SPV_INC}"
+    COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -mfmt=num -o "${EXPOSURE_SPV_INC}" "${CMAKE_CURRENT_SOURCE_DIR}/exposure.comp"
+    DEPENDS exposure.comp
+    COMMENT "Compiling exposure.comp")
 
 add_library(nvngx SHARED
     common.cpp
@@ -23,7 +29,8 @@ add_library(nvngx SHARED
     ngx_d3d12.cpp
     ngx_vulkan.cpp
     ngx_misc.cpp
-    "${SPV_INC}")
+    "${SPV_INC}"
+    "${EXPOSURE_SPV_INC}")
 
 set_target_properties(nvngx PROPERTIES PREFIX "" OUTPUT_NAME nvngx)
 target_compile_features(nvngx PRIVATE cxx_std_17)

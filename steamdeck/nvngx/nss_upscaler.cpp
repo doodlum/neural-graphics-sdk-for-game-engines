@@ -16,6 +16,9 @@
 static const uint32_t kDepthCopySpirv[] = {
 #include "depth_copy.spv.inc"
 };
+static const uint32_t kExposureSpirv[] = {
+#include "exposure.spv.inc"
+};
 
 struct NssUpscaler::Fn
 {
@@ -166,6 +169,8 @@ bool NssUpscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& inf
 
     if (!CreateDepthCopy())
         return false;
+    if (info.autoExposure && Config().exposure <= 0.0f && !CreateAutoExposure())
+        LOGI("auto exposure unavailable; NSS runs with exposure 1");
 
     ffxCreateBackendVKDesc backend = {};
     backend.header.type            = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
@@ -205,9 +210,9 @@ bool NssUpscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& inf
         return false;
     }
     m_context = ctx;
-    LOGI("NSS context %ux%u -> %ux%u, quality %d, hdr %d, inverted depth %d, fast maths %d, ML features 0x%x",
+    LOGI("NSS context %ux%u -> %ux%u, quality %d, hdr %d, inverted depth %d, auto exposure %d, fast maths %d, ML features 0x%x",
          info.renderWidth, info.renderHeight, info.displayWidth, info.displayHeight, info.nssQuality, info.hdr,
-         info.depthInverted, info.fastMath, device.mlFeatures);
+         info.depthInverted, m_aePipeline != VK_NULL_HANDLE, info.fastMath, device.mlFeatures);
     return true;
 }
 
@@ -299,6 +304,165 @@ bool NssUpscaler::CreateDepthCopy()
     dsai.descriptorSetCount          = kRing;
     dsai.pSetLayouts                 = layouts;
     return fn.vkAllocateDescriptorSets(dev, &dsai, m_sets) == VK_SUCCESS && m_depthView != VK_NULL_HANDLE;
+}
+
+bool NssUpscaler::CreateAutoExposure()
+{
+    VkDevice dev = m_dev.device;
+    auto&    fn  = *m_fn;
+
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size               = sizeof(float) * 4 * kRing;
+    bci.usage              = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (fn.vkCreateBuffer(dev, &bci, nullptr, &m_aeBuffer) != VK_SUCCESS)
+        return false;
+    VkMemoryRequirements req;
+    fn.vkGetBufferMemoryRequirements(dev, m_aeBuffer, &req);
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize       = req.size;
+    mai.memoryTypeIndex      = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void* mapped             = nullptr;
+    if (mai.memoryTypeIndex == UINT32_MAX || fn.vkAllocateMemory(dev, &mai, nullptr, &m_aeMemory) != VK_SUCCESS ||
+        fn.vkBindBufferMemory(dev, m_aeBuffer, m_aeMemory, 0) != VK_SUCCESS || fn.vkMapMemory(dev, m_aeMemory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+        return false;
+    m_aeResults = static_cast<float*>(mapped);
+    memset(m_aeResults, 0, sizeof(float) * 4 * kRing);
+
+    VkDescriptorSetLayoutBinding bindings[2] = {};
+    bindings[0]                    = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, &m_sampler};
+    bindings[1]                    = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslci.bindingCount                    = 2;
+    dslci.pBindings                       = bindings;
+    if (fn.vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &m_aeSetLayout) != VK_SUCCESS)
+        return false;
+    VkPushConstantRange        pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pl  = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount              = 1;
+    pl.pSetLayouts                 = &m_aeSetLayout;
+    pl.pushConstantRangeCount      = 1;
+    pl.pPushConstantRanges         = &pcr;
+    if (fn.vkCreatePipelineLayout(dev, &pl, nullptr, &m_aePipeLayout) != VK_SUCCESS)
+        return false;
+    VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize                 = sizeof(kExposureSpirv);
+    smci.pCode                    = kExposureSpirv;
+    VkShaderModule module         = VK_NULL_HANDLE;
+    if (fn.vkCreateShaderModule(dev, &smci, nullptr, &module) != VK_SUCCESS)
+        return false;
+    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage.sType                 = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage                 = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module                = module;
+    cpci.stage.pName                 = "main";
+    cpci.layout                      = m_aePipeLayout;
+    const VkResult pr                = fn.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &m_aePipeline);
+    fn.vkDestroyShaderModule(dev, module, nullptr);
+    if (pr != VK_SUCCESS)
+    {
+        m_aePipeline = VK_NULL_HANDLE;
+        return false;
+    }
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kRing}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kRing}};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets                    = kRing;
+    dpci.poolSizeCount              = 2;
+    dpci.pPoolSizes                 = sizes;
+    if (fn.vkCreateDescriptorPool(dev, &dpci, nullptr, &m_aePool) != VK_SUCCESS)
+        return false;
+    VkDescriptorSetLayout layouts[kRing];
+    std::fill(layouts, layouts + kRing, m_aeSetLayout);
+    VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool              = m_aePool;
+    dsai.descriptorSetCount          = kRing;
+    dsai.pSetLayouts                 = layouts;
+    if (fn.vkAllocateDescriptorSets(dev, &dsai, m_aeSets) != VK_SUCCESS)
+    {
+        fn.vkDestroyPipeline(dev, m_aePipeline, nullptr);
+        m_aePipeline = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+// Records this dispatch's luminance measurement and returns the exposure to use now: 0.18 / geometric mean luminance
+// of a frame kExposureLatency dispatches ago, adapted smoothly (the value only feeds NSS's internal tonemap and its
+// inverse, so a slightly late exposure is harmless; it must just put the scene in the network's input range).
+float NssUpscaler::AutoExposure(VkCommandBuffer cmd, const UpscalerImage& color, uint32_t width, uint32_t height)
+{
+    auto&          fn   = *m_fn;
+    const uint64_t n    = m_dispatchCount;  // already incremented for this dispatch
+    const uint32_t slot = uint32_t(n % kRing);
+
+    // Read the measurement recorded kExposureLatency dispatches ago, if it carries the expected tag.
+    if (n > kExposureLatency)
+    {
+        const uint64_t want = n - kExposureLatency;
+        const float*   r    = m_aeResults + 4 * (want % kRing);
+        uint32_t       tag  = 0;
+        memcpy(&tag, &r[2], 4);
+        if (tag == uint32_t(want & 0xFFFFFFu) && r[1] > 0.0f)
+        {
+            const float geoMean = std::exp2(r[0] / r[1]);
+            const float target  = std::clamp(0.18f / std::max(geoMean, 1e-6f), 1.0f / 64.0f, 4096.0f);
+            // Adapt in log space, ~1/4 of the way per frame; jump on the first measurement.
+            m_exposure = m_exposure <= 0.0f ? target : std::exp2(std::log2(m_exposure) + 0.25f * (std::log2(target) - std::log2(m_exposure)));
+        }
+    }
+
+    // Measure this frame's colour.
+    VkImageLayout layout = color.layout;
+    VkImageMemoryBarrier toRead = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    const bool needsTransition  = !IsSampledLayout(layout);
+    if (needsTransition)
+    {
+        toRead.srcAccessMask       = VK_ACCESS_MEMORY_WRITE_BIT;
+        toRead.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+        toRead.oldLayout           = layout;
+        toRead.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
+        toRead.srcQueueFamilyIndex = toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toRead.image               = color.image;
+        toRead.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRead);
+        layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    if (m_aeViews[slot])
+        fn.vkDestroyImageView(m_dev.device, m_aeViews[slot], nullptr);
+    m_aeViews[slot] = CreateView(color.image, color.format, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkDescriptorImageInfo  imageInfo  = {VK_NULL_HANDLE, m_aeViews[slot], layout};
+    VkDescriptorBufferInfo bufferInfo = {m_aeBuffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet   writes[2]  = {};
+    writes[0].sType                   = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet                  = m_aeSets[slot];
+    writes[0].dstBinding              = 0;
+    writes[0].descriptorCount         = 1;
+    writes[0].descriptorType          = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo              = &imageInfo;
+    writes[1]                         = writes[0];
+    writes[1].dstBinding              = 1;
+    writes[1].descriptorType          = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].pImageInfo              = nullptr;
+    writes[1].pBufferInfo             = &bufferInfo;
+    fn.vkUpdateDescriptorSets(m_dev.device, 2, writes, 0, nullptr);
+
+    const uint32_t push[4] = {width, height, 4u, slot | uint32_t((n & 0xFFFFFFu) << 8)};
+    fn.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_aePipeline);
+    fn.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_aePipeLayout, 0, 1, &m_aeSets[slot], 0, nullptr);
+    fn.vkCmdPushConstants(cmd, m_aePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    fn.vkCmdDispatch(cmd, 1, 1, 1);
+
+    VkMemoryBarrier toHost = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    toHost.srcAccessMask   = VK_ACCESS_SHADER_WRITE_BIT;
+    toHost.dstAccessMask   = VK_ACCESS_HOST_READ_BIT;
+    fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0, nullptr);
+    if (needsTransition)
+    {
+        std::swap(toRead.oldLayout, toRead.newLayout);
+        toRead.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toRead.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toRead);
+    }
+    return m_exposure > 0.0f ? m_exposure : 1.0f;
 }
 
 uint32_t NssUpscaler::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags)
@@ -444,6 +608,8 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     toRead.dstAccessMask        = VK_ACCESS_SHADER_READ_BIT;
     toRead.oldLayout            = VK_IMAGE_LAYOUT_GENERAL;
     toRead.newLayout            = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const bool dumpInputs = Config().dumpInputsFrom >= 0 && m_dispatchCount > uint64_t(Config().dumpInputsFrom) &&
+                            m_dispatchCount <= uint64_t(Config().dumpInputsFrom + Config().dumpInputsCount);
     VkImageMemoryBarrier post[2] = {toRead, depthToRead};
     if (depthNeedsTransition)
     {
@@ -451,6 +617,29 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
         post[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
         post[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     }
+
+    if (dumpInputs)
+    {
+        // The R32F copy is in GENERAL until the barrier below.
+        fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        char name[64];
+        const uint64_t f = m_dispatchCount - 1;
+        snprintf(name, sizeof(name), "aiss_in_%03llu_color.raw", (unsigned long long)f);
+        RecordRaw(cmd, d.color, VK_IMAGE_ASPECT_COLOR_BIT, name);
+        snprintf(name, sizeof(name), "aiss_in_%03llu_mv.raw", (unsigned long long)f);
+        RecordRaw(cmd, d.motionVectors, VK_IMAGE_ASPECT_COLOR_BIT, name);
+        snprintf(name, sizeof(name), "aiss_in_%03llu_depth.raw", (unsigned long long)f);
+        RecordRaw(cmd, {m_depthImage, VK_FORMAT_R32_SFLOAT, renderW, renderH, VK_IMAGE_LAYOUT_GENERAL}, VK_IMAGE_ASPECT_COLOR_BIT, name);
+        LOGI("dump %llu: render %ux%u jitter %.4f,%.4f mv scale %.3f,%.3f reset %d dt %.2f, formats colour %d mv %d depth %d (%ux%u, %ux%u, %ux%u)",
+             (unsigned long long)f, renderW, renderH, d.jitterX, d.jitterY, d.mvScaleX, d.mvScaleY, d.reset, d.frameTimeMs,
+             d.color.format, d.motionVectors.format, d.depth.format, d.color.width, d.color.height, d.motionVectors.width,
+             d.motionVectors.height, d.depth.width, d.depth.height);
+    }
+
+    // ---- auto exposure (before the colour is moved to GENERAL for NSS) ----
+    float exposure = d.exposure;
+    if (m_aePipeline && Config().exposure <= 0.0f)
+        exposure = AutoExposure(cmd, d.color, renderW, renderH);
 
     // ---- NSS ----
     LayoutFix fix;
@@ -478,9 +667,11 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     nss.cameraNear             = Config().cameraNear;
     nss.cameraFar              = Config().cameraFar;
     nss.cameraFovAngleVertical = Config().cameraFovY;
-    nss.exposure               = d.exposure;
+    nss.exposure               = exposure;
     nss.frameTimeDelta         = d.frameTimeMs;
     nss.reset                  = d.reset || m_dispatchCount == 1;  // a fresh context has no history yet
+    if (LogLevel() >= 2 || (m_dispatchCount % 600) == 1)
+        LOGI("evaluate %llu: exposure %.3f%s", (unsigned long long)m_dispatchCount, exposure, m_aePipeline ? " (auto)" : "");
     if (Config().debugView >= 0)
     {
         nss.flags         = FFX_API_NSS_DISPATCH_FLAG_DRAW_DEBUG_VIEW;
@@ -501,6 +692,14 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     done.dstAccessMask   = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &done, 0,
                             nullptr, 0, nullptr);
+
+    if (dumpInputs)
+    {
+        char name[64];
+        snprintf(name, sizeof(name), "aiss_in_%03llu_output.raw", (unsigned long long)(m_dispatchCount - 1));
+        RecordRaw(cmd, d.output, VK_IMAGE_ASPECT_COLOR_BIT, name);
+    }
+    WriteRawDumps(false);
 
     if (Config().dumpFrame >= 0 && m_dispatchCount == uint64_t(Config().dumpFrame) + 1)
         RecordDump(cmd, d.output);
@@ -554,6 +753,105 @@ void NssUpscaler::RecordDump(VkCommandBuffer cmd, const UpscalerImage& output)
     fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     m_dumpImage = output;
     m_dumpAt    = m_dispatchCount + 16;  // read back once the frame has certainly retired
+}
+
+static uint32_t BytesPerPixel(VkFormat f)
+{
+    switch (f)
+    {
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32G32_SFLOAT:
+        return 8;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return 16;
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+        return 4;
+    case VK_FORMAT_R16_SFLOAT:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+void NssUpscaler::RecordRaw(VkCommandBuffer cmd, const UpscalerImage& img, VkImageAspectFlags aspect, const char* name)
+{
+    auto&          fn  = *m_fn;
+    const uint32_t bpp = BytesPerPixel(img.format);
+    if (!bpp)
+    {
+        LOGI("dump %s: format %d not supported", name, img.format);
+        return;
+    }
+    RawDump r;
+    r.width = img.width, r.height = img.height, r.format = img.format, r.bpp = bpp;
+    snprintf(r.name, sizeof(r.name), "%s", name);
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size               = VkDeviceSize(img.width) * img.height * bpp;
+    bci.usage              = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (fn.vkCreateBuffer(m_dev.device, &bci, nullptr, &r.buffer) != VK_SUCCESS)
+        return;
+    VkMemoryRequirements req;
+    fn.vkGetBufferMemoryRequirements(m_dev.device, r.buffer, &req);
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize       = req.size;
+    mai.memoryTypeIndex      = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX || fn.vkAllocateMemory(m_dev.device, &mai, nullptr, &r.memory) != VK_SUCCESS)
+        return;
+    fn.vkBindBufferMemory(m_dev.device, r.buffer, r.memory, 0);
+
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask        = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask        = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout            = img.layout;
+    b.newLayout            = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image                = img.image;
+    b.subresourceRange     = {aspect, 0, 1, 0, 1};
+    fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkBufferImageCopy region = {};
+    region.imageSubresource  = {aspect, 0, 0, 1};
+    region.imageExtent       = {img.width, img.height, 1};
+    fn.vkCmdCopyImageToBuffer(cmd, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.buffer, 1, &region);
+    std::swap(b.oldLayout, b.newLayout);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    fn.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    r.readAt = m_dispatchCount + 16;  // retired by then
+    m_rawDumps.push_back(r);
+}
+
+void NssUpscaler::WriteRawDumps(bool all)
+{
+    auto& fn = *m_fn;
+    for (auto it = m_rawDumps.begin(); it != m_rawDumps.end();)
+    {
+        if (!all && m_dispatchCount < it->readAt)
+        {
+            ++it;
+            continue;
+        }
+        void* ptr = nullptr;
+        if (fn.vkMapMemory(m_dev.device, it->memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS)
+        {
+            if (FILE* f = fopen(it->name, "wb"))
+            {
+                const uint32_t header[5] = {0x52534941u /* 'AISR' */, it->width, it->height, it->format, it->bpp};
+                fwrite(header, 4, 5, f);
+                fwrite(ptr, 1, size_t(it->width) * it->height * it->bpp, f);
+                fclose(f);
+            }
+            fn.vkUnmapMemory(m_dev.device, it->memory);
+        }
+        fn.vkDestroyBuffer(m_dev.device, it->buffer, nullptr);
+        fn.vkFreeMemory(m_dev.device, it->memory, nullptr);
+        it = m_rawDumps.erase(it);
+    }
 }
 
 static float HalfToFloat(uint16_t h)
@@ -639,6 +937,21 @@ NssUpscaler::~NssUpscaler()
     for (VkImageView v : m_gameViews)
         if (v)
             fn.vkDestroyImageView(dev, v, nullptr);
+    for (VkImageView v : m_aeViews)
+        if (v)
+            fn.vkDestroyImageView(dev, v, nullptr);
+    if (m_aePool)
+        fn.vkDestroyDescriptorPool(dev, m_aePool, nullptr);
+    if (m_aePipeline)
+        fn.vkDestroyPipeline(dev, m_aePipeline, nullptr);
+    if (m_aePipeLayout)
+        fn.vkDestroyPipelineLayout(dev, m_aePipeLayout, nullptr);
+    if (m_aeSetLayout)
+        fn.vkDestroyDescriptorSetLayout(dev, m_aeSetLayout, nullptr);
+    if (m_aeMemory)
+        fn.vkFreeMemory(dev, m_aeMemory, nullptr);
+    if (m_aeBuffer)
+        fn.vkDestroyBuffer(dev, m_aeBuffer, nullptr);
     if (m_pool)
         fn.vkDestroyDescriptorPool(dev, m_pool, nullptr);
     if (m_pipeline)

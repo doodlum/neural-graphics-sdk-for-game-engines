@@ -78,6 +78,10 @@ const ProxyConfig& Config()
         c.mlFeaturesForced = EnvInt("AISS_LAYER", 0) != 0;
         c.debugView        = EnvInt("AISS_DEBUG_VIEW", -1);
         c.dumpFrame        = EnvInt("AISS_DUMP_FRAME", -1);
+        c.dumpInputsFrom   = -1;
+        c.dumpInputsCount  = 0;
+        if (const char* v = getenv("AISS_DUMP_INPUTS"))
+            sscanf(v, "%d,%d", &c.dumpInputsFrom, &c.dumpInputsCount);
         c.fastMath         = getenv("FFX_ML_RESCALE_FLOAT") != nullptr;
         auto pair = [](const char* name, float* out) {
             out[0] = out[1] = 1.0f;
