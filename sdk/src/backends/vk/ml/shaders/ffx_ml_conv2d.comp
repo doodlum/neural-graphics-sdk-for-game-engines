@@ -313,6 +313,22 @@ int EpilogueBiased(int acc, int oc)
 }
 #endif
 
+#if ML_DOT4_TILED
+// NOT BIT EXACT (spec constant SCALE_FLOAT, FFX_ML_RESCALE_FLOAT=1): fp32 requantisation round(acc * s + o) with the bias
+// and zero points folded into o (see the host). Same int8 weights and activations format; outputs can differ by one step.
+layout(constant_id = 62) const int SCALE_FLOAT = 0;
+
+int EpilogueFloat(int acc, int oc)
+{
+    const int base = 3 * OC_PARAM_STRIDE() + 64;
+    float     f    = fma(float(acc), intBitsToFloat(params[base + oc]), intBitsToFloat(params[base + OC_PARAM_STRIDE() + oc]));
+    int       v    = clamp(int(roundEven(f)), -128, 127);
+    if ((FLAGS & FLAG_TABLE) != 0)
+        v = TableLookup(v);
+    return v;
+}
+#endif
+
 uint PackResult(ivec4 v)
 {
     return (uint(v.x) & 0xFFu) | ((uint(v.y) & 0xFFu) << 8) | ((uint(v.z) & 0xFFu) << 16) | ((uint(v.w) & 0xFFu) << 24);
@@ -647,7 +663,7 @@ void main()
         [[unroll]] for (int j = 0; j < 4; ++j)
         {
             if (OC_FULL != 0 || oc + j < OUT_C)
-                r[j] = EpilogueBiased(fin[q * 4 + j] + params[oc + j], oc + j);
+                r[j] = SCALE_FLOAT != 0 ? EpilogueFloat(fin[q * 4 + j], oc + j) : EpilogueBiased(fin[q * 4 + j] + params[oc + j], oc + j);
         }
         dst[((oy * OUT_W + ox) * OUT_STRIDE + oc) >> 2] = PackResult(r);
     }

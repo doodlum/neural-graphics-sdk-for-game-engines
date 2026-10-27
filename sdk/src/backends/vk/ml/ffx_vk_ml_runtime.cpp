@@ -901,7 +901,8 @@ namespace ffx_ml
                 align(64);
                 layer.paramsOffset     = constants.size();
                 const uint32_t stride  = RoundUp(OC, 4);
-                std::vector<int32_t> p(size_t(stride) * 3 + 64, 0);
+                // + 2 * stride: float scale and offset per channel for the non-exact FFX_ML_RESCALE_FLOAT epilogue.
+                std::vector<int32_t> p(size_t(stride) * 5 + 64, 0);
                 for (uint32_t oc = 0; oc < OC; ++oc)
                 {
                     int64_t b = conv.bias[oc];
@@ -932,6 +933,17 @@ namespace ffx_ml
                 {
                     for (uint32_t i = 0; i < 256; ++i)
                         reinterpret_cast<uint8_t*>(&p[3 * stride])[i] = uint8_t(fc.table->table[i]);
+                }
+                // NOT BIT EXACT (FFX_ML_RESCALE_FLOAT=1): out = round(acc * s + o), s = multiplier / 2^shift and
+                // o = (bias - rescale_in_zp) * s + rescale_out_zp, acc without the bias.
+                for (uint32_t oc = 0; oc < OC; ++oc)
+                {
+                    const size_t  pi    = rs.perChannel ? oc : 0;
+                    const double  scale = double(rs.multiplier[pi]) / std::ldexp(1.0, rs.shift[pi]);
+                    const double  off   = (double(p[oc]) - double(rs.rescaleInZp)) * scale + double(rs.rescaleOutZp);
+                    const float   fs = float(scale), fo = float(off);
+                    memcpy(&p[3 * stride + 64 + oc], &fs, 4);
+                    memcpy(&p[4 * stride + 64 + oc], &fo, 4);
                 }
                 const size_t pBytes = p.size() * 4;
                 constants.resize(constants.size() + pBytes);
@@ -1003,6 +1015,7 @@ namespace ffx_ml
                     // Cheaper exact rescale when no shift needs the low product word (the NSS models: shifts 35..49).
                     const bool hiOnly = rs.scale32 && !rs.doubleRound && minShift >= 33 && maxShift <= 62 && !getenv("FFX_ML_NO_SCALE_HI_ONLY");
                     spec(58, hiOnly ? 1 : 0);
+                    spec(62, getenv("FFX_ML_RESCALE_FLOAT") ? 1 : 0);
                 }
                 if (coop)
                 {
