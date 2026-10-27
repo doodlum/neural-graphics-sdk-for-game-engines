@@ -1083,7 +1083,9 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
 #if NSS_DENSE2X_HOISTED_KPN
     const int32_t    kpn_words = kKpnChannels / 4;
     DenseKpnChannels kch       = MakeDenseKpnChannels(int32_t(lut.base_channel));
-    int32_t4         pix0      = (int32_t4(kpn_y0) * int32_t4(KpnDims().x) + int32_t4(kpn_x0)) * int32_t4(kpn_words);
+    // (y * kpn_w + x) * 9 as y * (kpn_w * 9) + x * 9: the row and column parts are shared by the 3x3 block.
+    int32_t          kpn_row   = KpnDims().x * kpn_words;
+    int32_t4         pix0      = int32_t4(kpn_y0) * int32_t4(kpn_row) + int32_t4(kpn_x0) * int32_t4(kpn_words);
     int32_t4         q0        = int32_t4(NSS_DENSE_KPN_Q(pix0.x, 0, kch), NSS_DENSE_KPN_Q(pix0.y, 2, kch), NSS_DENSE_KPN_Q(pix0.z, 4, kch), NSS_DENSE_KPN_Q(pix0.w, 12, kch));
     half4            w0        = half4(max(float4(Dequantize(half4(q0), kKpnQuant)), float4(float(EPS))));
 #else
@@ -1110,7 +1112,7 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     f16mat4x4 taps1;
     NSS_LOAD_TAPS_4(tap_x1, tap_y1, taps1);
 #if NSS_DENSE2X_HOISTED_KPN
-    int32_t4 pix1 = (int32_t4(kpn_y1) * int32_t4(KpnDims().x) + int32_t4(kpn_x1)) * int32_t4(kpn_words);
+    int32_t4 pix1 = int32_t4(kpn_y1) * int32_t4(kpn_row) + int32_t4(kpn_x1) * int32_t4(kpn_words);
     int32_t4 q1   = int32_t4(NSS_DENSE_KPN_Q(pix1.x, 14, kch), NSS_DENSE_KPN_Q(pix1.y, 16, kch), NSS_DENSE_KPN_Q(pix1.z, 24, kch), NSS_DENSE_KPN_Q(pix1.w, 26, kch));
     half4    w1   = half4(max(float4(Dequantize(half4(q1), kKpnQuant)), float4(float(EPS))));
 #else
@@ -1139,7 +1141,7 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
 #endif
     half4 tap2_col = LoadColourTap4(lr_tap2);
 #if NSS_DENSE2X_HOISTED_KPN
-    int32_t pix2   = (kpn_tap2.y * KpnDims().x + kpn_tap2.x) * kpn_words;
+    int32_t pix2   = kpn_tap2.y * kpn_row + kpn_tap2.x * kpn_words;
     half    tap2_w = half(max(float(Dequantize(half(NSS_DENSE_KPN_Q(pix2, 28, kch)), kKpnQuant)), float(EPS)));
 #else
     half  tap2_w   = SampleKpnWeight(int32_t(lut.base_channel + kTapCh2), kpn_tap2);
