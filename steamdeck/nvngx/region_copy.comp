@@ -1,0 +1,17 @@
+#version 450
+// Copies the top-left (size) region of a game input into an image of exactly that size, so NSS's UV-based reads
+// (InvInputDims = 1 / renderSize) address the same texels as its texelFetch reads. Compiled once per output format
+// (OUT_FORMAT: rgba16f, rgba32f, r11f_g11f_b10f, rgba8, rgb10_a2, rg16f, rg32f).
+// SPDX-License-Identifier: MIT
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D u_src;
+layout(binding = 1, OUT_FORMAT) uniform writeonly image2D u_out;
+layout(push_constant) uniform Push { ivec2 size; ivec2 offset; } pc;
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size)))
+        return;
+    imageStore(u_out, p, texelFetch(u_src, p + pc.offset, 0));
+}

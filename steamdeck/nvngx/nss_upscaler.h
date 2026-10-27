@@ -83,20 +83,47 @@ private:
     UpscalerCreateInfo m_info;
     void*              m_context = nullptr;  // ffxContext
 
-    // R32F copy of the game's depth: NSS reads depth through a colour view.
-    VkImage               m_depthImage  = VK_NULL_HANDLE;
-    VkDeviceMemory        m_depthMemory = VK_NULL_HANDLE;
-    VkImageView           m_depthView   = VK_NULL_HANDLE;
+    // Images the proxy owns and hands to NSS instead of a game input, each exactly the dispatch's render size: NSS
+    // samples its inputs with UVs from 1 / renderSize, so a texture larger than the render size would be read
+    // stretched. Depth always goes through one (R32F: NSS reads depth through a colour view); colour and motion
+    // vectors only when the game's texture extent differs from the render size. Cached by kind, format and size so
+    // dynamic resolution does not reallocate every frame; an entry is destroyed only once it has gone unused for
+    // kRetireAfter dispatches (the proxy cannot wait on the game's queue, so that is when no frame in flight can
+    // still read it).
+    enum OwnedKind : uint32_t { kOwnedDepth, kOwnedColor, kOwnedMotion, kOwnedKinds };
+    struct OwnedImage
+    {
+        VkImage        image   = VK_NULL_HANDLE;
+        VkDeviceMemory memory  = VK_NULL_HANDLE;
+        VkImageView    view    = VK_NULL_HANDLE;
+        uint32_t       kind    = 0, width = 0, height = 0;
+        VkFormat       format  = VK_FORMAT_UNDEFINED;
+        uint64_t       lastUse = 0;  // m_dispatchCount of the last dispatch that used it
+    };
+    static constexpr uint64_t kRetireAfter   = 16;
+    static constexpr uint32_t kOwnedPerKind  = 4;  // retired entries beyond this many per kind are destroyed
+    std::vector<OwnedImage> m_owned;
+    bool                    m_loggedCopy[2] = {};  // colour / motion copy state last logged
+    VkFormat          CopyFormat(VkFormat game, VkFormat fallback) const;
+    const OwnedImage* AcquireOwned(uint32_t kind, VkFormat format, uint32_t width, uint32_t height);
+    void              DestroyOwned(const OwnedImage& img);
+    void              RecordCopy(VkCommandBuffer cmd, uint32_t setIndex, VkPipeline pipeline, VkImage src, VkFormat srcFormat,
+                                 VkImageAspectFlags aspect, VkImageLayout srcLayout, VkImageView dst, uint32_t width,
+                                 uint32_t height, int32_t offsetX, int32_t offsetY);
     VkSampler             m_sampler     = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_setLayout   = VK_NULL_HANDLE;
     VkPipelineLayout      m_pipeLayout  = VK_NULL_HANDLE;
-    VkPipeline            m_pipeline    = VK_NULL_HANDLE;
+    VkPipeline            m_pipeline    = VK_NULL_HANDLE;  // depth -> R32F
+    static constexpr uint32_t kCopyFormats = 7;  // region_copy.comp variants, see kRegionCopies
+    VkPipeline            m_copyPipelines[kCopyFormats] = {};
+    bool                  m_copyStorage[kCopyFormats]   = {};  // the device supports storage writes to that format
     VkDescriptorPool      m_pool        = VK_NULL_HANDLE;
 
     // Per-dispatch views of game images, recycled once the ring wraps (frames in flight are far fewer).
     static constexpr uint32_t kRing = 8;
-    VkDescriptorSet m_sets[kRing]       = {};
-    VkImageView     m_gameViews[kRing]  = {};
+    // kOwnedKinds sets and views per slot: one per copy (depth, colour, motion vectors).
+    VkDescriptorSet m_sets[kRing * kOwnedKinds]      = {};
+    VkImageView     m_gameViews[kRing * kOwnedKinds] = {};
     uint64_t        m_dispatchCount     = 0;
 
     // Auto exposure (DLSS AutoExposure flag): log-average luminance per dispatch into a host-visible ring, read back

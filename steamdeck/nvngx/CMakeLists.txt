@@ -20,6 +20,18 @@ add_custom_command(
     DEPENDS exposure.comp
     COMMENT "Compiling exposure.comp")
 
+# Region copy for colour / motion vectors whose texture is larger than the render size, one variant per output format.
+set(REGION_COPY_INCS "")
+foreach(fmt rgba16f rgba32f r11f_g11f_b10f rgba8 rgb10_a2 rg16f rg32f)
+    set(inc "${CMAKE_CURRENT_BINARY_DIR}/region_copy_${fmt}.spv.inc")
+    add_custom_command(
+        OUTPUT "${inc}"
+        COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -mfmt=num -DOUT_FORMAT=${fmt} -o "${inc}" "${CMAKE_CURRENT_SOURCE_DIR}/region_copy.comp"
+        DEPENDS region_copy.comp
+        COMMENT "Compiling region_copy.comp (${fmt})")
+    list(APPEND REGION_COPY_INCS "${inc}")
+endforeach()
+
 add_library(nvngx SHARED
     common.cpp
     params.cpp
@@ -30,7 +42,8 @@ add_library(nvngx SHARED
     ngx_vulkan.cpp
     ngx_misc.cpp
     "${SPV_INC}"
-    "${EXPOSURE_SPV_INC}")
+    "${EXPOSURE_SPV_INC}"
+    ${REGION_COPY_INCS})
 
 set_target_properties(nvngx PROPERTIES PREFIX "" OUTPUT_NAME nvngx)
 target_compile_features(nvngx PRIVATE cxx_std_17)

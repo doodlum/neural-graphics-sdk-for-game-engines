@@ -126,6 +126,7 @@ clang-cl, under Proton Experimental:
 - **D3D12** (with and without the Vulkan layer): DLSS reported supported. NSS runs inline on vkd3d-proton; the output, the debug view (depth, motion vectors, disocclusion) and the exit are clean. The layer hides its emulated NVIDIA extensions from DXVK and vkd3d-proton, which would otherwise switch on Reflex/CUDA interop paths that nothing implements.
 - **Vulkan** (`-vk`): DLSS reported supported; output frame verified with `AISS_DUMP_FRAME`; clean exit.
 - **D3D11**: the sample's D3D11 path needs `fxc`, so `steamdeck/tests/ngx_d3d11_test` drives the NGX D3D11 API on DXVK instead (64 evaluations, upscaled output within 0.009 mean error of the reference).
+- **Inputs larger than the render size** (e.g. Galactic Racer: 428x268 colour for a 427x267 render): NSS samples colour and motion vectors with UVs from the render size, so the proxy copies the render-size region of an oversized input into an exact-size image of the same format first (depth always goes through such a copy). `ngx_d3d11_test --pad N` pads the inputs with junk and must match the unpadded run bit for bit; `--replay DIR [--crop]` replays a capture or `AISS_DUMP_INPUTS` dump, as dumped or cropped to the render size.
 
 The sample's `SLWrapper::UpdateFeatureAvailable` reads a LUID through a pointer to a variable whose scope has ended.
 MSVC builds happen to work; an optimised clang build makes Streamline see LUID 0 and report DLSS as unsupported.
@@ -135,4 +136,5 @@ Building that one file without optimisation keeps the original source unchanged.
 
 - DLSS Super Resolution only. Ray Reconstruction and Frame Generation report "not supported", and games fall back.
 - Colour/output subrect offsets are ignored, and display-resolution motion vectors are not supported (both logged).
+- No dynamic resolution: NSS requires every dispatch's render size to equal the size the context was created with, so a smaller render subrect fails the dispatch.
 - Online games with anti-cheat may object to the extra DLLs; don't use it there.
