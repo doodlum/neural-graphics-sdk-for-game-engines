@@ -370,3 +370,35 @@ What did not work (measured, reverted):
 Floors at 640x400: the preprocess moves ~61 B per LR pixel (~15.6 MB per frame, ~0.25 ms at ~63 GB/s); the graph's
 large layers run at ~75% of the int8 dot4 peak; the postprocess is down to ~466 VALU per pixel, most of it the
 moments/history/tonemap math that must stay as written.
+
+### Non-exact experiment (QUALITY, Steam Deck): what dropping bit exactness buys
+
+Everything here is opt-in and off by default (the replay suite stays ALL IDENTICAL and `ffx_ml_runtime_test` EXACT
+with the switches unset). Switches: `--fp16` in the harness / `FFX_API_NSS_CONTEXT_FLAG_ALLOW_16BIT` in the API (fp16
+shader permutations for every NSS pass), `FFX_NSS_FP16_PASSES=pre,post,...` (fp16 permutation per pass) and
+`FFX_ML_RESCALE_FLOAT=1` (graph requantisation as `round(acc * s + o)` in fp32 instead of the exact 64-bit TOSA
+rescale; same int8 weights). Error is measured with `ffx_nss_replay_test --compare DIR` against the exact output: RGB
+of the RGBA16F output, PSNR with peak 1 (SDR) or the reference maximum (~36, HDR). The 64-frame runs use exact
+64-frame baselines; frame 16 of the 64-frame sequence differs from the 16-frame suite sequence (resets move).
+
+Time saved (interleaved A/B, 1500 frames; negative = faster) and error (SDR / HDR PSNR):
+
+| Candidate | 640x400 total | 853x533 total | SDR frame 16 / 64 | HDR frame 16 / 64 | SDR mean abs diff @64 |
+| --- | --- | --- | --- | --- | --- |
+| fp16 everywhere (`--fp16`) | **+88 us** (post +90, pre -11) | +30 us (post +205, pre -39) | 45.8 / 45.1 dB (640), 47.5 / 46.8 (853) | 59.6 / 59.1, 61.2 / 60.5 | 0.0037 / 0.0028 |
+| fp16 preprocess only | -11 us (pass), total in noise | -22 us (pass), total in noise | - / 49.5 dB, - / 50.5 | - / 60.5, - / 61.1 | 0.0020 / 0.0017 |
+| fp16 postprocess only | slower (see first row) | slower | - / 45.2 dB, - / 47.0 | - / 59.4, - / 60.7 | 0.0036 / 0.0028 |
+| fp32 requantisation (`FFX_ML_RESCALE_FLOAT`) | **-40 us** (graph -36) | **-96 us** (graph -83) | 50.5 / 49.8 dB, 51.6 / 50.6 | 61.1 / 60.5, 61.9 / 61.2 | 0.0019 / 0.0016 |
+| fp32 requant + fp16 preprocess | ~-30 us | -105 us | 50.2 / 49.7 dB, 50.8 / 50.4 | 60.4 / 60.8, 61.4 / 61.1 | 0.0019 / 0.0017 |
+
+In the 16-frame suite (same sequence as the exact gate) fp32 requantisation gives 56.4 / 57.1 dB SDR at frame 16
+(640x400 / 853x533); it changes 1.4% of the graph's int8 outputs, by up to 11 steps after propagation. The SDR mean abs
+error of ~0.002 is about half an 8-bit step; maxima are isolated pixels (0.05-0.9 in SDR).
+
+Why fp16 does not pay here: the stock fp16 postprocess has more VALU than the exact fp32 one (520 vs 466): texel
+fetches return fp32 and are converted, the dequantisation is written in fp32 and converted, and integer KPN addressing
+picks up quarter-rate `v_mul_lo_u32`; the packed `v_pk_fma_f16` savings are smaller than that. A hand-written packed
+filter would save at most ~6 of ~9 accumulate ops per tap (~30 us at 640x400) at a similar error.
+
+Recommendation: keep exact. The only consistent win is fp32 requantisation, 1.6% (640x400) / 2.4% (853x533) of the
+frame for ~50 dB PSNR after 64 frames; with temporal feedback any perturbation settles around that level.
