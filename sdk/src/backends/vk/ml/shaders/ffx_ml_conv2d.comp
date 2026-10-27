@@ -290,6 +290,26 @@ int Epilogue(int acc, int oc)
     return v;
 }
 
+#if ML_DOT4_TILED
+// Epilogue of the tiled kernel. With SCALE_HI_ONLY the output zero point is folded into the
+// rounding constant: ((hi + r) >> k) + zp == (hi + r + (zp << k)) >> k for an arithmetic shift (|hi| < 2^30 and the
+// constant < 2^25, no overflow), a per-channel uniform value.
+int EpilogueBiased(int acc, int oc)
+{
+    if (SCALE_HI_ONLY == 0)
+        return Epilogue(acc, oc);
+    int pIndex     = ((FLAGS & FLAG_PER_CHANNEL) != 0) ? oc : 0;
+    int multiplier = params[OC_PARAM_STRIDE() + pIndex];
+    int shift      = params[2 * OC_PARAM_STRIDE() + pIndex];
+    int hi, lo;
+    imulExtended(acc - RESCALE_IN_ZP, multiplier, hi, lo);
+    int v = clamp((hi + ((1 << (shift - 33)) + (RESCALE_OUT_ZP << (shift - 32)))) >> (shift - 32), -128, 127);
+    if ((FLAGS & FLAG_TABLE) != 0)
+        v = TableLookup(v);
+    return v;
+}
+#endif
+
 uint PackResult(ivec4 v)
 {
     return (uint(v.x) & 0xFFu) | ((uint(v.y) & 0xFFu) << 8) | ((uint(v.z) & 0xFFu) << 16) | ((uint(v.w) & 0xFFu) << 24);
@@ -619,7 +639,7 @@ void main()
         [[unroll]] for (int j = 0; j < 4; ++j)
         {
             if (oc + j < OUT_C)
-                r[j] = Epilogue(fin[q * 4 + j] + params[oc + j], oc + j);
+                r[j] = EpilogueBiased(fin[q * 4 + j] + params[oc + j], oc + j);
         }
         dst[((oy * OUT_W + ox) * OUT_STRIDE + oc) >> 2] = PackResult(r);
     }
