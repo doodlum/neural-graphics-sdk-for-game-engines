@@ -5,6 +5,8 @@ Nothing here imports `decky`, so the module can be exercised standalone (see tes
 
 Per enabled game the plugin owns:
   * pfx/drive_c/windows/system32/_nvngx.dll        the NSS NGX core (a foreign file there is backed up and restored)
+  * pfx/drive_c/windows/system32/libxess.dll       Intel XeSS (unmodified Intel binary), loaded by the core when the
+                                                   XeSS upscaler is selected (same backup/restore rules)
   * <exe dir>/dbghelp.dll or <exe dir>/dxgi.dll   the loader shim (never overwrites a file that is not ours)
   * HKLM\\Software\\NVIDIA Corporation\\Global {41FCC608-...}=hex:01 in pfx/system.reg (only while the game is not
     running, with a one-time backup of system.reg)
@@ -35,8 +37,13 @@ BIN_FILES = {
     "dxgi": "dxgi.dll",
     "layer_so": "libVkLayer_aiss_ngx.so",
     "layer_json": "VkLayer_aiss_ngx.json",
+    "xess": "libxess.dll",                  # Intel XeSS SDK binary, redistributed unmodified
+    "xess_license": "libxess-LICENSE.txt",  # its licence (Intel Simplified Software License), shipped with it
 }
 CORE_DEST_NAME = "_nvngx.dll"
+XESS_DEST_NAME = "libxess.dll"
+# Files installed into each prefix's system32: (bundle key, file name, marker of any build of ours or None, state key).
+PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME, None, "xess"))
 CORE_BACKUP_SUFFIX = ".aiss-orig"
 REG_BACKUP_SUFFIX = ".aiss-bak"
 
@@ -71,7 +78,8 @@ WDO_ENV = "WINEDLLOVERRIDES"
 COMMAND = "%command%"
 
 DEFAULT_SETTINGS = {
-    "quality": 0,        # NSS model: 0 = full network (default), 2 = fast small network (more ghosting); applied live
+    "quality": 0,        # upscaler: 0 = NSS full network (default), 2 = NSS fast small network (more ghosting),
+                         # 3 = Intel XeSS; applied live
     "log": 1,            # AISS_LOG level; 1 is the core's default and is not written out
     "fast_math": 0,      # 1 = fp32 requantisation in the ML graph (~2% faster, not bit exact); applied live
 }
@@ -855,7 +863,7 @@ class AissCore:
                 return "ours"
         except OSError:
             return "foreign"
-        return "ours" if file_contains(path, marker) else "foreign"
+        return "ours" if marker and file_contains(path, marker) else "foreign"
 
     # ---- per-game status ------------------------------------------------------------------------------------------
 
@@ -882,8 +890,8 @@ class AissCore:
                 shim_ok = False
         core_ok = False
         if pfx:
-            core_ok = self._classify(pfx / "drive_c/windows/system32" / CORE_DEST_NAME, "core", None,
-                                     CORE_MARKER) == "current"
+            core_ok = all(self._classify(pfx / "drive_c/windows/system32" / name, key, gs.get(f"{sk}_hash"),
+                                         self._marker(key)) == "current" for key, name, _, sk in PREFIX_FILES)
         if conflicts:
             status = STATUS_CONFLICT
             view["message"] = "Existing file is not ours: " + ", ".join(conflicts)
@@ -954,36 +962,43 @@ class AissCore:
                 self.log.error(f"cannot remove {p}: {e}")
             files.pop(path, None)
 
+    @staticmethod
+    def _marker(key: str) -> bytes | None:
+        return CORE_MARKER if key == "core" else None
+
     def _install_core(self, gs: dict, pfx: Path) -> None:
-        dst = pfx / "drive_c/windows/system32" / CORE_DEST_NAME
-        c = self._classify(dst, "core", gs.get("core_hash"), CORE_MARKER)
-        if c != "current":
-            backup = dst.with_name(dst.name + CORE_BACKUP_SUFFIX)
-            if c != "missing" and not gs.get("core_hash") and not backup.exists():
-                # first time we take over this prefix: keep whatever was there, restored on uninstall
-                shutil.copy2(dst, backup)
-                gs["core_backup"] = str(backup)
-            atomic_copy(self.bundle_path("core"), dst)
-        gs["core_hash"] = self.bundle_hash("core")
-        gs["core_path"] = str(dst)
+        """_nvngx.dll and libxess.dll into the prefix's system32."""
+        for key, name, _, sk in PREFIX_FILES:
+            dst = pfx / "drive_c/windows/system32" / name
+            c = self._classify(dst, key, gs.get(f"{sk}_hash"), self._marker(key))
+            if c != "current":
+                backup = dst.with_name(dst.name + CORE_BACKUP_SUFFIX)
+                if c == "foreign" and not backup.exists():
+                    # first time we take over this file: keep whatever was there, restored on uninstall
+                    shutil.copy2(dst, backup)
+                    gs[f"{sk}_backup"] = str(backup)
+                atomic_copy(self.bundle_path(key), dst)
+            gs[f"{sk}_hash"] = self.bundle_hash(key)
+            gs[f"{sk}_path"] = str(dst)
 
     def _remove_core(self, gs: dict) -> list[str]:
         warnings = []
-        path = gs.get("core_path")
-        if not path:
-            return warnings
-        dst = Path(path)
-        c = self._classify(dst, "core", gs.get("core_hash"), CORE_MARKER)
-        if c in ("current", "ours"):
-            dst.unlink()
-        elif c == "foreign":
-            warnings.append(f"{dst} was replaced by something else; left in place")
-        backup = gs.get("core_backup")
-        if backup and Path(backup).exists() and not dst.exists():
-            os.replace(backup, dst)
-        gs.pop("core_path", None)
-        gs.pop("core_hash", None)
-        gs.pop("core_backup", None)
+        for key, _, _, sk in PREFIX_FILES:
+            path = gs.get(f"{sk}_path")
+            if not path:
+                continue
+            dst = Path(path)
+            c = self._classify(dst, key, gs.get(f"{sk}_hash"), self._marker(key))
+            if c in ("current", "ours"):
+                dst.unlink()
+            elif c == "foreign":
+                warnings.append(f"{dst} was replaced by something else; left in place")
+            backup = gs.get(f"{sk}_backup")
+            if backup and Path(backup).exists() and not dst.exists():
+                os.replace(backup, dst)
+            gs.pop(f"{sk}_path", None)
+            gs.pop(f"{sk}_hash", None)
+            gs.pop(f"{sk}_backup", None)
         return warnings
 
     def _apply_registry(self, appid: str, gs: dict, pfx: Path) -> None:
@@ -1121,10 +1136,11 @@ class AissCore:
         pfx = self.find_prefix(app["appid"], app["library"])
         if pfx is None:
             return False  # nothing more to do until the game has been launched once
-        if self._classify(pfx / "drive_c/windows/system32" / CORE_DEST_NAME, "core", gs.get("core_hash"),
-                          CORE_MARKER) != "current":
-            return True
-        return bool(gs.get("reg_pending")) or not gs.get("core_path")
+        for key, name, _, sk in PREFIX_FILES:
+            if self._classify(pfx / "drive_c/windows/system32" / name, key, gs.get(f"{sk}_hash"),
+                              self._marker(key)) != "current":
+                return True
+        return bool(gs.get("reg_pending")) or not all(gs.get(f"{sk}_path") for _, _, _, sk in PREFIX_FILES)
 
     def verify_all(self) -> list[dict]:
         """Repair enabled games (a game update can delete the shim, the prefix may exist by now, a newer plugin
@@ -1189,7 +1205,7 @@ class AissCore:
 
     def write_control(self) -> None:
         q = int(self.state["settings"].get("quality", 0))
-        if q not in (0, 1, 2):
+        if q not in (0, 1, 2, 3):
             q = 0
         fast = 1 if self.state["settings"].get("fast_math") else 0
         capture = int(self.state.get("capture_seq", 0))
@@ -1225,8 +1241,8 @@ class AissCore:
         s.pop("ratio", None)  # option removed; drop it from older state files
         if "quality" in settings:
             q = int(settings["quality"])
-            if q not in (-1, 0, 1, 2):
-                raise ValueError("quality must be 0, 1 or 2")
+            if q not in (-1, 0, 1, 2, 3):
+                raise ValueError("quality must be 0, 1, 2 (NSS) or 3 (XeSS)")
             s["quality"] = 0 if q == -1 else q
         if "log" in settings:
             lv = int(settings["log"])

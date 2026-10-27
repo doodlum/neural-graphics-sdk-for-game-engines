@@ -41,6 +41,13 @@ def bin_dir(tmp: Path) -> Path:
                 REPO / "build_win_loader/dxgi/dxgi.dll", REPO / "build_layer/libVkLayer_aiss_ngx.so",
                 REPO / "build_layer/VkLayer_aiss_ngx.json"):
         shutil.copy(src, d / src.name)
+    xess = REPO.parent / "third_party/xess/sdk"
+    if (xess / "bin/libxess.dll").is_file():
+        os.symlink(xess / "bin/libxess.dll", d / "libxess.dll")  # 78 MB: linked, not copied
+        shutil.copy(xess / "LICENSE.txt", d / "libxess-LICENSE.txt")
+    else:  # stand-ins: the tests only move the files around
+        (d / "libxess.dll").write_bytes(b"MZ stand-in for Intel libxess.dll")
+        (d / "libxess-LICENSE.txt").write_text("stand-in licence\n")
     return d
 
 
@@ -320,6 +327,9 @@ class FakeLibraryTests(unittest.TestCase):
             p = self.pfx(self.steam, a)
             self.assertEqual((p / "drive_c/windows/system32/_nvngx.dll").read_bytes(),
                              (self.bin / "nvngx.dll").read_bytes())
+            # XeSS (Intel's binary) goes next to the core, unmodified
+            self.assertEqual((p / "drive_c/windows/system32/libxess.dll").read_bytes(),
+                             (self.bin / "libxess.dll").read_bytes())
             self.assertTrue(reg_has_value((p / "system.reg").read_text(), REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
             self.assertEqual((p / "system.reg.aiss-bak").read_text(), REG_SAMPLE)
         self.assertTrue((self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll.aiss-orig").exists())
@@ -341,6 +351,24 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertEqual(after, self.before_pfx, "prefixes not restored")
         self.core.remove_layer()
         self.assertFalse((self.layer / "libVkLayer_aiss_ngx.so").exists())
+
+    def test_xess_dll_foreign_kept_and_old_install_repaired(self):
+        sys32 = self.pfx(self.steam, "1001") / "drive_c/windows/system32"
+        self.put(sys32 / "libxess.dll", b"MZ a game's own libxess")
+        self.assertEqual(self.core.install_game("1001")["status"], "installed")
+        self.assertEqual((sys32 / "libxess.dll").read_bytes(), (self.bin / "libxess.dll").read_bytes())
+        self.assertEqual((sys32 / "libxess.dll.aiss-orig").read_bytes(), b"MZ a game's own libxess")
+        # an install from before XeSS was bundled (no libxess.dll recorded) is repaired by verify_all
+        gs = self.core.state["games"]["1001"]
+        (sys32 / "libxess.dll").unlink()
+        gs.pop("xess_path")
+        gs.pop("xess_hash")
+        self.assertEqual(self.core.verify_all()[0]["status"], "installed")
+        self.assertTrue((sys32 / "libxess.dll").exists())
+        self.assertEqual(self.view("1001")["status"], "installed")
+        self.core.uninstall_game("1001")
+        self.assertEqual((sys32 / "libxess.dll").read_bytes(), b"MZ a game's own libxess")
+        self.assertFalse((sys32 / "_nvngx.dll").exists())
 
     def test_conflict_untouched(self):
         r = self.core.install_game("1003")
@@ -476,6 +504,10 @@ class FakeLibraryTests(unittest.TestCase):
         self.core.request_capture()
         self.core.set_settings({"quality": 2})
         self.assertEqual(control.read_text().strip(), "2 1 2")
+        # 3 selects XeSS
+        self.core.set_settings({"quality": 3})
+        self.assertEqual(control.read_text().strip(), "3 1 2")
+        self.core.set_settings({"quality": 2})
         self.assertIsNone(self.core.latest_capture())
         cap = self.core.captures_dir / "Game_20261027_120000"
         cap.mkdir(parents=True)

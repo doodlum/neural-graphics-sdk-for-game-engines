@@ -3,6 +3,8 @@
 // Usage (under Proton/Wine): ngx_d3d11_test.exe <path to nvngx.dll> [options]
 //   --pad N       colour and motion vector textures N pixels wider and taller than the render size (as some games
 //                 allocate them), with junk outside the render region; the output must match the unpadded run
+//   --dyn         dynamic resolution: the render subrect changes every 8 frames (textures stay at the maximum); the
+//                 output is checked against the scene at the final size (XeSS only: NSS needs a fixed render size)
 //   --save FILE   write the output (RGBA16F) to FILE
 //   --cmp FILE    compare the output with one written by --save
 //   --log FILE    print to FILE instead of stdout (Proton does not always pass a console through)
@@ -185,6 +187,7 @@ int main(int argc, char** argv)
     setvbuf(stdout, nullptr, _IONBF, 0);
     const char* dll = argc > 1 ? argv[1] : "nvngx.dll";
     unsigned    pad = 0;
+    bool        dyn = false;
     const char* saveFile = nullptr;
     const char* cmpFile  = nullptr;
     const char* replayDir = nullptr;
@@ -196,6 +199,7 @@ int main(int argc, char** argv)
     {
         const std::string a = argv[i];
         if (a == "--pad" && i + 1 < argc) pad = unsigned(atoi(argv[++i]));
+        else if (a == "--dyn") dyn = true;
         else if (a == "--save" && i + 1 < argc) saveFile = argv[++i];
         else if (a == "--cmp" && i + 1 < argc) cmpFile = argv[++i];
         else if (a == "--log" && i + 1 < argc) freopen(argv[++i], "w", stdout);
@@ -436,8 +440,25 @@ int main(int argc, char** argv)
     p->Set("MV.Scale.Y", 1.0f);
     const DWORD t0 = GetTickCount();
     const int frames = 64;
+    const unsigned dynSizes[][2] = {{rw, rh}, {rw * 7 / 8, rh * 7 / 8}, {rw * 3 / 4, rh * 3 / 4}, {rw * 7 / 8, rh * 7 / 8},
+                                    {rw * 13 / 16, rh * 13 / 16}};
+    unsigned curW = rw, curH = rh;
     for (int i = 0; i < frames; ++i)
     {
+        if (dyn)
+        {
+            const unsigned* sz = dynSizes[i / 8 < 4 ? i / 8 : 4];
+            if (sz[0] != curW || sz[1] != curH)
+            {
+                curW = sz[0], curH = sz[1];
+                fillInputs(curW, curH);
+                ctx->UpdateSubresource(color, 0, nullptr, colorData.data(), tw * 8, 0);
+                ctx->UpdateSubresource(mv, 0, nullptr, mvData.data(), tw * 4, 0);
+                printf("frame %d: render %ux%u\n", i, curW, curH);
+            }
+            p->Set("DLSS.Render.Subrect.Dimensions.Width", curW);
+            p->Set("DLSS.Render.Subrect.Dimensions.Height", curH);
+        }
         // Halton(2,3) jitter, as games use.
         auto halton = [](int i, int b) { float f = 1, r = 0; for (; i > 0; i /= b) { f /= b; r += f * (i % b); } return r; };
         p->Set("Jitter.Offset.X", halton(i + 1, 2) - 0.5f);

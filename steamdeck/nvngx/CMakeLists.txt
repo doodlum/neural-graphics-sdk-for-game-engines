@@ -6,6 +6,8 @@ project(aiss_nvngx CXX)
 set(NGSDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH "Neural graphics SDK checkout")
 set(NGSDK_LIBS "${NGSDK_ROOT}/bin" CACHE PATH "Directory holding libngsdk_windows_x64.a")
 find_program(GLSLC glslc REQUIRED)
+# Intel XeSS SDK: only its headers are used at build time; libxess.dll is loaded at runtime.
+set(XESS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/xess/sdk" CACHE PATH "Intel XeSS SDK (headers)")
 
 set(SPV_INC "${CMAKE_CURRENT_BINARY_DIR}/depth_copy.spv.inc")
 add_custom_command(
@@ -41,6 +43,8 @@ add_library(nvngx SHARED
     ngx_d3d12.cpp
     ngx_vulkan.cpp
     ngx_misc.cpp
+    xess_upscaler.cpp
+    gpu_timing.cpp
     "${SPV_INC}"
     "${EXPOSURE_SPV_INC}"
     ${REGION_COPY_INCS})
@@ -53,7 +57,8 @@ target_include_directories(nvngx PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}"
     "${NGSDK_ROOT}/ffx-api/include"
     "${NGSDK_ROOT}/sdk/include"
-    "${NGSDK_ROOT}/sdk/include/vulkan-headers")
+    "${NGSDK_ROOT}/sdk/include/vulkan-headers"
+    "${XESS_SDK}/inc")
 target_link_libraries(nvngx PRIVATE
     "${NGSDK_LIBS}/libngsdk_windows_x64.a"
     "${NGSDK_LIBS}/ffx_sdk/windows_x64/libffx_nss_windows_x64.a"

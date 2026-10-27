@@ -277,7 +277,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext*, 
         return NVSDK_NGX_Result_FAIL_NotInitialized;
 
     Registry().CollectGarbage();
-    auto upscaler = NssUpscaler::Create(g_vk, NgxCreateInfo(*NgxParams::From(params)));
+    auto upscaler = CreateUpscaler(g_vk, NgxCreateInfo(*NgxParams::From(params)));
     if (!upscaler)
         return NVSDK_NGX_Result_FAIL_PlatformError;
     *outHandle = NgxNewHandle(Registry().Add(std::move(upscaler)));
@@ -299,7 +299,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext*
 {
     if (!context || !handle || !params)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
-    NssUpscaler* upscaler = Registry().Get(handle->Id);
+    Upscaler* upscaler = Registry().Get(handle->Id);
     if (upscaler)
         upscaler = NgxApplyLiveSettings(handle->Id, upscaler);
     if (!upscaler || !g_interop || !g_submitter)
@@ -320,7 +320,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext*
     // Everything the game recorded so far reaches the queue first; the upscale follows on the same queue.
     g_interop->FlushRenderingCommands();
     VkCommandBuffer cmd = g_submitter->Begin();
-    const bool      ok  = upscaler->Dispatch(cmd, d);
+    const bool      ok  = NgxDispatch(upscaler, cmd, d);
     g_interop->LockSubmissionQueue();
     const VkResult res = g_submitter->Submit();
     g_interop->ReleaseSubmissionQueue();

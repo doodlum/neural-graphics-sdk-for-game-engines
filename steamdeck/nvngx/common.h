@@ -31,13 +31,19 @@ struct ProxyConfig
     float jitterSign[2];    // AISS_JITTER_SIGN=x,y: multipliers on the jitter handed to NSS (convention debugging)
     float mvSign[2];        // AISS_MV_SIGN=x,y: multipliers on the motion vector scale (convention debugging)
     bool  fastMath;         // FFX_ML_RESCALE_FLOAT set at launch: fp32 requantisation in the ML graph (not bit exact)
+    bool  xess;             // AISS_UPSCALER=xess: Intel XeSS (libxess.dll next to the proxy) instead of NSS
+    int   xessQuality;      // AISS_XESS_QUALITY: xess_quality_settings_t (100-105), 0 = from the render scale
+    int   gpuTiming;        // AISS_GPU_TIMING=N: log the GPU time of the upscale, averaged over N evaluations
 };
 
 const ProxyConfig& Config();
 
-// NSS shader quality requested at runtime through the control file named by AISS_CONTROL (a Linux path, written by
-// the Decky plugin): 0, 1 or 2, or -1 when there is no file or no valid value. Re-read at most twice a second.
+// Upscaler requested at runtime through the control file named by AISS_CONTROL (a Linux path, written by the Decky
+// plugin). Its first value is 0, 1 or 2 for NSS at that shader quality, or 3 for XeSS. Re-read at most twice a second.
+// LiveNssQuality: the NSS quality, -1 when there is no file, no valid value or XeSS is selected.
 int LiveNssQuality();
+// LiveXess: 1 when the control file selects XeSS, 0 when it selects NSS, -1 when it selects nothing.
+int LiveXess();
 // Optional second value of the control file: 1 = fast maths (fp32 requantisation, ~2% faster, not bit exact), 0 = exact,
 // -1 when absent.
 int LiveFastMath();

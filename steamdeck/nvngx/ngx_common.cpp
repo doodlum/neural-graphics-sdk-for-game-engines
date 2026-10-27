@@ -3,7 +3,9 @@
 
 #include "common.h"
 
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 NVSDK_NGX_Result NgxGetParameters(NVSDK_NGX_Parameter** out)
 {
@@ -50,8 +52,11 @@ UpscalerCreateInfo NgxCreateInfo(const NgxParams& p)
     info.autoExposure  = (flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) != 0;
     info.nssQuality    = NssQualityForDlss(p.I32(ngxp::PerfQuality, NVSDK_NGX_PerfQuality_Value_MaxPerf));
     info.fastMath      = FastMathEnabled();
+    info.highResMv     = !(flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes);
+    info.backend       = SelectedBackend();
     if (!(flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes))
-        LOGI("warning: game passes display-resolution motion vectors (MVLowRes not set); NSS expects render resolution");
+        LOGI("warning: game passes display-resolution motion vectors (MVLowRes not set); NSS expects render resolution, "
+             "XeSS takes them as high-res motion vectors");
     LOGI("DLSS create: %ux%u -> %ux%u, flags 0x%x, perf quality %d", info.renderWidth, info.renderHeight,
          info.displayWidth, info.displayHeight, flags, p.I32(ngxp::PerfQuality));
     return info;
@@ -112,26 +117,47 @@ void NgxFreeHandle(NVSDK_NGX_Handle* handle)
     delete handle;
 }
 
-NssUpscaler* NgxApplyLiveSettings(unsigned int id, NssUpscaler* current)
+int SelectedBackend()
+{
+    const int live = LiveXess();
+    const bool xess = live >= 0 ? live == 1 : Config().xess;
+    return xess && !XessUnavailable() ? kBackendXess : kBackendNss;
+}
+
+static const char* Describe(const UpscalerCreateInfo& i)
+{
+    static thread_local char text[64];
+    if (i.backend == kBackendXess)
+        snprintf(text, sizeof(text), "XeSS");
+    else
+        snprintf(text, sizeof(text), "NSS quality %d%s", i.nssQuality, i.fastMath ? " fast maths" : "");
+    return text;
+}
+
+Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current)
 {
     const UpscalerCreateInfo& old  = current->Info();
-    const int                 live = LiveNssQuality();
     UpscalerCreateInfo        info = old;
-    if (live >= 0)
-        info.nssQuality = live;
-    info.fastMath = FastMathEnabled();
-    if (info.nssQuality == old.nssQuality && info.fastMath == old.fastMath)
+    info.backend                   = SelectedBackend();
+    if (info.backend == kBackendNss)
+    {
+        const int live = LiveNssQuality();
+        if (live >= 0)
+            info.nssQuality = live;
+        info.fastMath = FastMathEnabled();
+    }
+    if (info.backend == old.backend &&
+        (info.backend == kBackendXess || (info.nssQuality == old.nssQuality && info.fastMath == old.fastMath)))
         return current;
-    auto fresh = NssUpscaler::Create(current->Device(), info);
+    const std::string from = Describe(old);
+    auto fresh = CreateUpscaler(current->Device(), info);
     if (!fresh)
     {
-        LOGI("switch to quality %d, fast maths %d failed; keeping quality %d, fast maths %d", info.nssQuality,
-             info.fastMath, old.nssQuality, old.fastMath);
+        LOGI("switch from %s to %s failed; keeping it", from.c_str(), Describe(info));
         return current;
     }
-    LOGI("model switched at runtime: quality %d -> %d, fast maths %d -> %d", old.nssQuality, info.nssQuality,
-         old.fastMath, info.fastMath);
+    LOGI("upscaler switched at runtime: %s -> %s", from.c_str(), Describe(fresh->Info()));
     Registry().CollectGarbage();
-    NssUpscaler* swapped = Registry().Replace(id, std::move(fresh));
+    Upscaler* swapped = Registry().Replace(id, std::move(fresh));
     return swapped ? swapped : current;
 }

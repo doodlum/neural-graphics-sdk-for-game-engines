@@ -19,6 +19,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 NVNGX_DLL="${NVNGX_DLL:-$REPO/build_win_nvngx/nvngx.dll}"
 LOADER_DIR="${LOADER_DIR:-$REPO/build_win_loader}"
 LAYER_DIR="${LAYER_DIR:-$REPO/build_layer}"
+XESS_SDK="${XESS_SDK:-$REPO/../third_party/xess/sdk}"  # Intel XeSS SDK: libxess.dll + LICENSE.txt, shipped unmodified
 DISTROBOX="${DISTROBOX:-aissbuild}"
 NAME="aiss-dlss-nss"
 
@@ -30,8 +31,12 @@ for f in "$NVNGX_DLL" "$LOADER_DIR/dbghelp/dbghelp.dll" "$LOADER_DIR/dxgi/dxgi.d
     install -m 0755 "$f" "$HERE/bin/"
 done
 chmod 0644 "$HERE/bin/VkLayer_aiss_ngx.json"
+[ -f "$XESS_SDK/bin/libxess.dll" ] && [ -f "$XESS_SDK/LICENSE.txt" ] || { echo "missing XeSS SDK at $XESS_SDK" >&2; exit 1; }
+install -m 0644 "$XESS_SDK/bin/libxess.dll" "$HERE/bin/libxess.dll"
+install -m 0644 "$XESS_SDK/LICENSE.txt" "$HERE/bin/libxess-LICENSE.txt"
 echo "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$REPO" diff --quiet 2>/dev/null || echo -dirty) built $(date -u +%Y-%m-%dT%H:%MZ)" > "$HERE/bin/VERSION"
-(cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_aiss_ngx.so VkLayer_aiss_ngx.json > SHA256SUMS)
+(cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_aiss_ngx.so VkLayer_aiss_ngx.json libxess.dll \
+    libxess-LICENSE.txt > SHA256SUMS)
 
 if [ "${SKIP_FRONTEND:-0}" != 1 ]; then
     echo "== frontend"

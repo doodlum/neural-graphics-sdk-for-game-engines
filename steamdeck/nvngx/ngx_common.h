@@ -19,9 +19,15 @@ void NgxFillDispatch(const NgxParams& p, const UpscalerCreateInfo& info, Upscale
 
 NVSDK_NGX_Result NgxFeatureRequirement(NVSDK_NGX_Feature feature, NVSDK_NGX_FeatureRequirement* out);
 
-// Rebuilds the handle's upscaler when the NSS quality asked for at runtime (control file) differs from the one it
-// was created with; returns the upscaler to dispatch.
-NssUpscaler* NgxApplyLiveSettings(unsigned int id, NssUpscaler* current);
+// Rebuilds the handle's upscaler when the upscaler or NSS quality asked for at runtime (control file) differs from the
+// one it was created with; returns the upscaler to dispatch.
+Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current);
+
+// kBackendXess when XeSS is asked for (control file, else AISS_UPSCALER) and has not failed to load, else kBackendNss.
+int SelectedBackend();
+
+// Records the upscale, with GPU timestamps around it when AISS_GPU_TIMING is set.
+bool NgxDispatch(Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerDispatch& d);
 
 // Allocates a handle for a created upscaler. NGX hands handles back by pointer, so they must stay valid.
 NVSDK_NGX_Handle* NgxNewHandle(unsigned int id);

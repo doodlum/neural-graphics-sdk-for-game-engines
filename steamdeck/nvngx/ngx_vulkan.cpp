@@ -258,7 +258,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_CreateFeature1(VkDevice, VkCommandB
         return NVSDK_NGX_Result_FAIL_NotInitialized;
 
     Registry().CollectGarbage();
-    auto upscaler = NssUpscaler::Create(g_vk, NgxCreateInfo(*NgxParams::From(params)));
+    auto upscaler = CreateUpscaler(g_vk, NgxCreateInfo(*NgxParams::From(params)));
     if (!upscaler)
         return NVSDK_NGX_Result_FAIL_PlatformError;
     *outHandle = NgxNewHandle(Registry().Add(std::move(upscaler)));
@@ -288,7 +288,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd
     Log(3, "%s", "NVSDK_NGX_VULKAN_EvaluateFeature");
     if (!cmd || !handle || !params)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
-    NssUpscaler* upscaler = Registry().Get(handle->Id);
+    Upscaler* upscaler = Registry().Get(handle->Id);
     if (upscaler)
         upscaler = NgxApplyLiveSettings(handle->Id, upscaler);
     if (!upscaler)
@@ -307,7 +307,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     }
     NgxFillDispatch(p, upscaler->Info(), d);
-    return upscaler->Dispatch(cmd, d) ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail;
+    return NgxDispatch(upscaler, cmd, d) ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail;
 }
 
 NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature_C(VkCommandBuffer cmd, const NVSDK_NGX_Handle* handle,

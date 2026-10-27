@@ -40,6 +40,14 @@ struct UpscalerCreateInfo
     int      nssQuality    = 2;  // FfxApiNssShaderQualityMode
     bool     fastMath      = false;  // fp32 requantisation in the ML graph: ~2% faster, not bit exact
     bool     autoExposure  = false;  // the game asked DLSS for auto exposure: its colour is not pre-exposed
+    bool     highResMv     = false;  // motion vectors at display resolution (DLSS MVLowRes not set)
+    int      backend       = 0;      // UpscalerBackend
+};
+
+enum UpscalerBackend : int
+{
+    kBackendNss  = 0,
+    kBackendXess = 1,
 };
 
 struct UpscalerDispatch
@@ -54,16 +62,33 @@ struct UpscalerDispatch
     bool          reset = false;
 };
 
-class NssUpscaler
+// One upscaling context (NSS or XeSS) behind an NGX handle.
+class Upscaler
 {
 public:
-    static std::unique_ptr<NssUpscaler> Create(const VulkanDevice& device, const UpscalerCreateInfo& info);
-    ~NssUpscaler();
-
-    bool Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d);
+    virtual ~Upscaler() = default;
+    virtual bool Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d) = 0;
 
     const UpscalerCreateInfo& Info() const { return m_info; }
     const VulkanDevice&       Device() const { return m_dev; }
+
+protected:
+    VulkanDevice       m_dev;
+    UpscalerCreateInfo m_info;
+};
+
+// Creates the upscaler info.backend asks for; XeSS falls back to NSS when libxess.dll is missing or fails.
+std::unique_ptr<Upscaler> CreateUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info);
+// True once XeSS has failed to load or initialise in this process (it is not retried).
+bool XessUnavailable();
+
+class NssUpscaler : public Upscaler
+{
+public:
+    static std::unique_ptr<NssUpscaler> Create(const VulkanDevice& device, const UpscalerCreateInfo& info);
+    ~NssUpscaler() override;
+
+    bool Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d) override;
 
 private:
     NssUpscaler() = default;
@@ -79,8 +104,6 @@ private:
     struct Fn;
     std::unique_ptr<Fn> m_fn;
 
-    VulkanDevice       m_dev;
-    UpscalerCreateInfo m_info;
     void*              m_context = nullptr;  // ffxContext
 
     // Images the proxy owns and hands to NSS instead of a game input, each exactly the dispatch's render size: NSS
@@ -164,9 +187,9 @@ private:
 class UpscalerRegistry
 {
 public:
-    unsigned int Add(std::unique_ptr<NssUpscaler> upscaler);
-    NssUpscaler* Get(unsigned int id);
-    NssUpscaler* Replace(unsigned int id, std::unique_ptr<NssUpscaler> fresh);  // swap in a new context for a handle
+    unsigned int Add(std::unique_ptr<Upscaler> upscaler);
+    Upscaler*    Get(unsigned int id);
+    Upscaler*    Replace(unsigned int id, std::unique_ptr<Upscaler> fresh);  // swap in a new context for a handle
     void         Release(unsigned int id);
     void         CollectGarbage(bool force = false);
 
@@ -174,7 +197,7 @@ private:
     struct Entry
     {
         unsigned int                          id;
-        std::unique_ptr<NssUpscaler>          upscaler;
+        std::unique_ptr<Upscaler>             upscaler;
         bool                                  released = false;
         std::chrono::steady_clock::time_point releasedAt;
     };

@@ -1271,7 +1271,7 @@ UpscalerRegistry& Registry()
     return *registry;
 }
 
-unsigned int UpscalerRegistry::Add(std::unique_ptr<NssUpscaler> upscaler)
+unsigned int UpscalerRegistry::Add(std::unique_ptr<Upscaler> upscaler)
 {
     std::lock_guard<std::mutex> lock(g_registryMutex);
     const unsigned int id = m_nextId++;
@@ -1279,7 +1279,7 @@ unsigned int UpscalerRegistry::Add(std::unique_ptr<NssUpscaler> upscaler)
     return id;
 }
 
-NssUpscaler* UpscalerRegistry::Get(unsigned int id)
+Upscaler* UpscalerRegistry::Get(unsigned int id)
 {
     std::lock_guard<std::mutex> lock(g_registryMutex);
     for (auto& e : m_entries)
@@ -1288,15 +1288,15 @@ NssUpscaler* UpscalerRegistry::Get(unsigned int id)
     return nullptr;
 }
 
-NssUpscaler* UpscalerRegistry::Replace(unsigned int id, std::unique_ptr<NssUpscaler> fresh)
+Upscaler* UpscalerRegistry::Replace(unsigned int id, std::unique_ptr<Upscaler> fresh)
 {
     std::lock_guard<std::mutex> lock(g_registryMutex);
     for (auto& e : m_entries)
         if (e.id == id && !e.released)
         {
-            std::unique_ptr<NssUpscaler> old = std::move(e.upscaler);
-            e.upscaler                       = std::move(fresh);
-            NssUpscaler* result              = e.upscaler.get();
+            std::unique_ptr<Upscaler> old = std::move(e.upscaler);
+            e.upscaler                    = std::move(fresh);
+            Upscaler* result              = e.upscaler.get();
             // The old context may still be in flight: retire it like a released one. (`e` is invalid after this.)
             m_entries.push_back({0, std::move(old), true, std::chrono::steady_clock::now()});
             return result;

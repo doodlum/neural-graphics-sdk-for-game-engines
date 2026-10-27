@@ -134,9 +134,10 @@ const STATUS_LABEL: Record<Status, string> = {
   needs_repair: "Needs repair",
 };
 
-const QUALITY_OPTIONS = [
-  { data: 0, label: "Full (best quality)" },
-  { data: 2, label: "Fast (small network, more ghosting)" },
+const UPSCALER_OPTIONS = [
+  { data: 0, label: "NSS Full" },
+  { data: 2, label: "NSS Fast" },
+  { data: 3, label: "XeSS" },
 ];
 const LOG_OPTIONS = [
   { data: 0, label: "Off" },
@@ -279,9 +280,10 @@ function Content() {
       <PanelSection title="Global options">
         <PanelSectionRow>
           <DropdownItem
-            label="NSS model (switches live in-game)"
-            rgOptions={QUALITY_OPTIONS}
-            selectedOption={s.quality === 2 ? 2 : 0}
+            label="Upscaler"
+            description="Switches live in-game. NSS Full: best NSS quality. NSS Fast: small network, more ghosting. XeSS: Intel XeSS (supports dynamic resolution)."
+            rgOptions={UPSCALER_OPTIONS}
+            selectedOption={s.quality === 2 || s.quality === 3 ? s.quality : 0}
             disabled={!!busy}
             onChange={(o) => changeSetting({ quality: o.data })}
           />
@@ -289,9 +291,9 @@ function Content() {
         <PanelSectionRow>
           <ToggleField
             label="Fast maths"
-            description="~2% faster upscaling; output no longer bit-exact (about half an 8-bit step). Switches live."
+            description="NSS only: ~2% faster upscaling; output no longer bit-exact (about half an 8-bit step). Switches live."
             checked={!!s.fast_math}
-            disabled={!!busy}
+            disabled={!!busy || s.quality === 3}
             onChange={(v) => changeSetting({ fast_math: v ? 1 : 0 })}
           />
         </PanelSectionRow>

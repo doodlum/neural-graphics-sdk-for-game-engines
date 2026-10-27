@@ -73,7 +73,57 @@ Streamline sample (ray tracing on), 1280x800 fullscreen on the Deck, installed e
 
 Every DLSS mode uses NSS's full network by default. On the Deck it costs about 1.3 ms more per frame than the
 small one at 640x400 → 1280x800, and the small network ghosts visibly. The Decky plugin switches between them while the
-game runs: it writes the choice to a control file that the proxy re-reads (`AISS_CONTROL`, 0 = full, 2 = fast).
+game runs: it writes the choice to a control file that the proxy re-reads (`AISS_CONTROL`, 0 = full, 2 = fast,
+3 = XeSS).
+
+## Intel XeSS (alternative upscaler)
+
+The proxy can run Intel XeSS Super Resolution (Vulkan path of `libxess.dll`, XeSS SDK 3.0.2, SR library 2.0.2) instead of
+NSS: plugin "Upscaler" = XeSS, control file value 3, or `AISS_UPSCALER=xess` at launch. It switches live like the NSS
+models. `libxess.dll` is loaded at runtime from the proxy's own directory (the prefix's `system32`, next to
+`_nvngx.dll`) and used only through its public API; when it is missing or fails to initialise the proxy logs it and
+stays on NSS.
+
+- Inputs map as for NSS: colour, depth (passed directly, depth aspect, with the DLSS depth subrect offset), motion
+  vectors (render resolution by default, `XESS_INIT_FLAG_HIGH_RES_MV` when the game does not set `MVLowRes`), jitter
+  (DLSS and XeSS share the convention; checked visually, the other three sign combinations blur static detail),
+  `xessSetVelocityScale` = the DLSS MV scale, reset, HDR (`LDR_INPUT_COLOR` otherwise), inverted depth. DLSS
+  AutoExposure maps to `XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE`; otherwise the exposure value is 1 (or `AISS_EXPOSURE`).
+- Dynamic resolution works: the per-frame render subrect is the XeSS input size. The context uses the Ultra
+  Performance preset, whose input range is 1/3 of the output up to the output (presets only set the range: at a
+  given input size the output is bit-identical across presets).
+- Device requirements (`xessVKGetRequired*` under Proton on the Deck): no instance extensions, Vulkan 1.3,
+  `VK_EXT_mutable_descriptor_type` + `mutableDescriptorType`, `shaderStorageImageWriteWithoutFormat`,
+  `scalarBlockLayout`, `shaderInt8`, `shaderIntegerDotProduct`. The Deck supports all of them; the Vulkan layer enables
+  them on every device when `AISS_LAYER=1` (`AISS_LAYER_XESS=0` to skip). vkd3d-proton and DXVK already enable enough
+  for XeSS to run without the layer.
+- On RDNA2 XeSS uses its DP4a (int8 dot product) path, not XMX. Pipelines are built up front
+  (`xessVKBuildPipelines`, blocking): ~260 ms for the first context in a process, 45-110 ms for later ones. Its
+  temporary memory is 28-33 MB at 1280x722-1280x800, plus its persistent history and weights.
+
+GPU time per upscale (`AISS_GPU_TIMING=120`: timestamps around the evaluate in the game's command buffer) and frame
+rate, Streamline sample (ray tracing on), Steam Deck:
+
+| API | Mode | NSS full | NSS fast | XeSS |
+| --- | --- | --- | --- | --- |
+| D3D12 | 640x361 → 1280x722 (2x) | 2.20 ms, 25.4 FPS | 1.01 ms, 26.3 FPS | 2.88 ms, 24.8 FPS |
+| D3D12 | 853x481 → 1280x722 (1.5x) | 3.53 ms, 17.8 FPS | 2.10 ms, 18.1 FPS | 3.02 ms, 18.0 FPS |
+| Vulkan | 640x392 → 1280x785 (2x) | 2.58 ms, 26.6 FPS | 1.29 ms, 27.5 FPS | 3.19 ms, 26.2 FPS |
+| Vulkan | 853x523 → 1280x785 (1.5x) | 3.79 ms, 19.2 FPS | 2.29 ms, 19.8 FPS | 3.36 ms, 19.3 FPS |
+
+XeSS's cost depends mostly on the output size; NSS's on the input size. In screenshots XeSS is softer than NSS full
+on static detail, and the moving robot shows some smearing.
+
+Intel XeSS licence notice: the plugin ships `libxess.dll` unmodified with its licence (`libxess-LICENSE.txt`):
+
+> Intel(R) Xe Super Sampling (XeSS) SDK: Copyright (C) 2025 Intel Corporation. Licensed under the Intel Simplified
+> Software License (Version October 2022). Redistributed in binary form only, without modification; no reverse
+> engineering, decompilation, disassembly, modification or alteration of the Software is permitted. Neither the name of
+> Intel nor the names of its suppliers may be used to endorse or promote products derived from this Software. THE
+> SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND; see the full licence text shipped with it.
+
+The XeSS SDK is not part of this repository: the build takes its headers from `../third_party/xess/sdk` (CMake
+`XESS_SDK`), and `steamdeck/decky/build.sh` copies `bin/libxess.dll` and `LICENSE.txt` from there.
 
 ## Build
 
@@ -105,7 +155,10 @@ Use the Decky plugin for this. By hand:
 | Variable | Effect |
 | --- | --- |
 | `AISS_NSS_QUALITY=0/1/2` | NSS model at launch: 0 = full network (default), 1/2 = small network |
-| `AISS_CONTROL=/path` | File holding 0/1/2, re-read twice a second; switches the model while the game runs (set by the plugin) |
+| `AISS_CONTROL=/path` | File holding 0/1/2 (NSS model) or 3 (XeSS), re-read twice a second; switches the upscaler while the game runs (set by the plugin) |
+| `AISS_UPSCALER=xess` | XeSS instead of NSS at launch (the control file overrides it) |
+| `AISS_XESS_QUALITY=100..105` | XeSS preset (default 100, Ultra Performance: the widest input range) |
+| `AISS_GPU_TIMING=N` | Log the GPU time of the upscale and the evaluations per second, averaged over N evaluations |
 | `AISS_CAMERA_NEAR`, `AISS_CAMERA_FAR`, `AISS_CAMERA_FOV` | Camera values NGX does not pass. Defaults: 0.1, 100000, 60° (reversed-Z, infinite far plane). |
 | `AISS_EXPOSURE` | Exposure passed to NSS (default 1.0) |
 | `AISS_LOG=0..4` | Log to `aiss_nvngx.log` next to the exe: 1 lifecycle (default), 2 per-frame, 3 NGX calls, 4 every parameter |
@@ -117,6 +170,7 @@ Use the Decky plugin for this. By hand:
 | `AISS_JITTER_SIGN=x,y`, `AISS_MV_SIGN=x,y` | Multipliers on the jitter / motion vector scale handed to NSS (convention debugging) |
 | `AISS_LAYER_LOG=1` | Vulkan layer: log instances, device extensions and NULL proc lookups to stderr |
 | `AISS_LAYER_FEATURES=0`, `AISS_LAYER_EMULATE=0` | Vulkan layer: don't force ML features / don't emulate the NVIDIA extensions (debugging) |
+| `AISS_LAYER_XESS=0` | Vulkan layer: don't enable the XeSS device features (debugging) |
 
 ## Tested
 
@@ -136,5 +190,5 @@ Building that one file without optimisation keeps the original source unchanged.
 
 - DLSS Super Resolution only. Ray Reconstruction and Frame Generation report "not supported", and games fall back.
 - Colour/output subrect offsets are ignored, and display-resolution motion vectors are not supported (both logged).
-- No dynamic resolution: NSS requires every dispatch's render size to equal the size the context was created with, so a smaller render subrect fails the dispatch.
+- No dynamic resolution with NSS: it requires every dispatch's render size to equal the size the context was created with, so a smaller render subrect fails the dispatch. XeSS supports it.
 - Online games with anti-cheat may object to the extra DLLs; don't use it there.

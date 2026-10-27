@@ -71,6 +71,11 @@ const ProxyConfig& Config()
         for (int i = 0; i < 6; ++i)
             c.qualityRatio[i] = forced >= 1.0f ? forced : standard[i];
         c.nssQuality       = EnvInt("AISS_NSS_QUALITY", -1);
+        c.xess             = false;
+        if (const char* v = getenv("AISS_UPSCALER"))
+            c.xess = !strcmp(v, "xess") || !strcmp(v, "XeSS") || !strcmp(v, "XESS") || !strcmp(v, "3");
+        c.xessQuality      = EnvInt("AISS_XESS_QUALITY", 0);
+        c.gpuTiming        = EnvInt("AISS_GPU_TIMING", 0);
         c.cameraNear       = EnvFloat("AISS_CAMERA_NEAR", 0.1f);
         c.cameraFar        = EnvFloat("AISS_CAMERA_FAR", 100000.0f);
         c.cameraFovY       = EnvFloat("AISS_CAMERA_FOV", 60.0f) * 3.14159265f / 180.0f;
@@ -136,8 +141,8 @@ static LiveControl ReadLiveControl()
     {
         int q = -1, fast = -1, capture = -1;
         const int n = fscanf(f, "%d %d %d", &q, &fast, &capture);
-        if (n >= 1 && q >= 0 && q <= 2)
-            read.nssQuality = q;
+        if (n >= 1 && q >= 0 && q <= 3)
+            read.nssQuality = q;  // 3 = XeSS
         if (n >= 2 && (fast == 0 || fast == 1))
             read.fastMath = fast;
         if (n >= 3 && capture >= 0)
@@ -150,7 +155,14 @@ static LiveControl ReadLiveControl()
 
 int LiveNssQuality()
 {
-    return ReadLiveControl().nssQuality;
+    const int q = ReadLiveControl().nssQuality;
+    return q <= 2 ? q : -1;
+}
+
+int LiveXess()
+{
+    const int q = ReadLiveControl().nssQuality;
+    return q < 0 ? -1 : q == 3 ? 1 : 0;
 }
 
 int LiveFastMath()

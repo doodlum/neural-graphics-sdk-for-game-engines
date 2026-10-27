@@ -7,6 +7,11 @@
 // 2. Enables the device features NSS's ML kernels run fastest with (int8/fp16 arithmetic, 8/16-bit storage, integer dot
 //    products, subgroup size control, the Vulkan memory model) on every device, as far as the GPU supports them.
 //    A Vulkan device's enabled features cannot be queried later, so this is the only way to guarantee them.
+// 3. Enables what Intel XeSS (the proxy's alternative upscaler) needs on the same device: VK_EXT_mutable_descriptor_type
+//    with mutableDescriptorType, shaderStorageImageWriteWithoutFormat, scalarBlockLayout, plus shaderInt8 and
+//    shaderIntegerDotProduct from (2). This is what xessVKGetRequiredDeviceExtensions/Features (XeSS 2.0.2) return on
+//    a Steam Deck under Proton (no instance extensions, Vulkan 1.3); the layer is native and cannot call the Windows
+//    library, so the list is fixed here.
 //
 // Enabled with AISS_LAYER=1 (see VkLayer_aiss_ngx.json); applies to the game's devices and to DXVK/vkd3d-proton's.
 // SPDX-License-Identifier: MIT
@@ -361,6 +366,10 @@ typedef struct FeatureStorage
     VkPhysicalDeviceVulkanMemoryModelFeatures       memoryModel;
     VkPhysicalDeviceShaderIntegerDotProductFeatures dot;
     VkPhysicalDeviceSubgroupSizeControlFeatures     subgroup;
+    VkPhysicalDeviceScalarBlockLayoutFeatures       scalar;
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableDesc;
+    VkPhysicalDeviceFeatures2                       features2;
+    VkPhysicalDeviceFeatures                        features;
 } FeatureStorage;
 
 static const void* FindInChain(const void* pNext, VkStructureType type)
@@ -399,7 +408,12 @@ static void EnableMlFeatures(InstanceData* inst, VkPhysicalDevice pd, VkDeviceCr
     VkPhysicalDeviceVulkanMemoryModelFeatures       mm     = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES, &s16};
     VkPhysicalDeviceShaderIntegerDotProductFeatures dot    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, &mm};
     VkPhysicalDeviceSubgroupSizeControlFeatures     sg     = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, &dot};
-    VkPhysicalDeviceFeatures2                       all    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sg};
+    VkPhysicalDeviceScalarBlockLayoutFeatures       sbl    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, &sg};
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mdt   = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT};
+    if (DriverHasExtension(inst, pd, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME))
+        mdt.pNext = &sbl;
+    VkPhysicalDeviceFeatures2                       all    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                                              mdt.pNext ? (void*)&mdt : (void*)&sbl};
     inst->getFeatures2(pd, &all);
 
     VkPhysicalDeviceProperties props;
@@ -466,6 +480,50 @@ static void EnableMlFeatures(InstanceData* inst, VkPhysicalDevice pd, VkDeviceCr
                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, subgroup,
                      VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, VK_API_VERSION_1_3,
                      t->subgroupSizeControl = VK_TRUE; t->computeFullSubgroups = VK_TRUE;);
+
+    // XeSS (see the top of the file).
+    const char* xessEnv = getenv("AISS_LAYER_XESS");
+    if (xessEnv && !strcmp(xessEnv, "0"))
+        return;
+    if (sbl.scalarBlockLayout)
+        ENABLE_GROUP(v12, VkPhysicalDeviceVulkan12Features, VkPhysicalDeviceScalarBlockLayoutFeatures,
+                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, scalar,
+                     VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME, VK_API_VERSION_1_2,
+                     t->scalarBlockLayout = VK_TRUE;);
+    if (mdt.mutableDescriptorType)
+    {
+        // Never core: always the extension (VALVE's alias shares the feature structure).
+        VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT* t = (VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT*)FindInChain(
+            info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT);
+        if (!t)
+        {
+            t = &st->mutableDesc;
+            memset(t, 0, sizeof(*t));
+            t->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+            Append(info, t);
+        }
+        t->mutableDescriptorType = VK_TRUE;
+        AddExtension(exts, extCount, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    }
+    if (all.features.shaderStorageImageWriteWithoutFormat)
+    {
+        VkPhysicalDeviceFeatures2* f2 = (VkPhysicalDeviceFeatures2*)FindInChain(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+        if (f2)
+            f2->features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+        else if (info->pEnabledFeatures)
+        {
+            st->features                                      = *info->pEnabledFeatures;
+            st->features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+            info->pEnabledFeatures                            = &st->features;
+        }
+        else
+        {
+            memset(&st->features2, 0, sizeof(st->features2));
+            st->features2.sType                                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            st->features2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+            Append(info, &st->features2);
+        }
+    }
 #undef ENABLE_GROUP
 }
 
@@ -485,7 +543,7 @@ static VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice pd, const VkDevic
     PFN_vkCreateDevice create      = (PFN_vkCreateDevice)gipa(inst->instance, "vkCreateDevice");
 
     // Enabled extensions minus the emulated ones, plus room for the feature extensions we may add.
-    const char** exts     = calloc(info->enabledExtensionCount + 8, sizeof(char*));
+    const char** exts     = calloc(info->enabledExtensionCount + 12, sizeof(char*));
     uint32_t     extCount = 0;
     bool         fakeNvx  = false, fakeLowLatency = false;
     for (uint32_t i = 0; i < info->enabledExtensionCount; ++i)
