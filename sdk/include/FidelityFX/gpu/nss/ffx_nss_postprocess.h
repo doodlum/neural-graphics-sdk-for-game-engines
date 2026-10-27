@@ -944,6 +944,36 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     NormalizeFilterMoments(accum_m1, accum_m2, m1, m2);
 }
 #elif (NSS_FILTER_MODE == 0) || (NSS_FILTER_MODE == 1)
+#if NSS_FILTER_MODE == 0 && !NSS_SUPPORT_TENSOR && NSS_KPN_SCALE_QUARTER && !NSS_PREPROCESS_HALF_RES_INPUT
+// Exact-2x dense filter (QUALITY), weight reads with the per-pixel channel arithmetic hoisted. A tap's channel is
+// base + c (base = the pattern's base channel, c a tap constant with c & 3 in {0, 2}), so its KPN word is
+// pixel * 9 + (c >> 2) + ((base + (c & 3)) >> 2) and its byte ((base + (c & 3)) & 3): two per-pixel variants, and the
+// constant (c >> 2) folds into the load offset. Same words, bytes and dequantisation as SampleKpnWeight4/SampleKpnWeight.
+#define NSS_DENSE2X_HOISTED_KPN 1
+struct DenseKpnChannels
+{
+    int32_t hi0;  // (base + 0) >> 2
+    int32_t hi2;  // (base + 2) >> 2
+    int32_t sh0;  // ((base + 0) & 3) * 8
+    int32_t sh2;  // ((base + 2) & 3) * 8
+};
+
+DenseKpnChannels MakeDenseKpnChannels(int32_t base)
+{
+    DenseKpnChannels c;
+    c.hi0 = base >> 2;
+    c.hi2 = (base + 2) >> 2;
+    c.sh0 = (base & 3) << 3;
+    c.sh2 = ((base + 2) & 3) << 3;
+    return c;
+}
+
+// Tap constant C (a literal from kTapCh0/1/2), KPN pixel word base PIX = (y * kpn_w + x) * 9.
+#define NSS_DENSE_KPN_Q(PIX, C, CH)                                                                                         \
+    bitfieldExtract(int32_t(r_coefficients_kpn_buffer.data[(PIX) + ((C) >> 2) + ((((C) & 3) != 0) ? (CH).hi2 : (CH).hi0)]), \
+                    ((((C) & 3) != 0) ? (CH).sh2 : (CH).sh0), 8)
+#endif
+
 #if NSS_FILTER_MODE == 1
 // Integer tap coordinates of the exact-2x sparse filter: the 2x2 LR block {lo, hi} per axis and the KPN coordinates
 // of lo and hi (.x = lo, .y = hi).
@@ -1046,13 +1076,27 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     int16_t4 kpn_x0 = clamp(KpnCoordFromInputCoord4(tap_x0, InputDims().x, KpnDims().x), zero4, kpn_max_x4);
     int16_t4 kpn_y0 = clamp(KpnCoordFromInputCoord4(tap_y0, InputDims().y, KpnDims().y), zero4, kpn_max_y4);
 #else
+#if NSS_DENSE2X_HOISTED_KPN
+    // tap >= 0, so clamp(min(tap >> 2, kpn_max), 0, kpn_max) == min(tap >> 2, kpn_max).
+    int16_t4 kpn_x0 = min(tap_x0 >> int16_t(2), kpn_max_x4);
+    int16_t4 kpn_y0 = min(tap_y0 >> int16_t(2), kpn_max_y4);
+#else
     int16_t4 kpn_x0 = clamp(KpnCoordFromScaledTap4(tap_x0, KpnScale().x, KpnDims().x), zero4, kpn_max_x4);
     int16_t4 kpn_y0 = clamp(KpnCoordFromScaledTap4(tap_y0, KpnScale().y, KpnDims().y), zero4, kpn_max_y4);
+#endif
 #endif
 
     f16mat4x4 taps0;
     NSS_LOAD_TAPS_4(tap_x0, tap_y0, taps0);
+#if NSS_DENSE2X_HOISTED_KPN
+    const int32_t    kpn_words = kKpnChannels / 4;
+    DenseKpnChannels kch       = MakeDenseKpnChannels(int32_t(lut.base_channel));
+    int32_t4         pix0      = (int32_t4(kpn_y0) * int32_t4(KpnDims().x) + int32_t4(kpn_x0)) * int32_t4(kpn_words);
+    int32_t4         q0        = int32_t4(NSS_DENSE_KPN_Q(pix0.x, 0, kch), NSS_DENSE_KPN_Q(pix0.y, 2, kch), NSS_DENSE_KPN_Q(pix0.z, 4, kch), NSS_DENSE_KPN_Q(pix0.w, 12, kch));
+    half4            w0        = half4(max(float4(Dequantize(half4(q0), kKpnQuant)), float4(float(EPS))));
+#else
     half4 w0 = SampleKpnWeight4(kTapCh0 + int16_t4(lut.base_channel), kpn_x0, kpn_y0);
+#endif
     accum_m1 += taps0 * w0;
     accum_m2 += NSS_SQ_MAT(taps0) * w0;
 
@@ -1062,13 +1106,24 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     int16_t4 kpn_x1 = clamp(KpnCoordFromInputCoord4(tap_x1, InputDims().x, KpnDims().x), zero4, kpn_max_x4);
     int16_t4 kpn_y1 = clamp(KpnCoordFromInputCoord4(tap_y1, InputDims().y, KpnDims().y), zero4, kpn_max_y4);
 #else
+#if NSS_DENSE2X_HOISTED_KPN
+    int16_t4 kpn_x1 = min(tap_x1 >> int16_t(2), kpn_max_x4);
+    int16_t4 kpn_y1 = min(tap_y1 >> int16_t(2), kpn_max_y4);
+#else
     int16_t4 kpn_x1 = clamp(KpnCoordFromScaledTap4(tap_x1, KpnScale().x, KpnDims().x), zero4, kpn_max_x4);
     int16_t4 kpn_y1 = clamp(KpnCoordFromScaledTap4(tap_y1, KpnScale().y, KpnDims().y), zero4, kpn_max_y4);
+#endif
 #endif
 
     f16mat4x4 taps1;
     NSS_LOAD_TAPS_4(tap_x1, tap_y1, taps1);
+#if NSS_DENSE2X_HOISTED_KPN
+    int32_t4 pix1 = (int32_t4(kpn_y1) * int32_t4(KpnDims().x) + int32_t4(kpn_x1)) * int32_t4(kpn_words);
+    int32_t4 q1   = int32_t4(NSS_DENSE_KPN_Q(pix1.x, 14, kch), NSS_DENSE_KPN_Q(pix1.y, 16, kch), NSS_DENSE_KPN_Q(pix1.z, 24, kch), NSS_DENSE_KPN_Q(pix1.w, 26, kch));
+    half4    w1   = half4(max(float4(Dequantize(half4(q1), kKpnQuant)), float4(float(EPS))));
+#else
     half4 w1      = SampleKpnWeight4(kTapCh1 + int16_t4(lut.base_channel), kpn_x1, kpn_y1);
+#endif
     center_sample = (lut_idx == int32_t(3)) ? taps1[0] : half4(0.HF);
     accum_m1 += taps1 * w1;
     accum_m2 += NSS_SQ_MAT(taps1) * w1;
@@ -1081,13 +1136,22 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
               int32_t2(0),
               kpn_max);
 #else
+#if NSS_DENSE2X_HOISTED_KPN
+    int32_t2 kpn_tap2 = min(lr_tap2 >> int32_t(2), kpn_max);
+#else
     int32_t2 kpn_tap2 =
         clamp(int32_t2(KpnCoordFromScaledTap(lr_tap2.x, KpnScale().x, KpnDims().x), KpnCoordFromScaledTap(lr_tap2.y, KpnScale().y, KpnDims().y)),
               int32_t2(0),
               kpn_max);
 #endif
+#endif
     half4 tap2_col = LoadColourTap4(lr_tap2);
+#if NSS_DENSE2X_HOISTED_KPN
+    int32_t pix2   = (kpn_tap2.y * KpnDims().x + kpn_tap2.x) * kpn_words;
+    half    tap2_w = half(max(float(Dequantize(half(NSS_DENSE_KPN_Q(pix2, 28, kch)), kKpnQuant)), float(EPS)));
+#else
     half  tap2_w   = SampleKpnWeight(int32_t(lut.base_channel + kTapCh2), kpn_tap2);
+#endif
     accum_m1 += tap2_col * tap2_w;
     accum_m2 += (tap2_col * tap2_col) * tap2_w;
 #endif
