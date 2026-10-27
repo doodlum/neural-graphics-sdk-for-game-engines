@@ -729,6 +729,9 @@ static FfxErrorCode nssCreate(FfxNssContext_Private* context, const FfxNssContex
     // TODO: we'd better query this from shape inference result.
     context->kpnDimension.width  = context->dataGraphSize.width / 4;
     context->kpnDimension.height = context->dataGraphSize.height / 4;
+    // The postprocess maps LR taps to KPN coordinates with `>> 2` (NSS_KPN_SCALE_QUARTER in ffx_nss_postprocess.h),
+    // which equals its float formula only while _KpnScale = kpnDimension / dataGraphSize is exactly 1/4.
+    FFX_ASSERT(context->kpnDimension.width * 4 == context->dataGraphSize.width && context->kpnDimension.height * 4 == context->dataGraphSize.height);
 
     if (context->useDynamicOffsetLut)
     {

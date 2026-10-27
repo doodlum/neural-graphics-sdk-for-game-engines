@@ -307,17 +307,35 @@ int16_t4 KpnCoordFromInputCoord4(int16_t4 input_coord, int32_t input_dim, int32_
 // KPN coordinate mapping using precomputed scale (kpnDims / paddedDims).
 // Used in QUALITY mode where paddedDims > inputDims due to alignment padding.
 // ---------------------------------------------------------------------------
+//
+// The KPN tensor is exactly 1/4 of the dataGraph size (ffx_nss.cpp: kpnDimension = dataGraphSize / 4, dataGraphSize a
+// multiple of FFX_NSS_RESOURCE_ALIGNMENT = 8, asserted there), so `scale` is exactly 0.25. For any integer t no multiple
+// of 4 lies in (t, t + 0.5 + 1e-3], so floor((t + 0.5 + 1e-3) * 0.25) == t >> 2 (arithmetic shift): the shift below is
+// the same mapping without the float round trip (~24 VALU per pixel in the exact-2x filter). NSS_KPN_SCALE_QUARTER=0
+// restores the float formula.
+#ifndef NSS_KPN_SCALE_QUARTER
+#define NSS_KPN_SCALE_QUARTER 1
+#endif
+
 int32_t KpnCoordFromScaledTap(int32_t tap_coord, float scale, int32_t kpn_dim)
 {
+#if NSS_KPN_SCALE_QUARTER
+    int32_t scaled = tap_coord >> int32_t(2);
+#else
     int32_t scaled = int32_t(floor((float(tap_coord) + 0.5 + 1e-3) * scale));
+#endif
     return min(scaled, kpn_dim - int32_t(1));
 }
 
 int16_t4 KpnCoordFromScaledTap4(int16_t4 tap_coord, float scale, int32_t kpn_dim)
 {
+#if NSS_KPN_SCALE_QUARTER
+    return min(tap_coord >> int16_t(2), int16_t4(kpn_dim - int32_t(1)));
+#else
     float4   fcoord = float4(int32_t4(tap_coord)) + float4(0.5 + 1e-3);
     int32_t4 scaled = int32_t4(floor(fcoord * float4(scale)));
     return int16_t4(min(scaled, int32_t4(kpn_dim - int32_t(1))));
+#endif
 }
 
 // ---------------------------------------------------------------------------
