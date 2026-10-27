@@ -4,12 +4,15 @@
 #include "ngx_common.h"
 
 #include "common.h"
+#include "fsr4_dx12.h"
 
 #include <d3d12.h>
 #include <windows.h>
 
 #include <ffx_api/vk/ffx_api_vk.h>
 
+#include <algorithm>
+#include <memory>
 #include <mutex>
 
 // vkd3d-proton interop interfaces (include/vkd3d_device_vkd3d_ext.idl).
@@ -43,6 +46,72 @@ namespace
 std::mutex                g_mutex;
 ID3D12DXVKInteropDevice1* g_interop = nullptr;
 VulkanDevice              g_vk;
+ID3D12Device*             g_device = nullptr;
+
+// Carrier for the D3D12-native FSR 4 path: an Upscaler (so it lives in the registry and switches like the others) whose
+// work runs on the game's D3D12 device, not the Vulkan one. Its Vulkan Dispatch is never called.
+class Dx12Carrier : public Upscaler
+{
+public:
+    static std::unique_ptr<Dx12Carrier> Create(const VulkanDevice& vk, const UpscalerCreateInfo& info, ID3D12Device* device,
+                                               uint32_t outW, uint32_t outH)
+    {
+        Fsr4Dx12* f = Fsr4Dx12::Create(device, info.renderWidth, info.renderHeight, info.displayWidth ? info.displayWidth : outW,
+                                       info.displayHeight ? info.displayHeight : outH, info.hdr, info.depthInverted,
+                                       info.highResMv, info.autoExposure, info.fsr4Model);
+        if (!f)
+            return nullptr;
+        std::unique_ptr<Dx12Carrier> c(new Dx12Carrier());
+        c->m_dev        = vk;
+        c->m_info       = info;
+        c->m_info.fsr4Active = f->Model();
+        c->m_fsr4.reset(f);
+        return c;
+    }
+    bool       Dispatch(VkCommandBuffer, const UpscalerDispatch&) override { return false; }
+    Fsr4Dx12*  AsDx12() override { return m_fsr4.get(); }
+
+private:
+    std::unique_ptr<Fsr4Dx12> m_fsr4;
+};
+
+// The FSR 4 path for D3D12: native (amdxcffx64) by default. The live control-file value (fsr4_path: 0 auto, 1 vk,
+// 2 dx12) wins, else AISS_FSR4_PATH=vk|dx12|auto. "auto" and "dx12" both prefer native on D3D12.
+bool Fsr4PreferDx12()
+{
+    const int live = LiveFsr4Path();
+    if (live >= 0)
+        return live != 1;  // 1 = Vulkan DLL; 0 (auto) and 2 (dx12) prefer native on D3D12
+    const char* v = getenv("AISS_FSR4_PATH");
+    if (v && (!strcmp(v, "vk") || !strcmp(v, "vulkan")))
+        return false;
+    return true;
+}
+
+// Picks the native FSR 4 backend on D3D12 when the DLL can run there; otherwise leaves the Vulkan FSR 4 backend.
+UpscalerCreateInfo RemapD3D12(const UpscalerCreateInfo& in)
+{
+    UpscalerCreateInfo info = in;
+    if (info.backend == kBackendFsr4 && Fsr4PreferDx12() && !Fsr4Dx12Unavailable(info.fsr4Model))
+        info.backend = kBackendFsr4Dx12;
+    return info;
+}
+
+// The upscaler for a D3D12 create: the native FSR 4 path when asked and available, else the Vulkan-device path. The
+// display size may only be known from the output resource at evaluate time, so pass a fallback here.
+std::unique_ptr<Upscaler> CreateD3D12Upscaler(const UpscalerCreateInfo& info, uint32_t outW, uint32_t outH)
+{
+    if (info.backend == kBackendFsr4Dx12 && g_device)
+    {
+        if (auto c = Dx12Carrier::Create(g_vk, info, g_device, outW, outH))
+            return c;
+        LOGI("FSR 4 DX12 (%s) unavailable; trying the Vulkan path", Fsr4ModelName(info.fsr4Model));
+        UpscalerCreateInfo vk = info;
+        vk.backend            = kBackendFsr4;
+        return CreateUpscaler(g_vk, vk);
+    }
+    return CreateUpscaler(g_vk, info);
+}
 
 // ML device features vkd3d-proton enabled, read from its feature chain.
 uint32_t MlFeaturesFromChain(const VkPhysicalDeviceFeatures2* features)
@@ -124,6 +193,7 @@ NVSDK_NGX_Result InitDevice(ID3D12Device* device)
     if (g_interop)
         g_interop->Release();
     g_interop = interop;
+    g_device  = device;
 
     VulkanDevice vk;
     interop->GetVulkanHandles(&vk.instance, &vk.physicalDevice, &vk.device);
@@ -297,7 +367,8 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandL
         return NVSDK_NGX_Result_FAIL_NotInitialized;
 
     Registry().CollectGarbage();
-    auto upscaler = CreateUpscaler(g_vk, NgxCreateInfo(*NgxParams::From(params)));
+    const UpscalerCreateInfo info = RemapD3D12(NgxCreateInfo(*NgxParams::From(params)));
+    auto upscaler = CreateD3D12Upscaler(info, info.displayWidth, info.displayHeight);
     if (!upscaler)
         return NVSDK_NGX_Result_FAIL_PlatformError;
     *outHandle = NgxNewHandle(Registry().Add(std::move(upscaler)));
@@ -322,11 +393,44 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsComman
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     Upscaler* upscaler = Registry().Get(handle->Id);
     if (upscaler)
-        upscaler = NgxApplyLiveSettings(handle->Id, upscaler);
+    {
+        auto create = [](const UpscalerCreateInfo& info) { return CreateD3D12Upscaler(info, info.displayWidth, info.displayHeight); };
+        upscaler    = NgxApplyLiveSettings(handle->Id, upscaler, create, RemapD3D12);
+    }
     if (!upscaler || !g_interop)
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
 
     const NgxParams& p = *NgxParams::From(params);
+
+    // D3D12-native FSR 4: hand amdxcffx64 the game's own ID3D12 resources and command list, no Vulkan interop.
+    if (Fsr4Dx12* fsr4 = upscaler->AsDx12())
+    {
+        auto* color  = static_cast<ID3D12Resource*>(p.Ptr(ngxp::Color));
+        auto* depth  = static_cast<ID3D12Resource*>(p.Ptr(ngxp::Depth));
+        auto* motion = static_cast<ID3D12Resource*>(p.Ptr(ngxp::MotionVectors));
+        auto* output = static_cast<ID3D12Resource*>(p.Ptr(ngxp::Output));
+        if (!color || !depth || !motion || !output)
+        {
+            LOGI("EvaluateFeature: missing input resource");
+            return NVSDK_NGX_Result_FAIL_InvalidParameter;
+        }
+        UpscalerDispatch d;  // reuse the shared scalar fill (jitter, mv scale, render subrect, exposure, reset)
+        NgxFillDispatch(p, upscaler->Info(), d);
+        const D3D12_RESOURCE_DESC cd = color->GetDesc(), od = output->GetDesc();
+        Fsr4Dx12Dispatch fd;
+        fd.color = color, fd.depth = depth, fd.motion = motion, fd.output = output;
+        fd.renderWidth  = std::min<uint32_t>(d.renderWidth, uint32_t(cd.Width));
+        fd.renderHeight = std::min<uint32_t>(d.renderHeight, cd.Height);
+        fd.outputWidth  = uint32_t(od.Width);
+        fd.outputHeight = od.Height;
+        fd.jitterX = d.jitterX, fd.jitterY = d.jitterY;
+        fd.mvScaleX = d.mvScaleX, fd.mvScaleY = d.mvScaleY;
+        fd.frameTimeMs = d.frameTimeMs;
+        fd.exposure    = d.exposure;
+        fd.reset       = d.reset;
+        return fsr4->Dispatch(cmdList, fd) ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail;
+    }
+
     UpscalerDispatch d;
     constexpr D3D12_RESOURCE_STATES kInput = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     if (!Describe(static_cast<ID3D12Resource*>(p.Ptr(ngxp::Color)), kInput, d.color) ||

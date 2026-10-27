@@ -22,6 +22,7 @@
 #include "nss_upscaler.h"
 
 #include "common.h"
+#include "fsr4_common.h"
 #include "spirv_half_images.h"
 
 #include <windows.h>
@@ -42,39 +43,13 @@
 
 namespace
 {
-// ---------------------------------------------------------------------------------------------------------------------
-// The FidelityFX provider interface handed out by UpdateFfxApiProvider (same layout as the SDK's ffxProviderInterface).
-struct AmdProvider
-{
-    uint64_t    versionId;
-    const char* versionName;
-    uint32_t (*canProvide)(uint64_t descType);
-    uint32_t (*createContext)(ffxContext* context, ffxCreateContextDescHeader* desc, const void* allocator);
-    uint32_t (*destroyContext)(ffxContext* context, const void* allocator);
-    uint32_t (*configure)(ffxContext* context, const ffxConfigureDescHeader* desc);
-    uint32_t (*query)(ffxContext* context, ffxQueryDescHeader* desc);
-    uint32_t (*dispatch)(ffxContext* context, const ffxDispatchDescHeader* desc);
-};
+// Vulkan backend create-desc type amdvkffx64's FidelityFX runtime understands, and the upscaler version desc it wants.
+constexpr uint64_t kDriverBackendVk    = 0x01000003u;
+constexpr uint64_t kUpscaleVersionDesc = 0x0001000Bu;
+constexpr uint32_t kUpscaleVersion     = (4u << 22) | (1u << 12) | 2u;
 
-// In/out block of UpdateFfxApiProvider: the caller sets blockVersion and descType, the DLL fills in the provider.
-// Block version 3 adds a device check and is 0x60 bytes; versions 1 and 2 end before the device check (0x50 bytes).
-struct ProviderBlock
-{
-    uint32_t    blockVersion;
-    uint64_t    descType;
-    AmdProvider provider;
-    bool (*deviceCheck)(const void* backend);  // takes a DriverVkDevice*
-    void* unused;
-};
-static_assert(offsetof(ProviderBlock, provider) == 0x10, "provider block layout");
-static_assert(offsetof(ProviderBlock, deviceCheck) == 0x50, "provider block layout");
-static_assert(sizeof(ProviderBlock) == 0x60, "provider block layout");
-
-typedef HRESULT (*PFN_UpdateFfxApiProvider)(void* block, uint32_t blockSize);
-
-// The Vulkan backend description the DLL's FidelityFX runtime understands (FFX SDK 2.x numbering, laid out like the
-// SDK 1.x ffxCreateBackendVKDesc: device, physical device, device proc addr).
-constexpr uint64_t kDriverBackendVk = 0x01000003u;
+// The Vulkan backend description the DLL's FidelityFX runtime understands (laid out like the SDK 1.x
+// ffxCreateBackendVKDesc: device, physical device, device proc addr).
 struct DriverVkDevice
 {
     VkDevice                device;
@@ -87,268 +62,12 @@ struct DriverBackendVkDesc
     DriverVkDevice             vk;
 };
 
-// FFX SDK 2.x ffx_upscale.h: the upscaler API version the caller was built against. The DLL logs an error without it
-// and accepts 4.0.0 to 4.1.2.
-constexpr uint64_t kUpscaleVersionDesc = 0x0001000Bu;
-constexpr uint32_t kUpscaleVersion     = (4u << 22) | (1u << 12) | 2u;
+// The DLL logs an error without the upscaler version desc and accepts 4.0.0 to 4.1.2.
 struct UpscaleVersionDesc
 {
     ffxCreateContextDescHeader header;
     uint32_t                   version;
 };
-
-// ---------------------------------------------------------------------------------------------------------------------
-// FSR 4 networks: one FidelityFX provider class per model, found through the DLL's RTTI. The device check is the third
-// virtual function of every provider class; FidelityFX asks FP8, INT8, INT8 RDNA 2, then Lite and runs the first that
-// accepts the device.
-typedef bool (*PFN_DeviceCheck)(void* self, const void* backend);
-
-struct ModelClass
-{
-    const char*     rttiName;
-    void**          vtable   = nullptr;
-    PFN_DeviceCheck original = nullptr;
-};
-
-ModelClass g_classes[kFsr4ModelCount] = {
-    {nullptr},
-    {".?AVffxProvider_FSR4Lite_Int8@@"},
-    {".?AVffxProvider_FSR4_Int8@@"},
-    {".?AVffxProvider_FSR4_Int8_Navi2@@"},
-    {".?AVffxProvider_FSR4@@"},
-};
-constexpr size_t kDeviceCheckSlot = 2;
-
-std::atomic<int> g_wantedModel{kFsr4Auto};  // model the wrapped checks let through
-std::atomic<int> g_acceptedModel{-1};       // first model that accepted since the last reset
-std::atomic<int> g_nativeAnswers{0};        // bit per model: what AMD's own check said, since the last reset
-
-bool WrappedDeviceCheck(void* self, const void* backend)
-{
-    void** vtable = *static_cast<void***>(self);
-    int    model  = -1;
-    for (int m = 1; m < kFsr4ModelCount; ++m)
-        if (g_classes[m].vtable == vtable)
-            model = m;
-    if (model < 0)
-        return false;
-    const bool native = g_classes[model].original(self, backend);
-    const int  wanted = g_wantedModel.load();
-    const bool answer = wanted == kFsr4Auto ? native : model == wanted;
-    if (native)
-        g_nativeAnswers.fetch_or(1 << model);
-    int none = -1;
-    if (answer && backend)
-        g_acceptedModel.compare_exchange_strong(none, model);
-    Log(2, "FSR 4: device check of %s: AMD says %d, answered %d", Fsr4ModelName(model), native, answer);
-    return answer;
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// GPU family and revision for the DLL's D3DKMT query (amdgpu's AMDGPU_INFO_DEV_INFO family and external revision).
-struct GpuIds
-{
-    uint32_t family   = 0;
-    uint32_t revision = 0;
-};
-GpuIds g_gpu;
-
-GpuIds KnownGpu(uint32_t vendor, uint32_t device, const char* name)
-{
-    GpuIds ids;
-    if (const char* v = getenv("AISS_FSR4_GPU"))  // "family,revision", e.g. 144,1
-    {
-        sscanf(v, "%u,%u", &ids.family, &ids.revision);
-        return ids;
-    }
-    // Steam Deck (Van Gogh, amdgpu family 144 = AMDGPU_FAMILY_VGH): LCD 0x163F, OLED 0x1435. External revision 1,
-    // read with DRM_IOCTL_AMDGPU_INFO / AMDGPU_INFO_DEV_INFO on a Steam Deck OLED.
-    // Proton's NVIDIA spoof (PROTON_FORCE_NVAPI / dxvk-nvapi) changes the reported IDs; RADV's name stays.
-    if ((vendor == 0x1002 && (device == 0x163F || device == 0x1435)) || (name && strstr(name, "VANGOGH")))
-        ids = {144, 1};
-    return ids;
-}
-
-// The network AMD's device checks pick for a family / revision (from the checks in amdvkffx64.dll 4.1.2).
-int ModelForGpu(const GpuIds& g)
-{
-    if (g.family == 144 && g.revision >= 1 && g.revision <= 0x7F)
-        return kFsr4Lite;  // Van Gogh
-    if (g.family == 150 && g.revision >= 1 && g.revision <= 0x3F)
-        return kFsr4Lite;  // Strix Point
-    if (g.family == 145 || (g.family == 150 && g.revision >= 0xC0 && g.revision <= 0xCF))
-        return kFsr4Int8;  // RDNA 3, Strix Halo
-    if (g.family == 143 && g.revision >= 0x28 && g.revision <= 0x4F)
-        return kFsr4Rdna2;
-    if (g.family == 152)
-        return kFsr4Fp8;
-    return -1;
-}
-
-// D3DKMT structures the DLL passes (d3dkmthk.h layouts).
-struct KmtAdapterInfo
-{
-    uint32_t handle;
-    LUID     luid;
-    uint32_t sources;
-    BOOL     presentMoveRegionsPreferred;
-};
-struct KmtEnumAdapters
-{
-    uint32_t       count;
-    KmtAdapterInfo adapters[16];
-};
-static_assert(sizeof(KmtEnumAdapters) == 0x144, "D3DKMT_ENUMADAPTERS");
-struct KmtQueryAdapterInfo
-{
-    uint32_t adapter;
-    uint32_t type;  // 0 = KMTQAITYPE_UMDRIVERPRIVATE
-    void*    data;
-    uint32_t size;
-};
-constexpr uint32_t kFakeAdapter = 0x40000040u;
-constexpr LONG     kStatusOk = 0, kStatusInvalid = (LONG)0xC000000Du, kStatusNotSupported = (LONG)0xC00000BBu;
-// Offsets in the AMD driver's private adapter data where the DLL reads the family and revision (its first, short
-// query of 0x260 bytes).
-constexpr uint32_t kPrivateFamily = 0x30, kPrivateRevision = 0x34, kPrivateMinSize = 0x38;
-
-LONG WINAPI KmtEnumAdapters_(KmtEnumAdapters* e)
-{
-    if (!e)
-        return kStatusInvalid;
-    memset(e, 0, sizeof(*e));
-    if (!g_gpu.family)
-        return kStatusOk;  // no adapter: the DLL treats the GPU as unknown
-    e->count               = 1;
-    e->adapters[0].handle  = kFakeAdapter;
-    e->adapters[0].sources = 1;
-    return kStatusOk;
-}
-
-LONG WINAPI KmtQueryAdapterInfo_(KmtQueryAdapterInfo* q)
-{
-    if (!q || q->adapter != kFakeAdapter)
-        return kStatusInvalid;
-    if (q->type != 0 || !q->data || q->size < kPrivateMinSize)
-        return kStatusNotSupported;
-    memset(q->data, 0, q->size);
-    uint8_t* p = static_cast<uint8_t*>(q->data);
-    memcpy(p + kPrivateFamily, &g_gpu.family, 4);
-    memcpy(p + kPrivateRevision, &g_gpu.revision, 4);
-    LOGI("FSR 4: answered the DLL's GPU query: family %u, revision %u", g_gpu.family, g_gpu.revision);
-    return kStatusOk;
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// Redirected imports of the DLL.
-HMODULE                     g_driver = nullptr;
-decltype(&GetModuleHandleW) g_realGetModuleHandleW = nullptr;
-decltype(&GetProcAddress)   g_realGetProcAddress   = nullptr;
-
-HMODULE WINAPI SdkModuleLookup(LPCWSTR name)
-{
-    // FidelityFX SDK modules (amd_fidelityfx_loader_vk.dll, ..._upscaler_vk.dll, ...): the DLL itself stands in.
-    if (name && !_wcsnicmp(name, L"amd_fidelityfx_", 15))
-        return g_driver;
-    return g_realGetModuleHandleW(name);
-}
-
-FARPROC WINAPI KmtProcLookup(HMODULE module, LPCSTR name)
-{
-    if (reinterpret_cast<uintptr_t>(name) > 0xFFFF)
-    {
-        if (!strcmp(name, "D3DKMTEnumAdapters"))
-            return reinterpret_cast<FARPROC>(&KmtEnumAdapters_);
-        if (!strcmp(name, "D3DKMTQueryAdapterInfo"))
-            return reinterpret_cast<FARPROC>(&KmtQueryAdapterInfo_);
-    }
-    return g_realGetProcAddress(module, name);
-}
-
-bool WritePointer(void** slot, void* value)
-{
-    DWORD old = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old))
-        return false;
-    *slot = value;
-    VirtualProtect(slot, sizeof(void*), old, &old);
-    return true;
-}
-
-// Points the module's import of dll!function at replacement; returns the previous target.
-void* RedirectImport(HMODULE module, const char* dll, const char* function, void* replacement)
-{
-    auto* base = reinterpret_cast<uint8_t*>(module);
-    auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
-    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress)
-        return nullptr;
-    for (auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); imp->Name; ++imp)
-    {
-        if (_stricmp(reinterpret_cast<char*>(base + imp->Name), dll))
-            continue;
-        auto* names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk
-                                                                                              : imp->FirstThunk));
-        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + imp->FirstThunk);
-        for (; names->u1.AddressOfData; ++names, ++slots)
-        {
-            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal))
-                continue;
-            auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
-            if (strcmp(reinterpret_cast<char*>(byName->Name), function))
-                continue;
-            void* previous = reinterpret_cast<void*>(slots->u1.Function);
-            if (!WritePointer(reinterpret_cast<void**>(&slots->u1.Function), replacement))
-                return nullptr;
-            return previous;
-        }
-    }
-    return nullptr;
-}
-
-// MSVC RTTI: type descriptor (name 16 bytes in) <- complete object locator (signature 1, self RVA) <- vtable[-1].
-void** FindVtable(HMODULE module, const char* rttiName)
-{
-    auto* base = reinterpret_cast<uint8_t*>(module);
-    auto* nt   = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
-    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
-    const size_t                nameLen  = strlen(rttiName) + 1;  // with the terminator
-
-    uint32_t typeRva = 0;
-    for (uint32_t s = 0; s < nt->FileHeader.NumberOfSections && !typeRva; ++s)
-    {
-        if (sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)
-            continue;
-        const uint8_t* begin = base + sections[s].VirtualAddress;
-        const uint8_t* end   = begin + sections[s].Misc.VirtualSize;
-        for (const uint8_t* p = begin; p + nameLen <= end; p += 8)  // names sit 16 bytes into 8-aligned descriptors
-            if (*p == '.' && !memcmp(p, rttiName, nameLen))
-            {
-                typeRva = uint32_t(p - base) - 16;
-                break;
-            }
-    }
-    if (!typeRva)
-        return nullptr;
-    for (uint32_t s = 0; s < nt->FileHeader.NumberOfSections; ++s)
-    {
-        if (sections[s].Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE))
-            continue;
-        uint8_t* begin = base + sections[s].VirtualAddress;
-        uint8_t* end   = begin + sections[s].Misc.VirtualSize;
-        for (uint8_t* p = begin; p + 24 <= end; p += 4)
-        {
-            const uint32_t* col = reinterpret_cast<const uint32_t*>(p);
-            if (col[0] != 1 || col[1] != 0 || col[3] != typeRva || col[5] != uint32_t(p - base))
-                continue;
-            const uint64_t target = reinterpret_cast<uint64_t>(p);
-            for (uint8_t* q = begin; q + 16 <= end; q += 8)
-                if (*reinterpret_cast<uint64_t*>(q) == target)
-                    return reinterpret_cast<void**>(q + 8);
-        }
-    }
-    return nullptr;
-}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Shader modules the DLL creates pass through the proxy (it hands the DLL a vkGetDeviceProcAddr of its own).
@@ -435,132 +154,6 @@ std::vector<uint32_t> AdaptSpirv(const uint32_t* code, size_t words)
     return out;
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-struct Driver
-{
-    AmdProvider provider = {};
-    std::string versionName;
-    bool (*deviceCheck)(const void*) = nullptr;
-    int  modelsFound = 0;  // bit per model class found
-};
-
-std::mutex g_mutex;
-bool       g_loadTried = false, g_loadFailed = false;
-bool       g_modelFailed[kFsr4ModelCount] = {};
-Driver     g_drv;
-
-void EnableWatermark()
-{
-    // amdvkffx64 draws the network's name on the output when MLSR-WATERMARK is set in its CRT's environment.
-    const char* a = getenv("AISS_FSR4_WATERMARK");
-    const char* b = getenv("FSR_WATERMARK");
-    if (!((a && *a && strcmp(a, "0")) || (b && *b && strcmp(b, "0"))))
-        return;
-    SetEnvironmentVariableA("MLSR-WATERMARK", "1");
-    typedef int (*PFN_putenv_s)(const char*, const char*);
-    HMODULE ucrt = GetModuleHandleA("ucrtbase.dll");
-    auto    put  = ucrt ? reinterpret_cast<PFN_putenv_s>(GetProcAddress(ucrt, "_putenv_s")) : nullptr;
-    if (put)
-        put("MLSR-WATERMARK", "1");
-    LOGI("FSR 4: watermark on (MLSR-WATERMARK=1%s)", put ? "" : ", ucrtbase _putenv_s not found");
-}
-
-const Driver* LoadDriver()
-{
-    if (g_loadTried)
-        return g_loadFailed ? nullptr : &g_drv;
-    g_loadTried  = true;
-    g_loadFailed = true;
-
-    wchar_t path[MAX_PATH] = {};
-    HMODULE self           = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&LoadDriver), &self);
-    GetModuleFileNameW(self, path, MAX_PATH);
-    if (wchar_t* slash = wcsrchr(path, L'\\'))
-        wcscpy(slash + 1, L"amdvkffx64.dll");
-    else
-        wcscpy(path, L"amdvkffx64.dll");
-    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
-    {
-        LOGI("FSR 4: %ls not found; using NSS", path);
-        return nullptr;
-    }
-    const auto t0 = GetTickCount64();
-    HMODULE    lib = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!lib)
-    {
-        LOGI("FSR 4: cannot load %ls (error %lu); using NSS", path, GetLastError());
-        return nullptr;
-    }
-    g_driver    = lib;
-    auto update = reinterpret_cast<PFN_UpdateFfxApiProvider>(GetProcAddress(lib, "UpdateFfxApiProvider"));
-    if (!update)
-    {
-        LOGI("FSR 4: %ls has no UpdateFfxApiProvider; using NSS", path);
-        return nullptr;
-    }
-
-    g_realGetModuleHandleW = reinterpret_cast<decltype(g_realGetModuleHandleW)>(
-        RedirectImport(lib, "KERNEL32.dll", "GetModuleHandleW", reinterpret_cast<void*>(&SdkModuleLookup)));
-    g_realGetProcAddress = reinterpret_cast<decltype(g_realGetProcAddress)>(
-        RedirectImport(lib, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void*>(&KmtProcLookup)));
-    if (!g_realGetModuleHandleW || !g_realGetProcAddress)
-    {
-        LOGI("FSR 4: cannot redirect the DLL's GetModuleHandleW / GetProcAddress imports; using NSS");
-        return nullptr;
-    }
-
-    for (int m = 1; m < kFsr4ModelCount; ++m)
-    {
-        ModelClass& c = g_classes[m];
-        c.vtable      = FindVtable(lib, c.rttiName);
-        if (!c.vtable)
-            continue;
-        c.original = reinterpret_cast<PFN_DeviceCheck>(c.vtable[kDeviceCheckSlot]);
-        if (!WritePointer(&c.vtable[kDeviceCheckSlot], reinterpret_cast<void*>(&WrappedDeviceCheck)))
-        {
-            c.vtable = nullptr;
-            continue;
-        }
-        g_drv.modelsFound |= 1 << m;
-    }
-    std::string models;
-    for (int m = 1; m < kFsr4ModelCount; ++m)
-        if (g_drv.modelsFound & (1 << m))
-            models += std::string(models.empty() ? "" : ", ") + Fsr4ModelName(m);
-    EnableWatermark();
-
-    ProviderBlock block = {};
-    HRESULT       hr    = E_FAIL;
-    for (uint32_t version : {3u, 2u})
-    {
-        block              = {};
-        block.blockVersion = version;
-        block.descType     = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-        hr = update(&block, version >= 3 ? uint32_t(sizeof(ProviderBlock)) : uint32_t(offsetof(ProviderBlock, deviceCheck)));
-        if (SUCCEEDED(hr) && block.provider.createContext)
-            break;
-        LOGI("FSR 4: UpdateFfxApiProvider (block version %u) returned 0x%lx, provider %s", version, (unsigned long)hr,
-             block.provider.createContext ? "given" : "not given");
-    }
-    if (FAILED(hr) || !block.provider.createContext || !block.provider.dispatch || !block.provider.destroyContext)
-    {
-        LOGI("FSR 4: amdvkffx64.dll handed out no upscaler provider; using NSS");
-        return nullptr;
-    }
-    g_drv.provider    = block.provider;
-    g_drv.versionName = block.provider.versionName ? block.provider.versionName : "";
-    g_drv.deviceCheck = block.blockVersion >= 3 ? block.deviceCheck : nullptr;
-    LOGI("FSR 4: loaded %ls in %llu ms: provider \"%s\" (id 0x%llx), networks: %s", path,
-         (unsigned long long)(GetTickCount64() - t0), g_drv.versionName.c_str(),
-         (unsigned long long)block.provider.versionId, models.empty() ? "none found" : models.c_str());
-    if (!models.size())
-        LOGI("FSR 4: warning: no FSR 4 network classes found; model selection is not possible");
-    g_loadFailed = false;
-    return &g_drv;
-}
-
 void FfxMessage(uint32_t type, const wchar_t* message)
 {
     LOGI("FSR 4 runtime %s: %ls", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
@@ -636,6 +229,54 @@ FfxApiResource Resource(const UpscalerImage& img, uint32_t usage, uint32_t state
     return r;
 }
 
+// amdvkffx64.dll, loaded once. The wrapped device checks keep a pointer to it, so it must outlive every upscaler.
+std::mutex g_mutex;
+bool       g_loadTried = false, g_loadOk = false;
+bool       g_modelFailed[kFsr4ModelCount] = {};
+Fsr4Driver g_drv;
+
+Fsr4Gpu GpuForDevice(const VulkanDevice& device)
+{
+    VkPhysicalDeviceProperties props = {};
+    reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(device.gipa(device.instance, "vkGetPhysicalDeviceProperties"))(
+        device.physicalDevice, &props);
+    return Fsr4KnownGpu(props.vendorID, props.deviceID, props.deviceName);
+}
+
+const Fsr4Driver* LoadVkDriver(const VulkanDevice& device)
+{
+    if (g_loadTried)
+        return g_loadOk ? &g_drv : nullptr;
+    g_loadTried = true;
+    VkPhysicalDeviceProperties props = {};
+    reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(device.gipa(device.instance, "vkGetPhysicalDeviceProperties"))(
+        device.physicalDevice, &props);
+    const Fsr4Gpu gpu = Fsr4KnownGpu(props.vendorID, props.deviceID, props.deviceName);
+    if (!gpu.family)
+        LOGI("FSR 4: GPU %04x:%04x (%s) has no known amdgpu family; AMD's automatic model choice will refuse it "
+             "(set AISS_FSR4_GPU=family,revision)", props.vendorID, props.deviceID, props.deviceName);
+    g_loadOk = Fsr4LoadDriver(L"amdvkffx64.dll", gpu, g_drv);
+    return g_loadOk ? &g_drv : nullptr;
+}
+
+// VK_EXT_shader_float8 + VK_KHR_cooperative_matrix, which the FP8 network's shaders need (RADV crashes without them).
+bool DeviceHasFp8(const VulkanDevice& device)
+{
+    auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        device.gipa(device.instance, "vkEnumerateDeviceExtensionProperties"));
+    uint32_t n = 0;
+    enumerate(device.physicalDevice, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> exts(n);
+    enumerate(device.physicalDevice, nullptr, &n, exts.data());
+    bool fp8 = false, coop = false;
+    for (const VkExtensionProperties& e : exts)
+    {
+        fp8 |= !strcmp(e.extensionName, "VK_EXT_shader_float8");
+        coop |= !strcmp(e.extensionName, "VK_KHR_cooperative_matrix");
+    }
+    return fp8 && coop;
+}
+
 class Fsr4Upscaler : public Upscaler
 {
 public:
@@ -644,7 +285,7 @@ public:
     bool Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d) override;
 
 private:
-    const Driver*            m_drv    = nullptr;
+    const Fsr4Driver*        m_drv    = nullptr;
     ffxContext               m_ctx    = nullptr;
     int                      m_model  = kFsr4Auto;  // the network that runs
     uint64_t                 m_dispatchCount = 0;
@@ -700,42 +341,17 @@ bool Fsr4Upscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& in
     m_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(device.gdpa(device.device, "vkCmdPipelineBarrier"));
     m_clear   = reinterpret_cast<PFN_vkCmdClearColorImage>(device.gdpa(device.device, "vkCmdClearColorImage"));
 
-    VkPhysicalDeviceProperties props = {};
-    reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(device.gipa(device.instance, "vkGetPhysicalDeviceProperties"))(
-        device.physicalDevice, &props);
-    g_gpu = KnownGpu(props.vendorID, props.deviceID, props.deviceName);
-    if (!g_gpu.family)
-        LOGI("FSR 4: GPU %04x:%04x (%s) has no known amdgpu family; AMD's automatic model choice will refuse it "
-             "(set AISS_FSR4_GPU=family,revision)", props.vendorID, props.deviceID, props.deviceName);
-
-    m_drv = LoadDriver();
+    m_drv = LoadVkDriver(device);
     if (!m_drv)
         return false;
     const int wanted = info.fsr4Model;
-    if (wanted == kFsr4Fp8 && !getenv("AISS_FSR4_FORCE_FP8"))
+    if (wanted == kFsr4Fp8 && !getenv("AISS_FSR4_FORCE_FP8") && !DeviceHasFp8(device))
     {
-        // The FP8 network's shaders need SPV_EXT_float8 and cooperative matrices (RDNA 4); RADV crashes compiling them
-        // on a GPU without (seen on Van Gogh), so it is refused unless the device has both extensions.
-        auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
-            device.gipa(device.instance, "vkEnumerateDeviceExtensionProperties"));
-        uint32_t n = 0;
-        enumerate(device.physicalDevice, nullptr, &n, nullptr);
-        std::vector<VkExtensionProperties> exts(n);
-        enumerate(device.physicalDevice, nullptr, &n, exts.data());
-        bool fp8 = false, coop = false;
-        for (const VkExtensionProperties& e : exts)
-        {
-            fp8 |= !strcmp(e.extensionName, "VK_EXT_shader_float8");
-            coop |= !strcmp(e.extensionName, "VK_KHR_cooperative_matrix");
-        }
-        if (!fp8 || !coop)
-        {
-            LOGI("FSR 4: the FP8 network needs VK_EXT_shader_float8 and VK_KHR_cooperative_matrix (RDNA 4), which this "
-                 "GPU does not have");
-            return false;
-        }
+        LOGI("FSR 4: the FP8 network needs VK_EXT_shader_float8 and VK_KHR_cooperative_matrix (RDNA 4), which this "
+             "GPU does not have");
+        return false;
     }
-    if (wanted != kFsr4Auto && !(m_drv->modelsFound & (1 << wanted)))
+    if (wanted != kFsr4Auto && !m_drv->HasModel(wanted))
     {
         LOGI("FSR 4: amdvkffx64.dll has no %s network", Fsr4ModelName(wanted));
         return false;
@@ -745,12 +361,6 @@ bool Fsr4Upscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& in
     backend.header.type         = kDriverBackendVk;
     RegisterDevice(device);
     backend.vk                  = {device.device, device.physicalDevice, &DeviceProcAddrThunk};
-    if (m_drv->deviceCheck)
-    {
-        g_wantedModel = wanted;
-        const bool ok = m_drv->deviceCheck(&backend.vk);
-        LOGI("FSR 4: provider device check: %s", ok ? "supported" : "not supported");
-    }
 
     ffxCreateContextDescUpscale create = {};
     create.header.type                 = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
@@ -782,49 +392,16 @@ bool Fsr4Upscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& in
     create.header.pNext        = &backend.header;
     backend.header.pNext       = &version.header;
 
-    auto create_ = [&](int model) {
-        g_wantedModel   = model;
-        g_acceptedModel = -1;
-        g_nativeAnswers = 0;
-        return m_drv->provider.createContext(&m_ctx, &create.header, nullptr);
-    };
     const auto t0 = GetTickCount64();
-    uint32_t   rc = create_(wanted);
-    if (rc == FFX_API_RETURN_OK && m_ctx && wanted == kFsr4Auto && g_acceptedModel.load() < 0 && ModelForGpu(g_gpu) > 0 &&
-        ModelForGpu(g_gpu) != kFsr4Fp8)
+    m_model = Fsr4CreateWithModel(*m_drv, wanted, GpuForDevice(device), &m_ctx, &create.header);
+    if (m_model < 0)
     {
-        // AMD's checks only run for an AMD vendor ID; under Proton's NVIDIA spoof they see 10de and accept nothing.
-        // Auto then means the network AMD picks for this GPU's family.
-        LOGI("FSR 4: AMD's device checks accepted no network (the DLL sees vendor %04x); auto -> %s for amdgpu family "
-             "%u revision %u", props.vendorID, Fsr4ModelName(ModelForGpu(g_gpu)), g_gpu.family, g_gpu.revision);
-        m_drv->provider.destroyContext(&m_ctx, nullptr);
-        m_ctx = nullptr;
-        rc    = create_(ModelForGpu(g_gpu));
-    }
-    const int      accepted = g_acceptedModel.load();
-    const int      native   = g_nativeAnswers.load();
-    std::string nativeList;
-    for (int m = 1; m < kFsr4ModelCount; ++m)
-        if (native & (1 << m))
-            nativeList += std::string(nativeList.empty() ? "" : ", ") + Fsr4ModelName(m);
-    if (rc != FFX_API_RETURN_OK || !m_ctx)
-    {
-        LOGI("FSR 4: createContext failed (%u), asked for %s", rc, Fsr4ModelName(wanted));
         m_ctx = nullptr;
         return false;
     }
-    if (accepted < 0 || (g_wantedModel.load() != kFsr4Auto && accepted != g_wantedModel.load()))
-    {
-        LOGI("FSR 4: context created but no FSR 4 network accepted the device (asked for %s, AMD's checks accept: %s); "
-             "not using it", Fsr4ModelName(wanted), nativeList.empty() ? "none" : nativeList.c_str());
-        return false;
-    }
-    m_model = accepted;
-    LOGI("FSR 4 context %ux%u -> %ux%u: provider \"%s\", network %s (asked for %s; AMD's own choice: %s), flags 0x%x, "
-         "created in %llu ms",
-         create.maxRenderSize.width, create.maxRenderSize.height, info.displayWidth, info.displayHeight,
-         m_drv->versionName.c_str(), Fsr4ModelName(m_model), Fsr4ModelName(wanted),
-         nativeList.empty() ? "none" : nativeList.c_str(), create.flags, (unsigned long long)(GetTickCount64() - t0));
+    LOGI("FSR 4 (Vulkan) context %ux%u -> %ux%u, flags 0x%x, created in %llu ms", create.maxRenderSize.width,
+         create.maxRenderSize.height, info.displayWidth, info.displayHeight, create.flags,
+         (unsigned long long)(GetTickCount64() - t0));
     m_info.fsr4Model  = wanted;
     m_info.fsr4Active = m_model;
     return true;
@@ -973,7 +550,7 @@ int Fsr4ModelFromName(const char* name)
 bool Fsr4Unavailable(int model)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_loadTried && g_loadFailed)
+    if (g_loadTried && !g_loadOk)
         return true;
     return model >= 0 && model < kFsr4ModelCount && g_modelFailed[model];
 }
@@ -982,7 +559,7 @@ std::unique_ptr<Upscaler> CreateFsr4Upscaler(const VulkanDevice& device, const U
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     const int model = info.fsr4Model >= 0 && info.fsr4Model < kFsr4ModelCount ? info.fsr4Model : kFsr4Auto;
-    if ((g_loadTried && g_loadFailed) || g_modelFailed[model])
+    if ((g_loadTried && !g_loadOk) || g_modelFailed[model])
         return nullptr;
     UpscalerCreateInfo fixed = info;
     fixed.fsr4Model          = model;

@@ -26,7 +26,7 @@ import aiss_core as core  # noqa: E402
 from aiss_core import (AissCore, build_launch_options, strip_launch_options, reg_set_value,  # noqa: E402
                        reg_delete_value, reg_has_value, REG_KEY_PATH, SIG_OVERRIDE_VALUE)
 
-S0 = {"quality": 0, "log": 1, "fast_math": 0}
+S0 = {"upscaler": 0, "log": 1, "fast_math": 0}
 
 
 def bin_dir(tmp: Path) -> Path:
@@ -48,11 +48,12 @@ def bin_dir(tmp: Path) -> Path:
     else:  # stand-ins: the tests only move the files around
         (d / "libxess.dll").write_bytes(b"MZ stand-in for Intel libxess.dll")
         (d / "libxess-LICENSE.txt").write_text("stand-in licence\n")
-    amd = REPO.parent / "third_party/amd/amdvkffx64.dll"
-    if amd.is_file():
-        os.symlink(amd, d / "amdvkffx64.dll")  # 72 MB: linked, not copied
-    else:
-        (d / "amdvkffx64.dll").write_bytes(b"MZ stand-in for AMD amdvkffx64.dll")
+    for amd in ("amdvkffx64.dll", "amdxcffx64.dll"):
+        src = REPO.parent / "third_party/amd" / amd
+        if src.is_file():
+            os.symlink(src, d / amd)  # tens of MB: linked, not copied
+        else:
+            (d / amd).write_bytes(b"MZ stand-in for AMD " + amd.encode())
     return d
 
 
@@ -136,7 +137,7 @@ class LaunchOptionTests(unittest.TestCase):
 
     def test_settings_change(self):
         new, rec = build_launch_options("", "dxgi", S0, None)
-        s2 = {"quality": 0, "log": 2}
+        s2 = {"log": 2}
         new2, rec2 = build_launch_options(new, "dxgi", s2, rec)
         self.assertEqual(new2, 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_LOG=2 '
                                'WINEDLLOVERRIDES="dxgi=n,b" %command%')
@@ -339,11 +340,13 @@ class FakeLibraryTests(unittest.TestCase):
             # XeSS (Intel's binary) and FSR 4 (AMD's) go next to the core, unmodified
             self.assertEqual((p / "drive_c/windows/system32/libxess.dll").read_bytes(),
                              (self.bin / "libxess.dll").read_bytes())
-            if (self.bin / "amdvkffx64.dll").is_file():
-                self.assertEqual(sha256_of(p / "drive_c/windows/system32/amdvkffx64.dll"),
-                                 sha256_of(self.bin / "amdvkffx64.dll"))
-            else:
-                self.assertFalse((p / "drive_c/windows/system32/amdvkffx64.dll").exists())
+            # AMD's FSR 4 DLLs go in a private system32/aiss subfolder (Proton's own amdxcffx64 in system32 can't shadow them)
+            for amd in ("amdvkffx64.dll", "amdxcffx64.dll"):
+                dst = p / "drive_c/windows/system32/aiss" / amd
+                if (self.bin / amd).is_file():
+                    self.assertEqual(sha256_of(dst), sha256_of(self.bin / amd))
+                else:
+                    self.assertFalse(dst.exists())
             self.assertTrue(reg_has_value((p / "system.reg").read_text(), REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
             self.assertEqual((p / "system.reg.aiss-bak").read_text(), REG_SAMPLE)
         self.assertTrue((self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll.aiss-orig").exists())
@@ -384,35 +387,43 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertEqual((sys32 / "libxess.dll").read_bytes(), b"MZ a game's own libxess")
         self.assertFalse((sys32 / "_nvngx.dll").exists())
 
-    def test_fsr4_dll_optional_and_foreign_kept(self):
+    def test_fsr4_dlls_private_subfolder_and_optional(self):
         sys32 = self.pfx(self.steam, "1001") / "drive_c/windows/system32"
-        # bundles with and without the AMD DLL (the build skips it when it is not available)
-        withfsr, nofsr = self.tmp / "bin_fsr4", self.tmp / "bin_nofsr4"
+        aiss  = sys32 / "aiss"
+        # a bundle with both AMD DLLs (the build skips whichever it cannot find locally)
+        withfsr = self.tmp / "bin_fsr4"
         withfsr.mkdir()
-        nofsr.mkdir()
         for f in self.bin.iterdir():
-            if f.name != "amdvkffx64.dll":
+            if f.name not in ("amdvkffx64.dll", "amdxcffx64.dll"):
                 os.symlink(f.resolve(), withfsr / f.name)
-                os.symlink(f.resolve(), nofsr / f.name)
-        if (self.bin / "amdvkffx64.dll").is_file():
-            os.symlink((self.bin / "amdvkffx64.dll").resolve(), withfsr / "amdvkffx64.dll")
-        else:
-            (withfsr / "amdvkffx64.dll").write_bytes(b"MZ stand-in for AMD amdvkffx64.dll")
+        for amd in ("amdvkffx64.dll", "amdxcffx64.dll"):
+            if (self.bin / amd).is_file():
+                os.symlink((self.bin / amd).resolve(), withfsr / amd)
+            else:
+                (withfsr / amd).write_bytes(b"MZ stand-in for AMD " + amd.encode())
+        # Proton's own amdxcffx64 sits in system32; ours must land in the private aiss subfolder, not shadow it
+        self.put(sys32 / "amdxcffx64.dll", b"MZ proton builtin amdxcffx64 4.1.1")
         self.core = self.make_core(bin_dir=withfsr)
-        self.put(sys32 / "amdvkffx64.dll", b"MZ a game's own amdvkffx64")
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
-        self.assertEqual(sha256_of(sys32 / "amdvkffx64.dll"), sha256_of(withfsr / "amdvkffx64.dll"))
-        self.assertEqual((sys32 / "amdvkffx64.dll.aiss-orig").read_bytes(), b"MZ a game's own amdvkffx64")
+        self.assertEqual(sha256_of(aiss / "amdvkffx64.dll"), sha256_of(withfsr / "amdvkffx64.dll"))
+        self.assertEqual(sha256_of(aiss / "amdxcffx64.dll"), sha256_of(withfsr / "amdxcffx64.dll"))
+        self.assertEqual((sys32 / "amdxcffx64.dll").read_bytes(), b"MZ proton builtin amdxcffx64 4.1.1")  # untouched
         self.assertTrue(self.core.bundle_info()["fsr4"])
         self.core.uninstall_game("1001")
-        self.assertEqual((sys32 / "amdvkffx64.dll").read_bytes(), b"MZ a game's own amdvkffx64")
-        (sys32 / "amdvkffx64.dll").unlink()
-        # a bundle built without the AMD DLL: not reported missing, nothing installed for it, games still "installed"
+        self.assertFalse(aiss.exists())  # the private subfolder is removed on uninstall
+        self.assertEqual((sys32 / "amdxcffx64.dll").read_bytes(), b"MZ proton builtin amdxcffx64 4.1.1")
+        (sys32 / "amdxcffx64.dll").unlink()
+        # a bundle built without the AMD DLLs: not reported missing, nothing installed for them, games still "installed"
+        nofsr = self.tmp / "bin_nofsr4"
+        nofsr.mkdir()
+        for f in self.bin.iterdir():
+            if f.name not in ("amdvkffx64.dll", "amdxcffx64.dll"):
+                os.symlink(f.resolve(), nofsr / f.name)
         self.core = self.make_core(bin_dir=nofsr)
         self.assertEqual(self.core.bundle_missing(), [])
         self.assertFalse(self.core.bundle_info()["fsr4"])
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
-        self.assertFalse((sys32 / "amdvkffx64.dll").exists())
+        self.assertFalse((sys32 / "aiss").exists())
         self.assertEqual(self.view("1001")["status"], "installed")
         self.core.uninstall_game("1001")
         self.assertFalse((sys32 / "_nvngx.dll").exists())
@@ -536,41 +547,55 @@ class FakeLibraryTests(unittest.TestCase):
         lo = self.core.launch_options("1002", "-novid", True)
         self.assertEqual(lo["options"], f'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_CONTROL={control} '
                                         'WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
-        # The model is switched live through the control file, not the launch options.
-        self.core.set_settings({"quality": 2, "log": 0})
-        self.assertEqual(control.read_text().strip(), "2 0 0")
-        self.core.set_settings({"quality": 0})
-        self.assertEqual(control.read_text().strip(), "0 0 0")
+        # The control file: a legacy first line "<upscaler> <fast_math> <capture>", then key=value lines. Old proxies
+        # read the first line; new ones also read the keys. Everything switches live, not through the launch options.
+        def ctl():
+            text = control.read_text()
+            d = {"_first": text.splitlines()[0]}
+            for ln in text.splitlines():
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    d[k] = v
+            return d
+        self.core.set_settings({"upscaler": 2, "log": 0})
+        self.assertEqual(ctl()["_first"], "2 0 0")
+        self.assertEqual(ctl()["upscaler"], "2")
+        self.assertEqual(ctl()["log"], "0")
+        self.core.set_settings({"upscaler": 0})
+        self.assertEqual(ctl()["_first"], "0 0 0")
         # Fast maths also goes through the control file and keeps the launch options unchanged.
         self.core.set_settings({"fast_math": 1})
-        self.assertEqual(control.read_text().strip(), "0 1 0")
+        self.assertEqual(ctl()["_first"], "0 1 0")
+        self.assertEqual(ctl()["fast_math"], "1")
         # Each capture request bumps the third value; settings changes keep it.
         r = self.core.request_capture()
         self.assertEqual(r["seq"], 1)
-        self.assertEqual(control.read_text().strip(), "0 1 1")
+        self.assertEqual(ctl()["_first"], "0 1 1")
         self.core.request_capture()
-        self.core.set_settings({"quality": 2})
-        self.assertEqual(control.read_text().strip(), "2 1 2")
-        # 3 selects XeSS, 4-6 the FSR 4 networks (Lite, INT8, INT8 RDNA 2)
-        self.core.set_settings({"quality": 3})
-        self.assertEqual(control.read_text().strip(), "3 1 2")
-        for q in (4, 5, 6):
-            self.core.set_settings({"quality": q})
-            self.assertEqual(control.read_text().strip(), f"{q} 1 2")
-        with self.assertRaises(ValueError):
-            self.core.set_settings({"quality": 7})
-        self.core.set_settings({"quality": 2})
+        self.core.set_settings({"upscaler": 2})
+        self.assertEqual(ctl()["_first"], "2 1 2")
+        # XeSS (3), and FSR 4 (upscaler 4) with a model: Auto=8, Lite=4, INT8=5, INT8 RDNA 2=6.
+        self.core.set_settings({"upscaler": 3})
+        self.assertEqual(ctl()["_first"], "3 1 2")
+        for model, code in ((0, 8), (1, 4), (2, 5), (3, 6)):
+            self.core.set_settings({"upscaler": 4, "fsr4_model": model})
+            self.assertEqual(ctl()["_first"], f"{code} 1 2")
+            self.assertEqual(ctl()["upscaler"], str(code))
+        # FSR 4 path, watermark, gpu timing and xess preset all go through the control file.
+        self.core.set_settings({"fsr4_path": 2, "watermark": 1, "gpu_timing": 1, "xess_quality": 101})
+        self.assertEqual((ctl()["fsr4_path"], ctl()["watermark"], ctl()["gpu_timing"], ctl()["xess_quality"]),
+                         ("2", "1", "1", "101"))
+        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"fsr4_path": 3}, {"xess_quality": 99}, {"fast_math": 2},
+                    {"quality": 7}):
+            with self.assertRaises(ValueError):
+                self.core.set_settings(bad)
+        self.core.set_settings({"upscaler": 2})
         self.assertIsNone(self.core.latest_capture())
         cap = self.core.captures_dir / "Game_20261027_120000"
         cap.mkdir(parents=True)
         (cap / "000_output.raw").write_bytes(b"x")
         self.assertEqual(self.core.latest_capture()["frames"], 1)
-        self.core.set_settings({"quality": 0})
-        with self.assertRaises(ValueError):
-            self.core.set_settings({"fast_math": 2})
-        self.core.set_settings({"fast_math": 0})
-        with self.assertRaises(ValueError):
-            self.core.set_settings({"quality": 9})
+        self.core.set_settings({"upscaler": 0, "watermark": 0, "gpu_timing": 0, "xess_quality": 0})
         # AISS_RATIO / AISS_NSS_QUALITY left over from older plugin versions are removed on the next sync.
         old = lo["options"].replace("AISS_LAYER=1", "AISS_LAYER=1 AISS_RATIO=2.0 AISS_NSS_QUALITY=0")
         lo2 = self.core.launch_options("1002", old, True)
@@ -597,7 +622,7 @@ class FakeLibraryTests(unittest.TestCase):
         st = asyncio.run(p.get_state(True))
         self.assertIn("games", st)
         self.assertIn("settings", st)
-        r = asyncio.run(p.set_settings({"quality": 7}))
+        r = asyncio.run(p.set_settings({"upscaler": 9}))
         self.assertFalse(r["ok"])
         mod.Plugin.core = None
 

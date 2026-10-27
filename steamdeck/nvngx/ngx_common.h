@@ -6,6 +6,9 @@
 #include "nss_upscaler.h"
 #include "params.h"
 
+#include <functional>
+#include <memory>
+
 // Parameter tables handed out by GetParameters / GetCapabilityParameters / AllocateParameters.
 NVSDK_NGX_Result NgxGetParameters(NVSDK_NGX_Parameter** out);       // persistent table, owned by the proxy
 NVSDK_NGX_Result NgxAllocateParameters(NVSDK_NGX_Parameter** out);  // caller frees with DestroyParameters
@@ -19,9 +22,15 @@ void NgxFillDispatch(const NgxParams& p, const UpscalerCreateInfo& info, Upscale
 
 NVSDK_NGX_Result NgxFeatureRequirement(NVSDK_NGX_Feature feature, NVSDK_NGX_FeatureRequirement* out);
 
+// Optional hooks for NgxApplyLiveSettings: a creator (defaults to CreateUpscaler on the current device) and a backend
+// remap applied to the resolved settings (the D3D12 front end uses it to pick the native FSR 4 path).
+using UpscalerCreate = std::function<std::unique_ptr<Upscaler>(const UpscalerCreateInfo&)>;
+using UpscalerRemap  = std::function<UpscalerCreateInfo(const UpscalerCreateInfo&)>;
+
 // Rebuilds the handle's upscaler when the upscaler or NSS quality asked for at runtime (control file) differs from the
 // one it was created with; returns the upscaler to dispatch.
-Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current);
+Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current, const UpscalerCreate& create = {},
+                               const UpscalerRemap& remap = {});
 
 // The upscaler asked for (control file, else AISS_UPSCALER): kBackendXess or kBackendFsr4 (with the FSR 4 model in
 // *fsr4Model) unless that one has failed to load, else kBackendNss.

@@ -179,8 +179,10 @@ bool XessUpscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& in
     // the dynamic-resolution range the proxy reports to games.
     xess_2d_t               output  = {info.displayWidth, info.displayHeight};
     xess_quality_settings_t quality = XESS_QUALITY_SETTING_ULTRA_PERFORMANCE;
-    if (Config().xessQuality >= XESS_QUALITY_SETTING_ULTRA_PERFORMANCE && Config().xessQuality <= XESS_QUALITY_SETTING_AA)
-        quality = xess_quality_settings_t(Config().xessQuality);
+    const int liveXq = LiveXessQuality();
+    const int xq     = liveXq >= 0 ? liveXq : Config().xessQuality;
+    if (xq >= XESS_QUALITY_SETTING_ULTRA_PERFORMANCE && xq <= XESS_QUALITY_SETTING_AA)
+        quality = xess_quality_settings_t(xq);
 
     // Build the pipelines now (blocking): it is the slow part of initialisation (~0.3 s on a Steam Deck).
     const auto t0 = GetTickCount64();

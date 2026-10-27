@@ -56,5 +56,12 @@ int LiveFastMath();
 // Optional third value: a capture request counter. The plugin's "Capture frames" button increments it; each new value
 // asks the proxy to save the next few frames' inputs. -1 when absent.
 int LiveCaptureRequest();
+// Further control-file keys (key=value lines the plugin writes), each -1 when absent so the launch option / env wins.
+int LiveFsr4Path();     // 0 auto, 1 Vulkan DLL, 2 D3D12 native
+int LiveWatermark();    // 0 off, 1 on (AMD's FSR 4 banner)
+int LiveGpuTiming();    // 0 off, 1 on (log the GPU time of each upscale)
+int LiveXessQuality();  // xess_quality_settings_t, 0 = from the render scale
+// The number of evaluations to average GPU timing over: the live gpu_timing toggle (120 when on), else AISS_GPU_TIMING.
+int GpuTimingFrames();
 // The control file as a Windows path (Z:\...), empty when AISS_CONTROL is not set.
 const std::string& ControlFilePath();

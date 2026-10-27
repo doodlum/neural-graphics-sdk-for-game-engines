@@ -23,10 +23,13 @@ static int EnvInt(const char* name, int def)
     return (v && *v) ? atoi(v) : def;
 }
 
+static int LiveLogLevelRaw();  // the control file's log value (-1 when absent), defined with the other live getters
+
 int LogLevel()
 {
-    static const int level = EnvInt("AISS_LOG", 1);
-    return level;
+    static const int envLevel = EnvInt("AISS_LOG", 1);
+    const int        live     = LiveLogLevelRaw();
+    return live >= 0 ? live : envLevel;
 }
 
 void Log(int level, const char* fmt, ...)
@@ -118,9 +121,14 @@ const ProxyConfig& Config()
 
 struct LiveControl
 {
-    int nssQuality = -1;
-    int fastMath   = -1;
-    int capture    = -1;
+    int nssQuality  = -1;  // control-file upscaler value 0-8 (0-2 NSS, 3 XeSS, 4-8 FSR 4)
+    int fastMath    = -1;
+    int capture     = -1;
+    int fsr4Path    = -1;  // 0 auto, 1 vk, 2 dx12
+    int watermark   = -1;  // 0 off, 1 on
+    int logLevel    = -1;  // 0-4
+    int gpuTiming   = -1;  // 0 off, 1 on
+    int xessQuality = -1;  // xess_quality_settings_t, 0 = from render scale
 };
 
 const std::string& ControlFilePath()
@@ -155,14 +163,44 @@ static LiveControl ReadLiveControl()
     FILE*       f = fopen(path.c_str(), "r");
     if (f)
     {
-        int q = -1, fast = -1, capture = -1;
-        const int n = fscanf(f, "%d %d %d", &q, &fast, &capture);
-        if (n >= 1 && q >= 0 && q <= 8)
-            read.nssQuality = q;  // 3 = XeSS, 4-8 = FSR 4
-        if (n >= 2 && (fast == 0 || fast == 1))
-            read.fastMath = fast;
-        if (n >= 3 && capture >= 0)
-            read.capture = capture;
+        // Two formats, both accepted: the legacy first line "<upscaler> [fast_math] [capture]" (three ints), and
+        // key=value lines (one per line). The plugin writes key=value; older plugins and manual files still work.
+        char line[256];
+        bool firstLine = true;
+        auto setInt = [](const char* s, int lo, int hi, int& out) {
+            int v;
+            if (sscanf(s, "%d", &v) == 1 && v >= lo && v <= hi)
+                out = v;
+        };
+        while (fgets(line, sizeof(line), f))
+        {
+            char* eq = strchr(line, '=');
+            if (eq)
+            {
+                *eq           = 0;
+                const char* k = line;
+                const char* v = eq + 1;
+                if (!strcmp(k, "upscaler")) setInt(v, 0, 8, read.nssQuality);
+                else if (!strcmp(k, "fast_math")) setInt(v, 0, 1, read.fastMath);
+                else if (!strcmp(k, "capture")) setInt(v, 0, 1 << 30, read.capture);
+                else if (!strcmp(k, "fsr4_path")) setInt(v, 0, 2, read.fsr4Path);
+                else if (!strcmp(k, "watermark")) setInt(v, 0, 1, read.watermark);
+                else if (!strcmp(k, "log")) setInt(v, 0, 4, read.logLevel);
+                else if (!strcmp(k, "gpu_timing")) setInt(v, 0, 1, read.gpuTiming);
+                else if (!strcmp(k, "xess_quality")) setInt(v, 0, 1000, read.xessQuality);
+                firstLine = false;
+                continue;
+            }
+            if (firstLine)  // legacy three-int line
+            {
+                int q = -1, fast = -1, capture = -1;
+                const int n = sscanf(line, "%d %d %d", &q, &fast, &capture);
+                if (n >= 1 && q >= 0 && q <= 8) read.nssQuality = q;
+                if (n >= 2 && (fast == 0 || fast == 1)) read.fastMath = fast;
+                if (n >= 3 && capture >= 0) read.capture = capture;
+            }
+            firstLine = false;
+        }
         fclose(f);
     }
     value = read;
@@ -198,4 +236,37 @@ int LiveFastMath()
 int LiveCaptureRequest()
 {
     return ReadLiveControl().capture;
+}
+
+int LiveFsr4Path()
+{
+    return ReadLiveControl().fsr4Path;
+}
+
+int LiveWatermark()
+{
+    return ReadLiveControl().watermark;
+}
+
+int LiveGpuTiming()
+{
+    return ReadLiveControl().gpuTiming;
+}
+
+int LiveXessQuality()
+{
+    return ReadLiveControl().xessQuality;
+}
+
+static int LiveLogLevelRaw()
+{
+    return ReadLiveControl().logLevel;
+}
+
+int GpuTimingFrames()
+{
+    const int live = LiveGpuTiming();
+    if (live >= 0)
+        return live ? (Config().gpuTiming > 0 ? Config().gpuTiming : 120) : 0;
+    return Config().gpuTiming;
 }

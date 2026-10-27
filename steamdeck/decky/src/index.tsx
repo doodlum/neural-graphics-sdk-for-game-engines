@@ -34,15 +34,20 @@ interface Game {
 }
 
 interface Settings {
-  quality: number;
-  log: number;
+  upscaler: number;    // 0 NSS Quality, 1 NSS Balanced, 2 NSS Performance, 3 XeSS, 4 FSR 4
+  fsr4_model: number;  // 0 Auto, 1 Lite, 2 INT8, 3 INT8 RDNA 2
+  fsr4_path: number;   // 0 Auto, 1 Vulkan DLL, 2 D3D12 native
+  watermark: number;
   fast_math: number;
+  xess_quality: number;
+  gpu_timing: number;
+  log: number;
 }
 
 interface State {
   games: Game[];
   settings: Settings;
-  bundle: { missing: string[]; version: string; fsr4?: boolean };
+  bundle: { missing: string[]; version: string; fsr4?: boolean; fsr4_dx12?: boolean };
 }
 
 interface OpResult {
@@ -134,16 +139,33 @@ const STATUS_LABEL: Record<Status, string> = {
   needs_repair: "Needs repair",
 };
 
+// NSS shader quality names from Arm's FfxApiNssShaderQualityMode (0 Quality, 1 Balanced, 2 Performance).
 const UPSCALER_OPTIONS = [
-  { data: 0, label: "NSS Full" },
-  { data: 2, label: "NSS Fast" },
+  { data: 0, label: "NSS Quality" },
+  { data: 1, label: "NSS Balanced" },
+  { data: 2, label: "NSS Performance" },
   { data: 3, label: "XeSS" },
 ];
-// AMD FSR 4 networks (amdvkffx64.dll), offered when the bundle has the DLL.
-const FSR4_OPTIONS = [
-  { data: 4, label: "FSR 4 Lite" },
-  { data: 5, label: "FSR 4 INT8" },
-  { data: 6, label: "FSR 4 INT8 RDNA 2" },
+const FSR4_UPSCALER_OPTION = { data: 4, label: "FSR 4" };
+const FSR4_MODEL_OPTIONS = [
+  { data: 0, label: "Auto (AMD's choice)" },
+  { data: 1, label: "Lite" },
+  { data: 2, label: "INT8" },
+  { data: 3, label: "INT8 RDNA 2" },
+];
+const FSR4_PATH_OPTIONS = [
+  { data: 0, label: "Auto (native D3D12 where possible)" },
+  { data: 1, label: "Vulkan DLL" },
+  { data: 2, label: "D3D12 native" },
+];
+const XESS_QUALITY_OPTIONS = [
+  { data: 0, label: "Auto (from render scale)" },
+  { data: 100, label: "Ultra Performance" },
+  { data: 101, label: "Performance" },
+  { data: 102, label: "Balanced" },
+  { data: 103, label: "Quality" },
+  { data: 104, label: "Ultra Quality" },
+  { data: 105, label: "Ultra Quality Plus" },
 ];
 const LOG_OPTIONS = [
   { data: 0, label: "Off" },
@@ -288,26 +310,78 @@ function Content() {
           <DropdownItem
             label="Upscaler"
             description={
-              "Switches live in-game. NSS Full: best NSS quality. NSS Fast: small network, more ghosting. XeSS: Intel XeSS (supports dynamic resolution)." +
-              (state.bundle.fsr4
-                ? " FSR 4: AMD's networks (Lite is AMD's handheld choice; INT8 and INT8 RDNA 2 are the desktop ones, slower)."
-                : "")
+              "Switches live in-game. NSS Quality: best NSS network. NSS Balanced / Performance: smaller networks, faster, more ghosting. XeSS: Intel XeSS (dynamic resolution)." +
+              (state.bundle.fsr4 ? " FSR 4: AMD's networks (pick the model and path below)." : "")
             }
-            rgOptions={state.bundle.fsr4 ? [...UPSCALER_OPTIONS, ...FSR4_OPTIONS] : UPSCALER_OPTIONS}
-            selectedOption={
-              s.quality === 2 || s.quality === 3 || (state.bundle.fsr4 && s.quality >= 4 && s.quality <= 6) ? s.quality : 0
-            }
+            rgOptions={state.bundle.fsr4 ? [...UPSCALER_OPTIONS, FSR4_UPSCALER_OPTION] : UPSCALER_OPTIONS}
+            selectedOption={s.upscaler >= 0 && s.upscaler <= (state.bundle.fsr4 ? 4 : 3) ? s.upscaler : 0}
             disabled={!!busy}
-            onChange={(o) => changeSetting({ quality: o.data })}
+            onChange={(o) => changeSetting({ upscaler: o.data })}
           />
         </PanelSectionRow>
+        {state.bundle.fsr4 && s.upscaler === 4 && (
+          <>
+            <PanelSectionRow>
+              <DropdownItem
+                label="FSR 4 model"
+                description="Auto lets AMD choose (Lite on a Steam Deck). INT8 and INT8 RDNA 2 are the desktop networks: much slower here."
+                rgOptions={FSR4_MODEL_OPTIONS}
+                selectedOption={s.fsr4_model}
+                disabled={!!busy}
+                onChange={(o) => changeSetting({ fsr4_model: o.data })}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <DropdownItem
+                label="FSR 4 path"
+                description="Native D3D12 (amdxcffx64.dll) is ~2x faster than the Vulkan DLL on D3D12 games; Vulkan and D3D11 games always use the Vulkan DLL."
+                rgOptions={
+                  state.bundle.fsr4_dx12 ? FSR4_PATH_OPTIONS : FSR4_PATH_OPTIONS.filter((o) => o.data !== 2)
+                }
+                selectedOption={s.fsr4_path}
+                disabled={!!busy}
+                onChange={(o) => changeSetting({ fsr4_path: o.data })}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ToggleField
+                label="FSR 4 watermark"
+                description="Draw AMD's version/network banner on the output (proof of which model runs). Applies when the upscaler is next (re)built."
+                checked={!!s.watermark}
+                disabled={!!busy}
+                onChange={(v) => changeSetting({ watermark: v ? 1 : 0 })}
+              />
+            </PanelSectionRow>
+          </>
+        )}
+        {s.upscaler === 3 && (
+          <PanelSectionRow>
+            <DropdownItem
+              label="XeSS preset"
+              description="Input-range preset. Auto follows the render scale; the others fix the range."
+              rgOptions={XESS_QUALITY_OPTIONS}
+              selectedOption={s.xess_quality}
+              disabled={!!busy}
+              onChange={(o) => changeSetting({ xess_quality: o.data })}
+            />
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <ToggleField
             label="Fast maths"
             description="NSS only: ~2% faster upscaling; output no longer bit-exact (about half an 8-bit step). Switches live."
             checked={!!s.fast_math}
-            disabled={!!busy || s.quality >= 3}
+            disabled={!!busy || s.upscaler >= 3}
             onChange={(v) => changeSetting({ fast_math: v ? 1 : 0 })}
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ToggleField
+            label="Log GPU time"
+            description="Log the GPU milliseconds per upscale to aiss_nvngx.log (AISS_GPU_TIMING). Switches live."
+            checked={!!s.gpu_timing}
+            disabled={!!busy}
+            onChange={(v) => changeSetting({ gpu_timing: v ? 1 : 0 })}
           />
         </PanelSectionRow>
         <PanelSectionRow>

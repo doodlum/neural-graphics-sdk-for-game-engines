@@ -7,9 +7,11 @@ Per enabled game the plugin owns:
   * pfx/drive_c/windows/system32/_nvngx.dll        the NSS NGX core (a foreign file there is backed up and restored)
   * pfx/drive_c/windows/system32/libxess.dll       Intel XeSS (unmodified Intel binary), loaded by the core when the
                                                    XeSS upscaler is selected (same backup/restore rules)
-  * pfx/drive_c/windows/system32/amdvkffx64.dll    AMD FSR 4 (unmodified file from AMD's Vulkan driver), loaded by the
-                                                   core when an FSR 4 upscaler is selected; only when the bundle has
-                                                   it (same backup/restore rules)
+  * pfx/drive_c/windows/system32/aiss/amdvkffx64.dll   AMD FSR 4 Vulkan DLL (unmodified), loaded by the core for FSR 4
+  * pfx/drive_c/windows/system32/aiss/amdxcffx64.dll   AMD FSR 4 D3D12 DLL (unmodified), the faster native D3D12 path
+                                                   Both live in a private "aiss" subfolder so Proton's own (older) copy
+                                                   of amdxcffx64.dll in system32 cannot shadow them; installed only when
+                                                   the bundle has them.
   * <exe dir>/dbghelp.dll or <exe dir>/dxgi.dll   the loader shim (never overwrites a file that is not ours)
   * HKLM\\Software\\NVIDIA Corporation\\Global {41FCC608-...}=hex:01 in pfx/system.reg (only while the game is not
     running, with a one-time backup of system.reg)
@@ -42,16 +44,19 @@ BIN_FILES = {
     "layer_json": "VkLayer_aiss_ngx.json",
     "xess": "libxess.dll",                  # Intel XeSS SDK binary, redistributed unmodified
     "xess_license": "libxess-LICENSE.txt",  # its licence (Intel Simplified Software License), shipped with it
-    "fsr4": "amdvkffx64.dll",               # AMD FSR 4 (AMD Vulkan driver component), redistributed unmodified
+    "fsr4": "amdvkffx64.dll",               # AMD FSR 4 Vulkan DLL (AMD driver component), redistributed unmodified
+    "fsr4_dx12": "amdxcffx64.dll",          # AMD FSR 4 D3D12 DLL (AMD driver component), redistributed unmodified
 }
 # Bundle files the plugin works without (the build skips them when they are not available locally).
-OPTIONAL_BIN = ("fsr4",)
+OPTIONAL_BIN = ("fsr4", "fsr4_dx12")
 CORE_DEST_NAME = "_nvngx.dll"
 XESS_DEST_NAME = "libxess.dll"
-FSR4_DEST_NAME = "amdvkffx64.dll"
-# Files installed into each prefix's system32: (bundle key, file name, marker of any build of ours or None, state key).
+# AMD's FSR 4 DLLs go in a private subfolder so Proton's own amdxcffx64.dll in system32 cannot shadow them.
+FSR4_SUBDIR = "aiss"
+# Files installed into each prefix's system32: (bundle key, dest path relative to system32, marker or None, state key).
 PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME, None, "xess"),
-                ("fsr4", FSR4_DEST_NAME, None, "fsr4"))
+                ("fsr4", f"{FSR4_SUBDIR}/amdvkffx64.dll", None, "fsr4"),
+                ("fsr4_dx12", f"{FSR4_SUBDIR}/amdxcffx64.dll", None, "fsr4_dx12"))
 CORE_BACKUP_SUFFIX = ".aiss-orig"
 REG_BACKUP_SUFFIX = ".aiss-bak"
 
@@ -86,15 +91,34 @@ WDO_ENV = "WINEDLLOVERRIDES"
 COMMAND = "%command%"
 
 DEFAULT_SETTINGS = {
-    "quality": 0,        # upscaler: 0 = NSS full network (default), 2 = NSS fast small network (more ghosting),
-                         # 3 = Intel XeSS, 4 = FSR 4 Lite, 5 = FSR 4 INT8, 6 = FSR 4 INT8 RDNA 2; applied live
-    "log": 1,            # AISS_LOG level; 1 is the core's default and is not written out
-    "fast_math": 0,      # 1 = fp32 requantisation in the ML graph (~2% faster, not bit exact); applied live
+    # Upscaler family: 0 NSS Quality, 1 NSS Balanced, 2 NSS Performance, 3 XeSS, 4 FSR 4. Applied live.
+    "upscaler": 0,
+    "fsr4_model": 0,     # when upscaler == 4: 0 Auto (AMD's choice), 1 Lite, 2 INT8, 3 INT8 RDNA 2
+    "fsr4_path": 0,      # FSR 4 path: 0 Auto (native D3D12 where possible), 1 Vulkan DLL, 2 D3D12 native
+    "watermark": 0,      # 1 = draw AMD's FSR 4 version/network banner on the output
+    "fast_math": 0,      # NSS only: 1 = fp32 requantisation in the ML graph (~2% faster, not bit exact)
+    "xess_quality": 0,   # XeSS preset override: 0 = from the render scale, else 100-105 (Ultra Perf .. AA)
+    "gpu_timing": 0,     # 1 = log the GPU time of each upscale (AISS_GPU_TIMING)
+    "log": 1,            # AISS_LOG level 0-4; 1 is the core's default
 }
+# FSR 4 model (setting value) -> control-file upscaler code (4 Lite, 5 INT8, 6 INT8 RDNA 2, 8 Auto).
+FSR4_MODEL_TO_CODE = {0: 8, 1: 4, 2: 5, 3: 6}
 
 # Control file upscaler values: 0-2 NSS, 3 XeSS, 4 FSR 4 Lite, 5 FSR 4 INT8, 6 FSR 4 INT8 RDNA 2 (the proxy also
 # understands 7 = FP8 and 8 = AMD's automatic choice, not offered: FP8 needs RDNA 4, auto is Lite on a Steam Deck).
-QUALITY_VALUES = (0, 1, 2, 3, 4, 5, 6)
+
+def migrate_settings(s: dict) -> dict:
+    """Bring an older settings dict up to date: the single 'quality' key (0-6) becomes upscaler + fsr4_model."""
+    s = {**DEFAULT_SETTINGS, **s}
+    s.pop("ratio", None)  # removed long ago
+    if "quality" in s:
+        q = int(s.pop("quality"))
+        if q in (0, 1, 2, 3):
+            s["upscaler"] = q
+        elif q in (4, 5, 6):
+            s["upscaler"] = 4
+            s["fsr4_model"] = {4: 1, 5: 2, 6: 3}[q]
+    return s
 
 STATUS_INSTALLED = "installed"
 STATUS_NOT_INSTALLED = "not_installed"
@@ -631,7 +655,7 @@ class AissCore:
                 loaded = json.load(f)
             if isinstance(loaded, dict):
                 state.update({k: v for k, v in loaded.items() if k in state})
-                state["settings"] = {**DEFAULT_SETTINGS, **(loaded.get("settings") or {})}
+                state["settings"] = migrate_settings({**DEFAULT_SETTINGS, **(loaded.get("settings") or {})})
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -663,7 +687,8 @@ class AissCore:
         return [f for f in PREFIX_FILES if f[0] not in OPTIONAL_BIN or self.bundle_path(f[0]).is_file()]
 
     def bundle_info(self) -> dict:
-        info = {"missing": self.bundle_missing(), "version": "", "fsr4": self.bundle_path("fsr4").is_file()}
+        info = {"missing": self.bundle_missing(), "version": "", "fsr4": self.bundle_path("fsr4").is_file(),
+                "fsr4_dx12": self.bundle_path("fsr4_dx12").is_file()}
         try:
             info["version"] = (self.bin_dir / "VERSION").read_text(encoding="utf-8").strip()
         except OSError:
@@ -983,9 +1008,10 @@ class AissCore:
         return CORE_MARKER if key == "core" else None
 
     def _install_core(self, gs: dict, pfx: Path) -> None:
-        """_nvngx.dll, libxess.dll and (when bundled) amdvkffx64.dll into the prefix's system32."""
+        """_nvngx.dll and libxess.dll into system32, and (when bundled) AMD's FSR 4 DLLs into system32/aiss."""
         for key, name, _, sk in self.prefix_files():
             dst = pfx / "drive_c/windows/system32" / name
+            dst.parent.mkdir(parents=True, exist_ok=True)  # the aiss subfolder for the FSR 4 DLLs
             c = self._classify(dst, key, gs.get(f"{sk}_hash"), self._marker(key))
             if c != "current":
                 backup = dst.with_name(dst.name + CORE_BACKUP_SUFFIX)
@@ -999,6 +1025,7 @@ class AissCore:
 
     def _remove_core(self, gs: dict) -> list[str]:
         warnings = []
+        subdirs: set[Path] = set()
         for key, _, _, sk in PREFIX_FILES:
             path = gs.get(f"{sk}_path")
             if not path:
@@ -1012,9 +1039,17 @@ class AissCore:
             backup = gs.get(f"{sk}_backup")
             if backup and Path(backup).exists() and not dst.exists():
                 os.replace(backup, dst)
+            if dst.parent.name == FSR4_SUBDIR:
+                subdirs.add(dst.parent)
             gs.pop(f"{sk}_path", None)
             gs.pop(f"{sk}_hash", None)
             gs.pop(f"{sk}_backup", None)
+        for d in subdirs:  # remove the private aiss folder once its DLLs are gone
+            try:
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
+            except OSError:
+                pass
         return warnings
 
     def _apply_registry(self, appid: str, gs: dict, pfx: Path) -> None:
@@ -1219,15 +1254,34 @@ class AissCore:
     def env_settings(self) -> dict:
         return {**self.state["settings"], "control": str(self.control_path)}
 
+    def control_upscaler_code(self, s: dict | None = None) -> int:
+        """The single control-file upscaler value (0-8) from the upscaler + FSR 4 model settings."""
+        s = s if s is not None else self.state["settings"]
+        u = int(s.get("upscaler", 0))
+        if u <= 3:
+            return u if u in (0, 1, 2, 3) else 0
+        return FSR4_MODEL_TO_CODE.get(int(s.get("fsr4_model", 0)), 8)
+
     def write_control(self) -> None:
-        q = int(self.state["settings"].get("quality", 0))
-        if q not in QUALITY_VALUES:
-            q = 0
-        fast = 1 if self.state["settings"].get("fast_math") else 0
+        s = self.state["settings"]
+        code = self.control_upscaler_code(s)
+        fast = 1 if s.get("fast_math") else 0
         capture = int(self.state.get("capture_seq", 0))
         self.control_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.control_path.with_suffix(".tmp")
-        tmp.write_text(f"{q} {fast} {capture}\n")
+        # Legacy first line (old proxies read "<upscaler> <fast_math> <capture>"), then key=value lines for the rest.
+        lines = [
+            f"{code} {fast} {capture}",
+            f"upscaler={code}",
+            f"fast_math={fast}",
+            f"capture={capture}",
+            f"fsr4_path={int(s.get('fsr4_path', 0))}",
+            f"watermark={1 if s.get('watermark') else 0}",
+            f"log={int(s.get('log', 1))}",
+            f"gpu_timing={1 if s.get('gpu_timing') else 0}",
+            f"xess_quality={int(s.get('xess_quality', 0))}",
+        ]
+        tmp.write_text("\n".join(lines) + "\n")
         os.replace(tmp, self.control_path)
 
     @property
@@ -1253,24 +1307,39 @@ class AissCore:
         return {"name": d.name, "path": str(d), "frames": frames}
 
     def set_settings(self, settings: dict) -> dict:
-        s = dict(self.state["settings"])
-        s.pop("ratio", None)  # option removed; drop it from older state files
-        if "quality" in settings:
+        s = migrate_settings(dict(self.state["settings"]))
+        if "quality" in settings:  # legacy single key (0-6); split into upscaler + fsr4_model
             q = int(settings["quality"])
-            if q != -1 and q not in QUALITY_VALUES:
-                raise ValueError("quality must be 0, 1, 2 (NSS), 3 (XeSS) or 4-6 (FSR 4 Lite / INT8 / INT8 RDNA 2)")
-            s["quality"] = 0 if q == -1 else q
-        if "log" in settings:
-            lv = int(settings["log"])
-            if not 0 <= lv <= 4:
-                raise ValueError("log must be 0..4")
-            s["log"] = lv
-        if "fast_math" in settings:
-            fm = int(settings["fast_math"])
-            if fm not in (0, 1):
-                raise ValueError("fast_math must be 0 or 1")
-            s["fast_math"] = fm
+            if q != -1 and q not in (0, 1, 2, 3, 4, 5, 6):
+                raise ValueError("quality must be 0-6 (NSS 0/1/2, XeSS 3, FSR 4 Lite/INT8/RDNA2 4/5/6)")
+            self._apply_quality(s, q)
+        checks = {
+            "upscaler": (0, 4), "fsr4_model": (0, 3), "fsr4_path": (0, 2), "watermark": (0, 1),
+            "fast_math": (0, 1), "gpu_timing": (0, 1), "log": (0, 4),
+        }
+        for key, (lo, hi) in checks.items():
+            if key in settings:
+                v = int(settings[key])
+                if not lo <= v <= hi:
+                    raise ValueError(f"{key} must be {lo}..{hi}")
+                s[key] = v
+        if "xess_quality" in settings:
+            xq = int(settings["xess_quality"])
+            if xq != 0 and not 100 <= xq <= 105:
+                raise ValueError("xess_quality must be 0 or 100..105")
+            s["xess_quality"] = xq
         self.state["settings"] = s
         self.save_state()
         self.write_control()
         return s
+
+    @staticmethod
+    def _apply_quality(s: dict, q: int) -> None:
+        """Map a legacy single 'quality' value (0-6, -1 = default) to the upscaler + fsr4_model settings."""
+        if q == -1:
+            q = 0
+        if q in (0, 1, 2, 3):
+            s["upscaler"] = q
+        elif q in (4, 5, 6):  # FSR 4 Lite / INT8 / INT8 RDNA 2
+            s["upscaler"] = 4
+            s["fsr4_model"] = {4: 1, 5: 2, 6: 3}[q]

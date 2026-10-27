@@ -44,6 +44,8 @@ add_library(nvngx SHARED
     ngx_vulkan.cpp
     ngx_misc.cpp
     xess_upscaler.cpp
+    fsr4_common.cpp
+    fsr4_dx12.cpp
     fsr4_upscaler.cpp
     spirv_half_images.cpp
     frame_dump.cpp
@@ -68,6 +70,7 @@ target_link_libraries(nvngx PRIVATE
     "${NGSDK_LIBS}/ffx_sdk/windows_x64/libffx_backend_vk_windows_x64.a"
     "${NGSDK_LIBS}/ffx_sdk/windows_x64/libSPIRV-Tools-opt.a"
     "${NGSDK_LIBS}/ffx_sdk/windows_x64/libSPIRV-Tools.a"
-    dxguid)
+    dxguid
+    version)
 # Only the NGX entry points are exported (they carry __declspec(dllexport)).
 target_link_options(nvngx PRIVATE -Wl,--exclude-all-symbols -s)

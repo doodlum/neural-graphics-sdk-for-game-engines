@@ -56,7 +56,7 @@ bool Setup(const VulkanDevice& dev)
     qci.queryCount            = Timer::kSlots * 2;
     if (createPool(dev.device, &qci, nullptr, &g_timer.pool) != VK_SUCCESS)
         g_timer.pool = VK_NULL_HANDLE;
-    LOGI("GPU timing on: upscale time averaged over %d evaluations", Config().gpuTiming);
+    LOGI("GPU timing on: upscale time averaged over %d evaluations", GpuTimingFrames());
     return g_timer.pool != VK_NULL_HANDLE;
 }
 
@@ -82,7 +82,7 @@ void Collect(uint32_t slot)
     t.sum += us;
     t.minUs = us < t.minUs ? us : t.minUs;
     t.maxUs = us > t.maxUs ? us : t.maxUs;
-    if (++t.samples >= uint32_t(Config().gpuTiming))
+    if (++t.samples >= uint32_t(GpuTimingFrames()))
     {
         // Evaluations per second over the same window: the game's frame rate when it upscales once per frame.
         const uint64_t now = GetTickCount64();
@@ -97,7 +97,7 @@ void Collect(uint32_t slot)
 
 bool NgxDispatch(Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerDispatch& d)
 {
-    if (Config().gpuTiming <= 0)
+    if (GpuTimingFrames() <= 0)
     {
         const bool ok = upscaler->Dispatch(cmd, d);
         NgxDumpFrame(upscaler, cmd, d.output);

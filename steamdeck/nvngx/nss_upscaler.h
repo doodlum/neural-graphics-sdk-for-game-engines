@@ -50,7 +50,8 @@ enum UpscalerBackend : int
 {
     kBackendNss  = 0,
     kBackendXess = 1,
-    kBackendFsr4 = 2,
+    kBackendFsr4 = 2,       // AMD FSR 4 on the Vulkan device (amdvkffx64.dll)
+    kBackendFsr4Dx12 = 3,  // AMD FSR 4 natively on the game's D3D12 device (amdxcffx64.dll); only the D3D12 front end
 };
 
 // AMD FSR 4 networks in amdvkffx64.dll. Auto lets the driver pick by GPU (Lite on Van Gogh).
@@ -80,11 +81,15 @@ struct UpscalerDispatch
 };
 
 // One upscaling context (NSS, XeSS or FSR 4) behind an NGX handle.
+class Fsr4Dx12;  // fsr4_dx12.h (D3D12 front end only)
+
 class Upscaler
 {
 public:
     virtual ~Upscaler() = default;
     virtual bool Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d) = 0;
+    // Non-null only for the D3D12-native FSR 4 carrier: it runs on the game's D3D12 device, not the Vulkan one.
+    virtual Fsr4Dx12* AsDx12() { return nullptr; }
 
     const UpscalerCreateInfo& Info() const { return m_info; }
     const VulkanDevice&       Device() const { return m_dev; }

@@ -148,21 +148,36 @@ const char* UpscalerName(const UpscalerCreateInfo& i)
     static thread_local char text[64];
     if (i.backend == kBackendXess)
         snprintf(text, sizeof(text), "XeSS");
-    else if (i.backend == kBackendFsr4)
-        snprintf(text, sizeof(text), "FSR 4 %s%s%s%s", Fsr4ModelName(i.fsr4Model),
+    else if (i.backend == kBackendFsr4 || i.backend == kBackendFsr4Dx12)
+        snprintf(text, sizeof(text), "FSR 4 %s%s%s%s%s", Fsr4ModelName(i.fsr4Model),
                  i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? " (" : "",
                  i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? Fsr4ModelName(i.fsr4Active) : "",
-                 i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? ")" : "");
+                 i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? ")" : "",
+                 i.backend == kBackendFsr4Dx12 ? " DX12" : "");
     else
         snprintf(text, sizeof(text), "NSS quality %d%s", i.nssQuality, i.fastMath ? " fast maths" : "");
     return text;
 }
 
-Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current)
+static bool SameLiveSettings(const UpscalerCreateInfo& a, const UpscalerCreateInfo& b)
+{
+    if (a.backend != b.backend)
+        return false;
+    if (a.backend == kBackendXess)
+        return true;
+    if (a.backend == kBackendFsr4 || a.backend == kBackendFsr4Dx12)
+        return a.fsr4Model == b.fsr4Model;
+    return a.nssQuality == b.nssQuality && a.fastMath == b.fastMath;
+}
+
+Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current, const UpscalerCreate& create,
+                               const UpscalerRemap& remap)
 {
     const UpscalerCreateInfo& old  = current->Info();
     UpscalerCreateInfo        info = old;
     info.backend                   = SelectedBackend(&info.fsr4Model);
+    if (remap)
+        info = remap(info);
     if (info.backend == kBackendNss)
     {
         const int live = LiveNssQuality();
@@ -170,12 +185,10 @@ Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current)
             info.nssQuality = live;
         info.fastMath = FastMathEnabled();
     }
-    if (info.backend == old.backend &&
-        (info.backend == kBackendXess || (info.backend == kBackendFsr4 && info.fsr4Model == old.fsr4Model) ||
-         (info.backend == kBackendNss && info.nssQuality == old.nssQuality && info.fastMath == old.fastMath)))
+    if (SameLiveSettings(info, old))
         return current;
     const std::string from = UpscalerName(old);
-    auto fresh = CreateUpscaler(current->Device(), info);
+    auto fresh = create ? create(info) : CreateUpscaler(current->Device(), info);
     if (!fresh)
     {
         LOGI("switch from %s to %s failed; keeping it", from.c_str(), UpscalerName(info));
