@@ -11,6 +11,7 @@
 //
 //   ffx_nss_replay_test --suite --save DIR     run the standard permutation matrix, write DIR/<config>.bin
 //   ffx_nss_replay_test --suite --check DIR    run it again and compare every frame/pixel/channel with DIR
+//   ffx_nss_replay_test --suite --compare DIR  error vs DIR (max/mean abs diff, PSNR) for non-exact variants (e.g. --fp16)
 //   ffx_nss_replay_test --bench N [config]     run N frames back to back and print per-pass GPU medians
 //
 // Single config options: --quality 0|1|2 (QUALITY/BALANCED/PERFORMANCE), --render WxH, --display WxH, --hdr 0|1,
@@ -74,6 +75,36 @@ namespace
         if (rem > 0x1000u || (rem == 0x1000u && (h & 1u)))
             ++h;
         return uint16_t(sign | h);
+    }
+
+    float HalfToFloat(uint16_t h)
+    {
+        const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+        uint32_t       exp  = (h >> 10) & 0x1Fu;
+        uint32_t       man  = h & 0x3FFu;
+        uint32_t       x;
+        if (exp == 0x1F)
+            x = sign | 0x7F800000u | (man << 13);
+        else if (exp == 0)
+        {
+            if (man == 0)
+                x = sign;
+            else
+            {
+                exp = 113;
+                while ((man & 0x400u) == 0)
+                {
+                    man <<= 1;
+                    --exp;
+                }
+                x = sign | (exp << 23) | ((man & 0x3FFu) << 13);
+            }
+        }
+        else
+            x = sign | ((exp + 112) << 23) | (man << 13);
+        float f;
+        memcpy(&f, &x, 4);
+        return f;
     }
 
     uint32_t Hash32(uint32_t x)
@@ -328,6 +359,8 @@ namespace
     // ---------------------------------------------------------------------------------------------------------------
     // Configuration and synthetic scene
     // ---------------------------------------------------------------------------------------------------------------
+    bool g_allow16bit = false;  // --fp16: FFX_API_NSS_CONTEXT_FLAG_ALLOW_16BIT (fp16 shader permutations, not bit exact)
+
     struct Config
     {
         int      quality       = FFX_API_NSS_SHADER_QUALITY_MODE_PERFORMANCE;
@@ -470,7 +503,8 @@ namespace
             ffxApiCreateContextDescNss desc = {};
             desc.header.type                = FFX_API_CREATE_CONTEXT_DESC_TYPE_NSS;
             desc.flags = FFX_API_NSS_CONTEXT_FLAG_QUANTIZED | FFX_API_NSS_CONTEXT_FLAG_MANAGE_HISTORY | FFX_API_NSS_CONTEXT_FLAG_DEPTH_INFINITE |
-                         FFX_API_NSS_CONTEXT_FLAG_DEPTH_INVERTED | (cfg.hdr ? FFX_API_NSS_CONTEXT_FLAG_HIGH_DYNAMIC_RANGE : 0u);
+                         FFX_API_NSS_CONTEXT_FLAG_DEPTH_INVERTED | (cfg.hdr ? FFX_API_NSS_CONTEXT_FLAG_HIGH_DYNAMIC_RANGE : 0u) |
+                         (g_allow16bit ? FFX_API_NSS_CONTEXT_FLAG_ALLOW_16BIT : 0u);
             desc.maxRenderSize  = {cfg.renderW, cfg.renderH};
             desc.maxUpscaleSize = {cfg.displayW, cfg.displayH};
             desc.qualityMode    = FfxApiNssShaderQualityMode(cfg.quality);
@@ -732,6 +766,74 @@ namespace
         return identical;
     }
 
+    // --compare: error of an RGBA16F run against an (exact) baseline, RGB channels. PSNR uses peak 1 for SDR and the
+    // reference maximum of the compared frames for HDR (the HDR scene goes well above 1).
+    struct ErrorStats
+    {
+        double maxDiff = 0, sumDiff = 0, sumSq = 0, peak = 0;
+        size_t count = 0, nonFinite = 0;
+        void   Add(float a, float b)
+        {
+            if (!std::isfinite(a) || !std::isfinite(b))
+            {
+                ++nonFinite;
+                return;
+            }
+            const double d = std::fabs(double(a) - double(b));
+            maxDiff        = std::max(maxDiff, d);
+            sumDiff += d;
+            sumSq += d * d;
+            peak = std::max(peak, double(std::fabs(b)));
+            ++count;
+        }
+        double Psnr(bool hdr) const
+        {
+            const double mse  = count ? sumSq / double(count) : 0.0;
+            const double pk   = hdr ? std::max(peak, 1.0) : 1.0;
+            return mse > 0 ? 10.0 * std::log10(pk * pk / mse) : INFINITY;
+        }
+        void Print(const char* label, bool hdr) const
+        {
+            printf("    %-10s max %.5f  mean %.6f  PSNR %6.2f dB%s", label, maxDiff, count ? sumDiff / double(count) : 0.0, Psnr(hdr),
+                   nonFinite ? "  (non-finite values!)" : "");
+            if (hdr)
+                printf("  (peak %.2f)", std::max(peak, 1.0));
+            printf("\n");
+        }
+    };
+
+    void CompareError(const Config& cfg, uint32_t bpp, const std::vector<uint8_t>& got, const std::vector<uint8_t>& ref)
+    {
+        if (bpp != 8)
+        {
+            printf("    (compare needs the RGBA16F output)\n");
+            return;
+        }
+        const size_t pixels = size_t(cfg.displayW) * cfg.displayH;
+        ErrorStats   all, frame16, last;
+        for (int f = 0; f < cfg.frames; ++f)
+        {
+            const uint16_t* a = reinterpret_cast<const uint16_t*>(got.data()) + pixels * 4 * f;
+            const uint16_t* b = reinterpret_cast<const uint16_t*>(ref.data()) + pixels * 4 * f;
+            for (size_t p = 0; p < pixels; ++p)
+                for (int c = 0; c < 3; ++c)
+                {
+                    const float x = HalfToFloat(a[p * 4 + c]), y = HalfToFloat(b[p * 4 + c]);
+                    all.Add(x, y);
+                    if (f == 15)
+                        frame16.Add(x, y);
+                    if (f == cfg.frames - 1)
+                        last.Add(x, y);
+                }
+        }
+        all.Print("all frames", cfg.hdr);
+        if (cfg.frames > 16)
+            frame16.Print("frame 16", cfg.hdr);
+        char label[32];
+        snprintf(label, sizeof(label), "frame %d", cfg.frames);
+        last.Print(label, cfg.hdr);
+    }
+
     std::vector<Config> SuiteConfigs(int frames)
     {
         // Every permutation the Steam Deck uses: BALANCED/PERFORMANCE (mid_low network) and QUALITY (high network, below), exact 2x and a non-2x ratio,
@@ -781,7 +883,7 @@ int main(int argc, char** argv)
     Config      cfg;
     int         gpu = 0, bench = 0;
     bool        suite = false;
-    std::string saveDir, checkDir;
+    std::string saveDir, checkDir, compareDir;
     for (int i = 1; i < argc; ++i)
     {
         const std::string a    = argv[i];
@@ -808,11 +910,15 @@ int main(int argc, char** argv)
             saveDir = argv[++i];
         else if (a == "--check" && next)
             checkDir = argv[++i];
+        else if (a == "--compare" && next)
+            compareDir = argv[++i];
+        else if (a == "--fp16")
+            g_allow16bit = true;
         else
         {
             fprintf(stderr,
-                    "usage: %s [--suite] [--save DIR | --check DIR] [--bench N] [--quality 0|1|2] [--render WxH] [--display WxH] [--hdr 0|1]\n"
-                    "          [--frames N] [--out rgba16f|r11g11b10] [--gpu N]\n",
+                    "usage: %s [--suite] [--save DIR | --check DIR | --compare DIR] [--bench N] [--quality 0|1|2] [--render WxH] [--display WxH]\n"
+                    "          [--hdr 0|1] [--frames N] [--out rgba16f|r11g11b10] [--fp16] [--gpu N]\n",
                     argv[0]);
             return 2;
         }
@@ -892,6 +998,19 @@ int main(int argc, char** argv)
                 printf("  DIFFERENT\n");
                 ++failures;
             }
+        }
+        else if (!compareDir.empty())
+        {
+            DumpHeader           h;
+            std::vector<uint8_t> ref;
+            const std::string    path = compareDir + "/" + c.Name() + ".bin";
+            if (!LoadDump(path, h, ref) || h.frames != uint32_t(c.frames) || h.bpp != bpp)
+            {
+                printf("  NO BASELINE (%s)\n", path.c_str());
+                continue;
+            }
+            printf(memcmp(out.data(), ref.data(), out.size()) == 0 ? "  IDENTICAL\n" : "\n");
+            CompareError(c, bpp, out, ref);
         }
         else
             printf("\n");
