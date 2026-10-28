@@ -39,6 +39,7 @@ interface Settings {
   fsr4_model: number;  // 0 Auto, 1 Lite, 2 INT8, 3 INT8 RDNA 2
   watermark: number;
   xess_quality: number;
+  equal_cost: number;
   gpu_timing: number;
   log: number;
 }
@@ -365,6 +366,15 @@ function Content() {
             />
           </PanelSectionRow>
         )}
+        <PanelSectionRow>
+          <ToggleField
+            label="Equal-cost render scale"
+            description="Each upscaler renders at the resolution where the whole frame costs the same GPU time as NSS Quality at the game's DLSS mode: costlier upscalers render smaller, cheaper ones larger. Applies when the game next asks for the render size (change the DLSS mode or restart the game)."
+            checked={!!s.equal_cost}
+            disabled={!!busy}
+            onChange={(v) => changeSetting({ equal_cost: v ? 1 : 0 })}
+          />
+        </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
             label="Log GPU time"

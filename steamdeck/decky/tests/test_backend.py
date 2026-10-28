@@ -604,9 +604,14 @@ class FakeLibraryTests(unittest.TestCase):
         # watermark, gpu timing and xess preset all go through the control file; the removed fsr4_path is ignored
         self.core.set_settings({"fsr4_path": 2, "watermark": 1, "gpu_timing": 1, "xess_quality": 101})
         self.assertEqual((ctl()["watermark"], ctl()["gpu_timing"], ctl()["xess_quality"]), ("1", "1", "101"))
+        # Equal-cost render scale: on by default, switchable through the control file.
+        self.assertEqual(ctl()["equal_cost"], "1")
+        self.core.set_settings({"equal_cost": 0})
+        self.assertEqual(ctl()["equal_cost"], "0")
+        self.core.set_settings({"equal_cost": 1})
         self.assertNotIn("fsr4_path", ctl())
         self.assertNotIn("fsr4_path", self.core.state["settings"])
-        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"xess_quality": 99}, {"nss_quality": 3}, {"quality": 7}):
+        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"xess_quality": 99}, {"nss_quality": 3}, {"equal_cost": 2}, {"quality": 7}):
             with self.assertRaises(ValueError):
                 self.core.set_settings(bad)
         self.core.set_settings({"upscaler": 2})

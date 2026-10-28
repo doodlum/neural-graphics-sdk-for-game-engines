@@ -2,6 +2,7 @@
 // layout behind each texture, and its submission queue; NSS records into the proxy's own command buffer, which is
 // submitted on DXVK's queue right after DXVK has flushed the game's work, so queue order keeps everything in sequence.
 // SPDX-License-Identifier: MIT
+#include "cost_model.h"
 #include "ngx_common.h"
 
 #include "common.h"
@@ -149,6 +150,7 @@ NVSDK_NGX_Result InitDevice(ID3D11Device* device)
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!device)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    CostSetApi(CostApi::D3D11);
 
     IDXGIVkInteropDevice* interop = nullptr;
     if (FAILED(device->QueryInterface(IID_IDXGIVkInteropDevice, reinterpret_cast<void**>(&interop))) || !interop)

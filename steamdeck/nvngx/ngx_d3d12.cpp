@@ -1,6 +1,7 @@
 // D3D12 NGX entry points. On Proton, D3D12 is vkd3d-proton, so NSS runs on the game's own VkDevice and records
 // straight into the game's command list through vkd3d-proton's interop interface. No copies, no extra submissions.
 // SPDX-License-Identifier: MIT
+#include "cost_model.h"
 #include "ngx_common.h"
 
 #include "common.h"
@@ -179,6 +180,7 @@ NVSDK_NGX_Result InitDevice(ID3D12Device* device)
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!device)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    CostSetApi(CostApi::D3D12);
 
     ID3D12DXVKInteropDevice1* interop = nullptr;
     if (FAILED(device->QueryInterface(IID_ID3D12DXVKInteropDevice1, reinterpret_cast<void**>(&interop))) || !interop)

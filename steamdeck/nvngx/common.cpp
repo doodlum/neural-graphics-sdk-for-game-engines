@@ -75,6 +75,8 @@ const ProxyConfig& Config()
         const float forced      = EnvFloat("AISS_RATIO", 0.0f);
         for (int i = 0; i < 6; ++i)
             c.qualityRatio[i] = forced >= 1.0f ? forced : standard[i];
+        c.ratioForced      = forced >= 1.0f;
+        c.equalCost        = EnvInt("AISS_EQUAL_COST", 1) != 0;
         c.nssQuality       = EnvInt("AISS_NSS_QUALITY", -1);
         c.xess             = false;
         if (const char* v = getenv("AISS_UPSCALER"))
@@ -128,6 +130,7 @@ struct LiveControl
     int logLevel    = -1;  // 0-4
     int gpuTiming   = -1;  // 0 off, 1 on
     int xessQuality = -1;  // xess_quality_settings_t, 0 = from render scale
+    int equalCost   = -1;  // 0 off, 1 on
 };
 
 const std::string& ControlFilePath()
@@ -187,6 +190,7 @@ static LiveControl ReadLiveControl()
                 else if (!strcmp(k, "log")) setInt(v, 0, 4, read.logLevel);
                 else if (!strcmp(k, "gpu_timing")) setInt(v, 0, 1, read.gpuTiming);
                 else if (!strcmp(k, "xess_quality")) setInt(v, 0, 1000, read.xessQuality);
+                else if (!strcmp(k, "equal_cost")) setInt(v, 0, 1, read.equalCost);
                 firstLine = false;
                 continue;
             }
@@ -250,6 +254,11 @@ int LiveGpuTiming()
 int LiveXessQuality()
 {
     return ReadLiveControl().xessQuality;
+}
+
+int LiveEqualCost()
+{
+    return ReadLiveControl().equalCost;
 }
 
 static int LiveLogLevelRaw()

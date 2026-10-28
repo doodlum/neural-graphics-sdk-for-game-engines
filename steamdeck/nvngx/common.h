@@ -36,6 +36,8 @@ struct ProxyConfig
     int   fsr4Model;        // AISS_UPSCALER=fsr4: AMD FSR 4 (amdxcffx64.dll in the aiss folder next to the proxy), Fsr4Model from
                             // AISS_FSR4_MODEL (auto, lite, int8, rdna2, fp8); -1 when FSR 4 is not asked for
     int   gpuTiming;        // AISS_GPU_TIMING=N: log the GPU time of the upscale, averaged over N evaluations
+    bool  ratioForced;      // AISS_RATIO set: every mode uses that ratio, no equal-cost scaling
+    bool  equalCost;        // AISS_EQUAL_COST (default 1): equal-cost render scale per upscaler (cost_model.h)
 };
 
 const ProxyConfig& Config();
@@ -60,6 +62,7 @@ int LiveCaptureRequest();
 int LiveWatermark();    // 0 off, 1 on (AMD's FSR 4 banner)
 int LiveGpuTiming();    // 0 off, 1 on (log the GPU time of each upscale)
 int LiveXessQuality();  // xess_quality_settings_t, 0 = from the render scale
+int LiveEqualCost();    // 0 off, 1 on (equal-cost render scale)
 // The number of evaluations to average GPU timing over: the live gpu_timing toggle (120 when on), else AISS_GPU_TIMING.
 int GpuTimingFrames();
 // The control file as a Windows path (Z:\...), empty when AISS_CONTROL is not set.

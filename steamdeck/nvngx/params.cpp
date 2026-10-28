@@ -2,7 +2,9 @@
 #include "params.h"
 
 #include "common.h"
+#include "cost_model.h"
 
+#include <algorithm>
 #include <type_traits>
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -255,7 +257,11 @@ NVSDK_NGX_Result NgxOptimalSettings(NVSDK_NGX_Parameter* abi)
     if (!p->GetU32(ngxp::Width, &width) || !p->GetU32(ngxp::Height, &height) || !p->GetI32(ngxp::PerfQuality, &quality))
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
 
-    const float  ratio  = Config().qualityRatio[(quality >= 0 && quality < 6) ? quality : 0];
+    const int    mode   = (quality >= 0 && quality < 6) ? quality : 0;
+    // AISS_RATIO fixes the ratio; otherwise each upscaler gets the render size at which the frame costs the same as
+    // with NSS Quality at the DLSS mode's standard ratio (cost_model.cpp).
+    const float  ratio  = Config().ratioForced ? Config().qualityRatio[mode]
+                                               : EqualCostRatio(mode, Config().qualityRatio[mode], width, height);
     unsigned int outW   = static_cast<unsigned int>(width / ratio);
     unsigned int outH   = static_cast<unsigned int>(height / ratio);
 
@@ -267,8 +273,8 @@ NVSDK_NGX_Result NgxOptimalSettings(NVSDK_NGX_Parameter* abi)
     // Dynamic resolution range: NSS accepts any render size up to the one the context was created with.
     p->SetU32("DLSS.Get.Dynamic.Max.Render.Width", outW);
     p->SetU32("DLSS.Get.Dynamic.Max.Render.Height", outH);
-    p->SetU32("DLSS.Get.Dynamic.Min.Render.Width", width / 3);
-    p->SetU32("DLSS.Get.Dynamic.Min.Render.Height", height / 3);
+    p->SetU32("DLSS.Get.Dynamic.Min.Render.Width", std::min(outW, width / 3));
+    p->SetU32("DLSS.Get.Dynamic.Min.Render.Height", std::min(outH, height / 3));
     p->SetU64("SizeInBytes", static_cast<unsigned long long>(width) * height * 31);
 
     LOGV("optimal settings: %ux%u quality %d -> %ux%u", width, height, quality, outW, outH);

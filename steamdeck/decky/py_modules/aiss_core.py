@@ -98,6 +98,7 @@ DEFAULT_SETTINGS = {
     "nss_quality": 0,    # when upscaler == 0: Arm's FfxApiNssShaderQualityMode, 0 Quality, 1 Balanced, 2 Performance
     "fsr4_model": 0,     # when upscaler == 4: 0 Auto (AMD's choice), 1 Lite, 2 INT8, 3 INT8 RDNA 2
     "watermark": 0,      # 1 = draw AMD's FSR 4 version/network banner on the output
+    "equal_cost": 1,     # 1 = each upscaler renders at the size where the frame costs the same as with NSS Quality
     "xess_quality": 0,   # XeSS preset override: 0 = from the render scale, else 100-105 (Ultra Perf .. AA)
     "gpu_timing": 0,     # 1 = log the GPU time of each upscale (AISS_GPU_TIMING)
     "log": 1,            # AISS_LOG level 0-4; 1 is the core's default
@@ -1314,6 +1315,7 @@ class AissCore:
             f"log={int(s.get('log', 1))}",
             f"gpu_timing={1 if s.get('gpu_timing') else 0}",
             f"xess_quality={int(s.get('xess_quality', 0))}",
+            f"equal_cost={1 if s.get('equal_cost', 1) else 0}",
         ]
         tmp.write_text("\n".join(lines) + "\n")
         os.replace(tmp, self.control_path)
@@ -1349,7 +1351,7 @@ class AissCore:
             _apply_upscaler_code(s, q)
         checks = {
             "upscaler": (0, 4), "nss_quality": (0, 2), "fsr4_model": (0, 3), "watermark": (0, 1),
-            "gpu_timing": (0, 1), "log": (0, 4),
+            "gpu_timing": (0, 1), "log": (0, 4), "equal_cost": (0, 1),
         }
         for key, (lo, hi) in checks.items():
             if key in settings:

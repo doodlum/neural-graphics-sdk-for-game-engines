@@ -71,12 +71,58 @@ Streamline sample (ray tracing on), 1280x800 fullscreen on the Deck, installed e
 | D3D12 | 9.9 FPS | **29.9 FPS** |
 | Vulkan | 12.1 FPS | **36.5 FPS** |
 
-Every DLSS mode uses NSS's full network by default. On the Deck it costs about 1.3 ms more per frame than the
-small one at 640x400 → 1280x800, and the small network ghosts visibly. The Decky plugin switches between them while the
+Every DLSS mode uses NSS's full network by default. At 640x400 → 1280x800 its passes total 2.22 ms on the Deck
+(ML graph 1.36, postprocess 0.57, preprocess 0.25, depth scatter 0.03; bit exact, `docs/nss_gpu_tuning.md` round 3),
+about 1.2 ms more per frame than the small network, which ghosts visibly. The Decky plugin switches between them while the
 game runs: the plugin's Quick Access panel carries every option (upscaler, NSS quality, FSR 4 model and watermark,
-XeSS preset, GPU-time logging, log level, capture) through a control file the proxy re-reads twice a second
+XeSS preset, equal-cost render scale, GPU-time logging, log level, capture) through a control file the proxy re-reads twice a second
 (`AISS_CONTROL`). The file is `key=value` lines (upscaler 0 = NSS Quality, 1 = Balanced, 2 = Performance, 3 = XeSS,
 4-6/8 = FSR 4), with a legacy first line `<upscaler> <fast_math> <capture>` so older proxies still parse it.
+
+## Equal-cost render scale
+
+The upscalers cost very different amounts on the Deck: FSR 4 INT8 through the Vulkan interop takes about 8 ms of frame
+time against NSS Quality's 2.5 ms at 640x392 → 1280x785. With equal cost on (the default; plugin toggle "Equal-cost
+render scale", control key `equal_cost`, launch option `AISS_EQUAL_COST`), the proxy answers the game's DLSS
+optimal-settings query with a render size per upscaler such that the whole frame (the game's render-resolution work
+plus the upscale) costs the same GPU time as NSS Quality at the DLSS mode's standard ratio. The expensive upscalers get
+fewer pixels, and the cheap NSS Balanced / Performance networks get more. DLAA is left alone, and the ratio stays
+between 1 and 4.
+
+- **The upscale cost** is a table measured on the Deck at render ratios 3, 2.5, 2 and 1.5 per upscaler and API
+  (`steamdeck/nvngx/cost_model.cpp`, from the sweep below), interpolated in render pixels and scaled by output pixels.
+  The FSR 4 interop rows include the ~2.8 ms per frame the GPU idles while the Vulkan and D3D12 queues wait on each
+  other; it shows up as frame time, not as upscale GPU time.
+- **The game's cost per extra render megapixel** is measured while the game runs: a thread samples amdgpu's
+  `gpu_busy_percent` and shader clock every 20 ms, the busy time per frame minus the modelled upscale is kept per
+  render size, and the slope across the sizes seen is the game's cost (until two sizes are seen, 0.55 of the average,
+  the share measured in the Streamline sample). It is saved per game under the plugin's `cost/` folder, so the next
+  launch starts from it.
+- **It applies when the game next asks** for optimal settings: a DLSS mode change, a resolution change or a restart.
+
+Upscale cost at 1280x800 output, ms of frame time (Streamline sample; NSS at exactly 2x takes its faster static-LUT
+path):
+
+| Upscaler | D3D12 3x | 2.5x | 2x | 1.5x | Vulkan 3x | 2.5x | 2x | 1.5x |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| NSS Quality | 1.56 | 1.88 | 2.22 | 3.72 | 1.58 | 1.90 | 2.46 | 3.68 |
+| NSS Balanced | 1.29 | 1.18 | 1.22 | 2.41 | 1.49 | 1.21 | 1.43 | 2.43 |
+| NSS Performance | 1.16 | 1.05 | 1.09 | 2.28 | 1.36 | 1.07 | 1.29 | 2.30 |
+| XeSS | 3.10 | 3.13 | 3.19 | 3.36 | 3.16 | 3.19 | 3.25 | 3.43 |
+| FSR 4 Lite | 3.05 | 3.05 | 3.06 | 3.10 | 6.37 | 6.37 | 6.40 | 6.47 |
+| FSR 4 INT8 | 5.04 | 5.01 | 5.02 | 5.05 | 8.31 | 8.33 | 8.34 | 8.45 |
+| FSR 4 INT8 RDNA 2 | 4.95 | 4.96 | 4.98 | 5.02 | 8.20 | 8.27 | 8.26 | 8.37 |
+
+Result in the Streamline sample, DLSS Performance (2x for NSS Quality), equal cost on, frames per second over the
+last 360 upscales. Before, at the standard 2x, FSR 4 Lite on Vulkan ran at 24.5 FPS against NSS Quality's 26.5.
+
+| Upscaler | D3D12 render size | FPS | Vulkan render size | FPS |
+| --- | --- | --- | --- | --- |
+| NSS Quality (reference) | 640x361 | 25.6 | 640x392 | 26.1 |
+| NSS Performance | 650x366 | 25.6 | 656x402 | 26.8 |
+| XeSS | 626x353 | 25.4 | 623x382 | 26.5 |
+| FSR 4 Lite | 625x353 | 25.6 | 553x339 | 27.2 |
+| FSR 4 INT8 | 592x333 | 25.9 | 543x333 | 26.1 |
 
 ## Intel XeSS (alternative upscaler)
 
@@ -346,6 +392,8 @@ Use the Decky plugin for this. By hand:
 | `AISS_FSR4_WATERMARK=1` (or `FSR_WATERMARK=1`) | FSR 4: have AMD's DLL draw its banner (network name, version) on the output |
 | `AISS_FSR4_GPU=family,revision` | FSR 4: amdgpu family / revision handed to AMD's GPU query (default 144,1 on a Steam Deck, nothing elsewhere) |
 | `AISS_FSR4_DX12_VER=0xVER` | FSR 4 D3D12: chain an upscaler version desc with this value (default: none; the 4.1.2 DLL rejects it) |
+| `AISS_EQUAL_COST=0/1` | Equal-cost render scale (default 1): each upscaler gets the render size at which game + upscale costs the same GPU time as NSS Quality at the DLSS mode's ratio (see *Equal-cost render scale*); 0 = the standard DLSS ratios for every upscaler. The control file's `equal_cost=` overrides it |
+| `AISS_RATIO=r` | Force one render-scale divisor for every DLSS mode (testing); turns equal cost off |
 | `AISS_XESS_QUALITY=100..105` | XeSS preset (default 100, Ultra Performance: the widest input range) |
 | `AISS_GPU_TIMING=N` | Log the GPU time of the upscale and the evaluations per second, averaged over N evaluations |
 | `AISS_CAMERA_NEAR`, `AISS_CAMERA_FAR`, `AISS_CAMERA_FOV` | Camera values NGX does not pass. Defaults: 0.1, 100000, 60° (reversed-Z, infinite far plane). |

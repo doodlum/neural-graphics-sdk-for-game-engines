@@ -2,6 +2,7 @@
 #include "ngx_common.h"
 
 #include "common.h"
+#include "cost_model.h"
 
 bool Fsr4Dx12Unavailable(int model);  // fsr4_dx12.cpp (its header needs d3d12.h)
 
@@ -94,6 +95,7 @@ void NgxFillDispatch(const NgxParams& p, const UpscalerCreateInfo& info, Upscale
     }
     LOGV("evaluate: render %ux%u jitter %.3f,%.3f mv scale %.3f,%.3f reset %d dt %.2f", d.renderWidth,
          d.renderHeight, d.jitterX, d.jitterY, d.mvScaleX, d.mvScaleY, d.reset, d.frameTimeMs);
+    CostNoteEvaluate(info, d.renderWidth, d.renderHeight, info.displayWidth, info.displayHeight);
 }
 
 NVSDK_NGX_Result NgxFeatureRequirement(NVSDK_NGX_Feature feature, NVSDK_NGX_FeatureRequirement* out)

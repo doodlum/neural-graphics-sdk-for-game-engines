@@ -49,6 +49,7 @@ add_library(nvngx SHARED
     fsr4_interop.cpp
     frame_dump.cpp
     gpu_timing.cpp
+    cost_model.cpp
     "${SPV_INC}"
     "${EXPOSURE_SPV_INC}"
     ${REGION_COPY_INCS})

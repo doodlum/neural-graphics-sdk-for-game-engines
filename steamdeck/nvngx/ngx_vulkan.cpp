@@ -1,5 +1,6 @@
 // Vulkan NGX entry points: NSS records directly into the game's command buffer on the game's device.
 // SPDX-License-Identifier: MIT
+#include "cost_model.h"
 #include "ngx_common.h"
 
 #include "common.h"
@@ -32,6 +33,7 @@ NVSDK_NGX_Result InitDevice(VkInstance instance, VkPhysicalDevice pd, VkDevice d
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!instance || !pd || !device)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    CostSetApi(CostApi::Vulkan);
     VulkanDevice vk;
     vk.instance       = instance;
     vk.physicalDevice = pd;
