@@ -35,7 +35,7 @@ constexpr double kDefaultG     = 60.0;    // ms per extra render megapixel befor
 // measured at render ratios 3, 2.5, 2 and 1.5 (Streamline sample, AISS_RATIO, mean of 2x 120 evaluations; sweep in
 // steamdeck/README.md) and interpolated linearly in render pixels between them. NSS takes its exact-2x path (static
 // LUT) only at exactly 2x, so for NSS the 2x column is used at exactly 2x and the other ratios interpolate around it.
-// FSR 4 Lite in [0] is the SDK Vulkan DLL with the replacement shaders (about 17% under AMD's D3D12 DLL, which the
+// FSR 4 Lite in [0] is the SDK Vulkan DLL with the replacement shaders (about 22% under AMD's D3D12 DLL, which the
 // other [0] FSR 4 rows measured), used on every API when that DLL works. The FSR 4 interop rows add 2.8 ms to the
 // upscale's own GPU time: the frame-rate drop measured against NSS at the same render size is that much larger, the GPU
 // idling while the Vulkan and D3D12 queues wait on each other.
@@ -67,7 +67,7 @@ const UpscaleCost kCost[2][kCostRows] = {
         /* NSS Balanced    */ {{1.285, 1.184, 1.217, 2.411}, true},
         /* NSS Performance */ {{1.155, 1.048, 1.089, 2.282}, true},
         /* XeSS            */ {{3.098, 3.128, 3.192, 3.355}, false},
-        /* FSR 4 Lite      */ {{2.496, 2.498, 2.507, 2.535}, false},
+        /* FSR 4 Lite      */ {{2.336, 2.338, 2.346, 2.373}, false},
         /* FSR 4 INT8      */ {{5.035, 5.006, 5.019, 5.050}, false},
         /* FSR 4 INT8 RDNA2*/ {{4.954, 4.964, 4.976, 5.021}, false},
     },
