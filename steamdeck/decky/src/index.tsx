@@ -34,10 +34,10 @@ interface Game {
 }
 
 interface Settings {
-  upscaler: number;    // 0 NSS Quality, 1 NSS Balanced, 2 NSS Performance, 3 XeSS, 4 FSR 4
+  upscaler: number;    // 0 NSS, 3 XeSS, 4 FSR 4
+  nss_quality: number; // 0 Quality, 1 Balanced, 2 Performance
   fsr4_model: number;  // 0 Auto, 1 Lite, 2 INT8, 3 INT8 RDNA 2
   watermark: number;
-  fast_math: number;
   xess_quality: number;
   gpu_timing: number;
   log: number;
@@ -138,14 +138,17 @@ const STATUS_LABEL: Record<Status, string> = {
   needs_repair: "Needs repair",
 };
 
-// NSS shader quality names from Arm's FfxApiNssShaderQualityMode (0 Quality, 1 Balanced, 2 Performance).
 const UPSCALER_OPTIONS = [
-  { data: 0, label: "NSS Quality" },
-  { data: 1, label: "NSS Balanced" },
-  { data: 2, label: "NSS Performance" },
+  { data: 0, label: "NSS" },
   { data: 3, label: "XeSS" },
 ];
 const FSR4_UPSCALER_OPTION = { data: 4, label: "FSR 4" };
+// NSS shader quality names from Arm's FfxApiNssShaderQualityMode (0 Quality, 1 Balanced, 2 Performance).
+const NSS_QUALITY_OPTIONS = [
+  { data: 0, label: "Quality" },
+  { data: 1, label: "Balanced" },
+  { data: 2, label: "Performance" },
+];
 const FSR4_MODEL_OPTIONS = [
   { data: 0, label: "Auto (AMD's choice)" },
   { data: 1, label: "Lite" },
@@ -304,17 +307,29 @@ function Content() {
           <DropdownItem
             label="Upscaler"
             description={
-              "Switches live in-game. NSS Quality: best NSS network. NSS Balanced / Performance: smaller networks, faster, more ghosting. XeSS: Intel XeSS (dynamic resolution)." +
+              "Switches live in-game. NSS: Arm's neural upscaler. XeSS: Intel XeSS (dynamic resolution)." +
               (state.bundle.fsr4
                 ? " FSR 4: AMD's networks through its D3D12 DLL (D3D12, D3D11 and Vulkan games)."
                 : "")
             }
             rgOptions={state.bundle.fsr4 ? [...UPSCALER_OPTIONS, FSR4_UPSCALER_OPTION] : UPSCALER_OPTIONS}
-            selectedOption={s.upscaler >= 0 && s.upscaler <= (state.bundle.fsr4 ? 4 : 3) ? s.upscaler : 0}
+            selectedOption={s.upscaler === 3 || (s.upscaler === 4 && state.bundle.fsr4) ? s.upscaler : 0}
             disabled={!!busy}
             onChange={(o) => changeSetting({ upscaler: o.data })}
           />
         </PanelSectionRow>
+        {s.upscaler !== 3 && !(s.upscaler === 4 && state.bundle.fsr4) && (
+          <PanelSectionRow>
+            <DropdownItem
+              label="NSS quality"
+              description="Quality: the full network (default). Balanced / Performance: smaller networks, faster, more ghosting."
+              rgOptions={NSS_QUALITY_OPTIONS}
+              selectedOption={s.nss_quality >= 0 && s.nss_quality <= 2 ? s.nss_quality : 0}
+              disabled={!!busy}
+              onChange={(o) => changeSetting({ nss_quality: o.data })}
+            />
+          </PanelSectionRow>
+        )}
         {state.bundle.fsr4 && s.upscaler === 4 && (
           <>
             <PanelSectionRow>
@@ -350,15 +365,6 @@ function Content() {
             />
           </PanelSectionRow>
         )}
-        <PanelSectionRow>
-          <ToggleField
-            label="Fast maths"
-            description="NSS only: ~2% faster upscaling; output no longer bit-exact (about half an 8-bit step). Switches live."
-            checked={!!s.fast_math}
-            disabled={!!busy || s.upscaler >= 3}
-            onChange={(v) => changeSetting({ fast_math: v ? 1 : 0 })}
-          />
-        </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
             label="Log GPU time"

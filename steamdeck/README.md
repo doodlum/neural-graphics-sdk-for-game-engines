@@ -73,8 +73,8 @@ Streamline sample (ray tracing on), 1280x800 fullscreen on the Deck, installed e
 
 Every DLSS mode uses NSS's full network by default. On the Deck it costs about 1.3 ms more per frame than the
 small one at 640x400 → 1280x800, and the small network ghosts visibly. The Decky plugin switches between them while the
-game runs: the plugin's Quick Access panel carries every option (upscaler, FSR 4 model and watermark, fast
-maths, XeSS preset, GPU-time logging, log level, capture) through a control file the proxy re-reads twice a second
+game runs: the plugin's Quick Access panel carries every option (upscaler, NSS quality, FSR 4 model and watermark,
+XeSS preset, GPU-time logging, log level, capture) through a control file the proxy re-reads twice a second
 (`AISS_CONTROL`). The file is `key=value` lines (upscaler 0 = NSS Quality, 1 = Balanced, 2 = Performance, 3 = XeSS,
 4-6/8 = FSR 4), with a legacy first line `<upscaler> <fast_math> <capture>` so older proxies still parse it.
 
@@ -354,7 +354,7 @@ Use the Decky plugin for this. By hand:
 | `AISS_DEBUG_VIEW=0..16` | Write NSS's internal views instead of the image (0 = 4x4 grid) |
 | `AISS_DUMP_FRAME=N` | Write output frame N to `aiss_frame_N.ppm` (any upscaler) |
 | `FFX_PROFILE_PASSES=file` | Per-pass GPU timings |
-| `FFX_ML_RESCALE_FLOAT=1` | Fast maths: fp32 requantisation in the ML graph, ~1-2% faster, not bit exact (the plugin's "Fast maths" toggle sets it live through the control file) |
+| `FFX_ML_RESCALE_FLOAT=1` | Fast maths: fp32 requantisation in the ML graph, ~1-2% faster, not bit exact; launch option only (the plugin no longer offers it and always writes fast maths off) |
 | `AISS_DUMP_INPUTS=first,count` | Raw colour/depth/MV/output per dispatch next to the game exe (the plugin's "Capture frames" button does the same for the next 8 frames of a running game, into `~/.local/share/aiss-dlss-nss/captures/`) |
 | `AISS_JITTER_SIGN=x,y`, `AISS_MV_SIGN=x,y` | Multipliers on the jitter / motion vector scale handed to NSS (convention debugging) |
 | `AISS_LAYER_LOG=1` | Vulkan layer: log instances, device extensions and NULL proc lookups to stderr |

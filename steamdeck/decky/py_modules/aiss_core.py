@@ -92,11 +92,12 @@ WDO_ENV = "WINEDLLOVERRIDES"
 COMMAND = "%command%"
 
 DEFAULT_SETTINGS = {
-    # Upscaler family: 0 NSS Quality, 1 NSS Balanced, 2 NSS Performance, 3 XeSS, 4 FSR 4. Applied live.
+    # Upscaler family: 0 NSS, 3 XeSS, 4 FSR 4 (1 and 2 were NSS Balanced / Performance; set_settings still maps them
+    # to NSS + nss_quality). Applied live.
     "upscaler": 0,
+    "nss_quality": 0,    # when upscaler == 0: Arm's FfxApiNssShaderQualityMode, 0 Quality, 1 Balanced, 2 Performance
     "fsr4_model": 0,     # when upscaler == 4: 0 Auto (AMD's choice), 1 Lite, 2 INT8, 3 INT8 RDNA 2
     "watermark": 0,      # 1 = draw AMD's FSR 4 version/network banner on the output
-    "fast_math": 0,      # NSS only: 1 = fp32 requantisation in the ML graph (~2% faster, not bit exact)
     "xess_quality": 0,   # XeSS preset override: 0 = from the render scale, else 100-105 (Ultra Perf .. AA)
     "gpu_timing": 0,     # 1 = log the GPU time of each upscale (AISS_GPU_TIMING)
     "log": 1,            # AISS_LOG level 0-4; 1 is the core's default
@@ -108,18 +109,32 @@ FSR4_MODEL_TO_CODE = {0: 8, 1: 4, 2: 5, 3: 6}
 # understands 7 = FP8 and 8 = AMD's automatic choice, not offered: FP8 needs RDNA 4, auto is Lite on a Steam Deck).
 
 def migrate_settings(s: dict) -> dict:
-    """Bring an older settings dict up to date: the single 'quality' key (0-6) becomes upscaler + fsr4_model."""
+    """Bring an older settings dict up to date: the single 'quality' key (0-6) becomes upscaler + fsr4_model, and
+    the NSS qualities folded into 'upscaler' (0-2) become upscaler 0 + nss_quality."""
     s = {**DEFAULT_SETTINGS, **s}
     s.pop("ratio", None)  # removed long ago
     s.pop("fsr4_path", None)  # removed: FSR 4 has a single path (amdxcffx64)
+    s.pop("fast_math", None)  # removed: NSS always runs bit exact
     if "quality" in s:
-        q = int(s.pop("quality"))
-        if q in (0, 1, 2, 3):
-            s["upscaler"] = q
-        elif q in (4, 5, 6):
-            s["upscaler"] = 4
-            s["fsr4_model"] = {4: 1, 5: 2, 6: 3}[q]
+        _apply_upscaler_code(s, int(s.pop("quality")))
+    if int(s.get("upscaler", 0)) in (1, 2):
+        _apply_upscaler_code(s, int(s["upscaler"]))
     return s
+
+
+def _apply_upscaler_code(s: dict, q: int) -> None:
+    """Map a legacy single value (0-6, -1 = default: NSS 0/1/2, XeSS 3, FSR 4 Lite/INT8/RDNA2 4/5/6) to the
+    upscaler + nss_quality + fsr4_model settings."""
+    if q == -1:
+        q = 0
+    if q in (0, 1, 2):
+        s["upscaler"] = 0
+        s["nss_quality"] = q
+    elif q == 3:
+        s["upscaler"] = 3
+    elif q in (4, 5, 6):
+        s["upscaler"] = 4
+        s["fsr4_model"] = {4: 1, 5: 2, 6: 3}[q]
 
 STATUS_INSTALLED = "installed"
 STATUS_NOT_INSTALLED = "not_installed"
@@ -1273,25 +1288,27 @@ class AissCore:
         return {**self.state["settings"], "control": str(self.control_path)}
 
     def control_upscaler_code(self, s: dict | None = None) -> int:
-        """The single control-file upscaler value (0-8) from the upscaler + FSR 4 model settings."""
+        """The single control-file upscaler value (0-8) from the upscaler, NSS quality and FSR 4 model settings."""
         s = s if s is not None else self.state["settings"]
         u = int(s.get("upscaler", 0))
-        if u <= 3:
-            return u if u in (0, 1, 2, 3) else 0
-        return FSR4_MODEL_TO_CODE.get(int(s.get("fsr4_model", 0)), 8)
+        if u == 3:
+            return 3
+        if u == 4:
+            return FSR4_MODEL_TO_CODE.get(int(s.get("fsr4_model", 0)), 8)
+        q = int(s.get("nss_quality", 0))
+        return q if q in (0, 1, 2) else 0
 
     def write_control(self) -> None:
         s = self.state["settings"]
         code = self.control_upscaler_code(s)
-        fast = 1 if s.get("fast_math") else 0
         capture = int(self.state.get("capture_seq", 0))
         self.control_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.control_path.with_suffix(".tmp")
-        # Legacy first line (old proxies read "<upscaler> <fast_math> <capture>"), then key=value lines for the rest.
+        # Legacy first line (old proxies read "<upscaler> <fast_math> <capture>"; fast maths is always off now), then
+        # key=value lines for the rest.
         lines = [
-            f"{code} {fast} {capture}",
+            f"{code} 0 {capture}",
             f"upscaler={code}",
-            f"fast_math={fast}",
             f"capture={capture}",
             f"watermark={1 if s.get('watermark') else 0}",
             f"log={int(s.get('log', 1))}",
@@ -1325,14 +1342,14 @@ class AissCore:
 
     def set_settings(self, settings: dict) -> dict:
         s = migrate_settings(dict(self.state["settings"]))
-        if "quality" in settings:  # legacy single key (0-6); split into upscaler + fsr4_model
+        if "quality" in settings:  # legacy single key (0-6); split into upscaler + nss_quality + fsr4_model
             q = int(settings["quality"])
             if q != -1 and q not in (0, 1, 2, 3, 4, 5, 6):
                 raise ValueError("quality must be 0-6 (NSS 0/1/2, XeSS 3, FSR 4 Lite/INT8/RDNA2 4/5/6)")
-            self._apply_quality(s, q)
+            _apply_upscaler_code(s, q)
         checks = {
-            "upscaler": (0, 4), "fsr4_model": (0, 3), "watermark": (0, 1),
-            "fast_math": (0, 1), "gpu_timing": (0, 1), "log": (0, 4),
+            "upscaler": (0, 4), "nss_quality": (0, 2), "fsr4_model": (0, 3), "watermark": (0, 1),
+            "gpu_timing": (0, 1), "log": (0, 4),
         }
         for key, (lo, hi) in checks.items():
             if key in settings:
@@ -1340,6 +1357,8 @@ class AissCore:
                 if not lo <= v <= hi:
                     raise ValueError(f"{key} must be {lo}..{hi}")
                 s[key] = v
+        if int(s["upscaler"]) in (1, 2):  # older frontends: NSS Balanced / Performance were upscaler values
+            _apply_upscaler_code(s, int(s["upscaler"]))
         if "xess_quality" in settings:
             xq = int(settings["xess_quality"])
             if xq != 0 and not 100 <= xq <= 105:
@@ -1349,14 +1368,3 @@ class AissCore:
         self.save_state()
         self.write_control()
         return s
-
-    @staticmethod
-    def _apply_quality(s: dict, q: int) -> None:
-        """Map a legacy single 'quality' value (0-6, -1 = default) to the upscaler + fsr4_model settings."""
-        if q == -1:
-            q = 0
-        if q in (0, 1, 2, 3):
-            s["upscaler"] = q
-        elif q in (4, 5, 6):  # FSR 4 Lite / INT8 / INT8 RDNA 2
-            s["upscaler"] = 4
-            s["fsr4_model"] = {4: 1, 5: 2, 6: 3}[q]

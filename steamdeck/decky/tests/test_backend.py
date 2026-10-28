@@ -26,7 +26,7 @@ import aiss_core as core  # noqa: E402
 from aiss_core import (AissCore, build_launch_options, strip_launch_options, reg_set_value,  # noqa: E402
                        reg_delete_value, reg_has_value, REG_KEY_PATH, SIG_OVERRIDE_VALUE)
 
-S0 = {"upscaler": 0, "log": 1, "fast_math": 0}
+S0 = {"upscaler": 0, "nss_quality": 0, "log": 1}
 
 
 def bin_dir(tmp: Path) -> Path:
@@ -569,36 +569,44 @@ class FakeLibraryTests(unittest.TestCase):
                     k, v = ln.split("=", 1)
                     d[k] = v
             return d
-        self.core.set_settings({"upscaler": 2, "log": 0})
+        # NSS Quality is the default; the NSS quality is its own setting (Arm's 0 Quality, 1 Balanced, 2 Performance).
+        self.core.set_settings({"log": 0})
+        self.assertEqual(ctl()["_first"], "0 0 0")
+        self.assertEqual(ctl()["log"], "0")
+        self.core.set_settings({"nss_quality": 2})
         self.assertEqual(ctl()["_first"], "2 0 0")
         self.assertEqual(ctl()["upscaler"], "2")
-        self.assertEqual(ctl()["log"], "0")
-        self.core.set_settings({"upscaler": 0})
-        self.assertEqual(ctl()["_first"], "0 0 0")
-        # Fast maths also goes through the control file and keeps the launch options unchanged.
+        # Fast maths is gone: the old key is ignored, never written, and the legacy first line keeps it off.
         self.core.set_settings({"fast_math": 1})
-        self.assertEqual(ctl()["_first"], "0 1 0")
-        self.assertEqual(ctl()["fast_math"], "1")
+        self.assertEqual(ctl()["_first"], "2 0 0")
+        self.assertNotIn("fast_math", ctl())
+        self.assertNotIn("fast_math", self.core.state["settings"])
         # Each capture request bumps the third value; settings changes keep it.
         r = self.core.request_capture()
         self.assertEqual(r["seq"], 1)
-        self.assertEqual(ctl()["_first"], "0 1 1")
+        self.assertEqual(ctl()["_first"], "2 0 1")
         self.core.request_capture()
-        self.core.set_settings({"upscaler": 2})
-        self.assertEqual(ctl()["_first"], "2 1 2")
-        # XeSS (3), and FSR 4 (upscaler 4) with a model: Auto=8, Lite=4, INT8=5, INT8 RDNA 2=6.
+        self.core.set_settings({"nss_quality": 1})
+        self.assertEqual(ctl()["_first"], "1 0 2")
+        # XeSS (3), and FSR 4 (upscaler 4) with a model: Auto=8, Lite=4, INT8=5, INT8 RDNA 2=6. The NSS quality is
+        # remembered for when NSS is picked again.
         self.core.set_settings({"upscaler": 3})
-        self.assertEqual(ctl()["_first"], "3 1 2")
+        self.assertEqual(ctl()["_first"], "3 0 2")
         for model, code in ((0, 8), (1, 4), (2, 5), (3, 6)):
             self.core.set_settings({"upscaler": 4, "fsr4_model": model})
-            self.assertEqual(ctl()["_first"], f"{code} 1 2")
+            self.assertEqual(ctl()["_first"], f"{code} 0 2")
             self.assertEqual(ctl()["upscaler"], str(code))
+        self.core.set_settings({"upscaler": 0})
+        self.assertEqual(ctl()["_first"], "1 0 2")
+        # Older frontends sent NSS Balanced / Performance as upscaler 1 / 2.
+        self.core.set_settings({"upscaler": 2})
+        self.assertEqual((self.core.state["settings"]["upscaler"], self.core.state["settings"]["nss_quality"]), (0, 2))
         # watermark, gpu timing and xess preset all go through the control file; the removed fsr4_path is ignored
         self.core.set_settings({"fsr4_path": 2, "watermark": 1, "gpu_timing": 1, "xess_quality": 101})
         self.assertEqual((ctl()["watermark"], ctl()["gpu_timing"], ctl()["xess_quality"]), ("1", "1", "101"))
         self.assertNotIn("fsr4_path", ctl())
         self.assertNotIn("fsr4_path", self.core.state["settings"])
-        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"xess_quality": 99}, {"fast_math": 2}, {"quality": 7}):
+        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"xess_quality": 99}, {"nss_quality": 3}, {"quality": 7}):
             with self.assertRaises(ValueError):
                 self.core.set_settings(bad)
         self.core.set_settings({"upscaler": 2})
@@ -616,6 +624,19 @@ class FakeLibraryTests(unittest.TestCase):
         self.core = self.make_core()  # ownership record persisted
         off = self.core.launch_options("1002", lo2["options"], False)
         self.assertEqual(off["options"], "-novid")
+
+    def test_settings_migration(self):
+        # Saved settings from older plugins: NSS Balanced / Performance were upscaler 1 / 2, fast maths was a setting,
+        # and before that a single 'quality' key held everything.
+        m = core.migrate_settings({"upscaler": 2, "fast_math": 1})
+        self.assertEqual((m["upscaler"], m["nss_quality"]), (0, 2))
+        self.assertNotIn("fast_math", m)
+        m = core.migrate_settings({"quality": 1})
+        self.assertEqual((m["upscaler"], m["nss_quality"]), (0, 1))
+        m = core.migrate_settings({"quality": 5})
+        self.assertEqual((m["upscaler"], m["fsr4_model"]), (4, 2))
+        m = core.migrate_settings({})
+        self.assertEqual((m["upscaler"], m["nss_quality"]), (0, 0))  # NSS Quality by default
 
     def test_main_py_loads_with_stub_decky(self):
         stub = types.ModuleType("decky")
