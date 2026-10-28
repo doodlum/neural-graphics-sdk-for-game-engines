@@ -1065,6 +1065,23 @@ class AissCore:
                 atomic_copy(self.bundle_path(key), dst)
             gs[f"{sk}_hash"] = self.bundle_hash(key)
             gs[f"{sk}_path"] = str(dst)
+        # Optional files an earlier bundle installed and this one does not have (e.g. a build without the FSR 4
+        # shader packs): remove them while they are still what was installed, so the proxy stops using them.
+        bundled = {f[0] for f in self.prefix_files()}
+        for key, _, _, sk in PREFIX_FILES:
+            if key in bundled or key not in OPTIONAL_BIN:
+                continue
+            path, digest = gs.get(f"{sk}_path"), gs.get(f"{sk}_hash")
+            if not path:
+                continue
+            p = Path(path)
+            try:
+                if p.is_file() and (not digest or sha256_file(p) == digest):
+                    p.unlink()
+            except OSError as e:
+                self.log.warning(f"cannot remove {p}: {e}")
+            for k in (f"{sk}_path", f"{sk}_hash", f"{sk}_backup"):
+                gs.pop(k, None)
 
     def _remove_core(self, gs: dict) -> list[str]:
         warnings = []

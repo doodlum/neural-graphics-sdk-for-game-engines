@@ -436,6 +436,22 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertFalse(aiss.exists())  # the private subfolder is removed on uninstall
         self.assertEqual((sys32 / "amdxcffx64.dll").read_bytes(), b"MZ proton builtin amdxcffx64 4.1.1")
         (sys32 / "amdxcffx64.dll").unlink()
+        # a later bundle without the shader packs (FSR 4 on AMD's own shaders): reinstalling removes the packs it had put
+        # in the prefix, so the proxy stops loading them, and keeps the rest
+        self.assertEqual(self.core.install_game("1001")["status"], "installed")
+        nopacks = self.tmp / "bin_nopacks"
+        nopacks.mkdir()
+        for f in withfsr.iterdir():
+            if f.name not in ("fsr4_shaders.bin", "fsr4_shaders_dot2.bin"):
+                os.symlink(f.resolve(), nopacks / f.name)
+        self.core = self.make_core(bin_dir=nopacks)
+        self.assertEqual(self.core.install_game("1001")["status"], "installed")
+        self.assertFalse((aiss / "fsr4_shaders.bin").exists())
+        self.assertFalse((aiss / "fsr4_shaders_dot2.bin").exists())
+        self.assertTrue((aiss / "amd_fidelityfx_upscaler_vk.dll").exists())
+        self.assertNotIn("fsr4_shaders_path", self.core.state["games"]["1001"])
+        self.core.uninstall_game("1001")
+        self.assertFalse(aiss.exists())
         # a bundle built without the AMD DLL: not reported missing, nothing installed for it, games still "installed"
         nofsr = self.tmp / "bin_nofsr4"
         nofsr.mkdir()
