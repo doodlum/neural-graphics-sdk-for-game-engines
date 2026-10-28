@@ -93,8 +93,8 @@ struct CostKey
 CostKey KeyFor(int backend, int fsr4Model, int nssQuality, CostApi api)
 {
     const int group = api == CostApi::D3D12 ? 0 : 1;
-    if (backend == kBackendXess)
-        return {group, kXess};
+    if (backend == kBackendXess || backend == kBackendFsr3Vk)
+        return {group, kXess};  // FSR 3.1: XeSS's row (an overestimate: FSR 3.1 is 1.8 ms at 2x on Vulkan)
     if (backend == kBackendFsr4 || backend == kBackendFsr4Dx12 || backend == kBackendFsr4Interop || backend == kBackendFsr4Vk)
     {
         // Every API runs FSR 4 through AMD's SDK Vulkan DLL when it works (fsr4_vk.cpp; about the cost of native D3D12),

@@ -34,12 +34,12 @@ interface Game {
 }
 
 interface Settings {
-  upscaler: number;    // 0 NSS, 3 XeSS, 4 FSR 4
+  upscaler: number;    // 0 NSS, 3 XeSS, 4 FSR 4, 9 FSR 3.1
   nss_quality: number; // 0 Quality, 1 Balanced, 2 Performance
   fsr4_model: number;  // 0 Auto, 1 Lite, 2 INT8, 3 INT8 RDNA 2
   watermark: number;
   xess_quality: number;
-  equal_cost: number;
+  dilate_mv: number;
   gpu_timing: number;
   log: number;
 }
@@ -47,7 +47,7 @@ interface Settings {
 interface State {
   games: Game[];
   settings: Settings;
-  bundle: { missing: string[]; version: string; fsr4?: boolean };
+  bundle: { missing: string[]; version: string; fsr4?: boolean; fsr3?: boolean };
 }
 
 interface OpResult {
@@ -144,6 +144,7 @@ const UPSCALER_OPTIONS = [
   { data: 3, label: "XeSS" },
 ];
 const FSR4_UPSCALER_OPTION = { data: 4, label: "FSR 4" };
+const FSR3_UPSCALER_OPTION = { data: 9, label: "FSR 3.1" };
 // NSS shader quality names from Arm's FfxApiNssShaderQualityMode (0 Quality, 1 Balanced, 2 Performance).
 const NSS_QUALITY_OPTIONS = [
   { data: 0, label: "Quality" },
@@ -309,17 +310,24 @@ function Content() {
             label="Upscaler"
             description={
               "Switches live in-game. NSS: Arm's neural upscaler. XeSS: Intel XeSS (dynamic resolution)." +
-              (state.bundle.fsr4
-                ? " FSR 4: AMD's networks through its D3D12 DLL (D3D12, D3D11 and Vulkan games)."
-                : "")
+              (state.bundle.fsr4 ? " FSR 4: AMD's neural upscaler (D3D12, D3D11 and Vulkan games)." : "") +
+              (state.bundle.fsr3 ? " FSR 3.1: AMD's non-neural upscaler, tuned to look as close to FSR 4 INT8 as it can." : "")
             }
-            rgOptions={state.bundle.fsr4 ? [...UPSCALER_OPTIONS, FSR4_UPSCALER_OPTION] : UPSCALER_OPTIONS}
-            selectedOption={s.upscaler === 3 || (s.upscaler === 4 && state.bundle.fsr4) ? s.upscaler : 0}
+            rgOptions={[
+              ...UPSCALER_OPTIONS,
+              ...(state.bundle.fsr4 ? [FSR4_UPSCALER_OPTION] : []),
+              ...(state.bundle.fsr3 ? [FSR3_UPSCALER_OPTION] : []),
+            ]}
+            selectedOption={
+              s.upscaler === 3 || (s.upscaler === 4 && state.bundle.fsr4) || (s.upscaler === 9 && state.bundle.fsr3)
+                ? s.upscaler
+                : 0
+            }
             disabled={!!busy}
             onChange={(o) => changeSetting({ upscaler: o.data })}
           />
         </PanelSectionRow>
-        {s.upscaler !== 3 && !(s.upscaler === 4 && state.bundle.fsr4) && (
+        {s.upscaler !== 3 && !(s.upscaler === 4 && state.bundle.fsr4) && !(s.upscaler === 9 && state.bundle.fsr3) && (
           <PanelSectionRow>
             <DropdownItem
               label="NSS quality"
@@ -336,7 +344,7 @@ function Content() {
             <PanelSectionRow>
               <DropdownItem
                 label="FSR 4 model"
-                description="Auto lets AMD choose (Lite on a Steam Deck). INT8 and INT8 RDNA 2 are the desktop networks: much slower here."
+                description="Auto lets AMD choose (Lite on a Steam Deck). INT8 and INT8 RDNA 2 are the desktop networks: sharper, but much slower here."
                 rgOptions={FSR4_MODEL_OPTIONS}
                 selectedOption={s.fsr4_model}
                 disabled={!!busy}
@@ -366,15 +374,17 @@ function Content() {
             />
           </PanelSectionRow>
         )}
-        <PanelSectionRow>
-          <ToggleField
-            label="Equal-cost render scale"
-            description="Each upscaler renders at the resolution where the whole frame costs the same GPU time as NSS Quality at the game's DLSS mode: costlier upscalers render smaller, cheaper ones larger. Applies when the game next asks for the render size (change the DLSS mode or restart the game)."
-            checked={!!s.equal_cost}
-            disabled={!!busy}
-            onChange={(v) => changeSetting({ equal_cost: v ? 1 : 0 })}
-          />
-        </PanelSectionRow>
+        {((s.upscaler === 4 && state.bundle.fsr4) || (s.upscaler === 9 && state.bundle.fsr3)) && (
+          <PanelSectionRow>
+            <ToggleField
+              label="Dilate motion vectors"
+              description="Before FSR runs, each pixel takes the motion of the nearest surface around it, so thin foreground detail (foliage, wires, edges) moves with its own motion. Can reduce shimmer and smearing on thin detail. Switches live."
+              checked={!!s.dilate_mv}
+              disabled={!!busy}
+              onChange={(v) => changeSetting({ dilate_mv: v ? 1 : 0 })}
+            />
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <ToggleField
             label="Log GPU time"

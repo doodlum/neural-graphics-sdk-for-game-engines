@@ -55,6 +55,7 @@ enum UpscalerBackend : int
     kBackendFsr4Dx12 = 3,  // AMD FSR 4 natively on the game's D3D12 device (amdxcffx64.dll); only the D3D12 front end
     kBackendFsr4Interop = 4,  // AMD FSR 4 via amdxcffx64.dll on an in-process D3D12 device (Vulkan / D3D11 games)
     kBackendFsr4Vk = 5,       // AMD FSR 4 natively on a Vulkan game's device (amd_fidelityfx_upscaler_vk.dll, FSR SDK 2.4)
+    kBackendFsr3Vk = 6,       // AMD FSR 3.1 (3.1.6) from the same DLL, every API (no network; settings in fsr4_vk.cpp)
 };
 
 // Lets an upscaler split its work over several submissions on the front end's queue: Begin() starts a command buffer,
@@ -130,6 +131,7 @@ bool Fsr4InteropUnavailable(int model);
 // or refuses the device (the interop path is then used).
 std::unique_ptr<Upscaler> CreateFsr4VkUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info);
 bool Fsr4VkUnavailable();
+bool Fsr3VkUnavailable();  // the SDK DLL is missing or offers no FSR 3.1 on this device
 
 class NssUpscaler : public Upscaler
 {

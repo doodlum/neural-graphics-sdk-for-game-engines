@@ -32,12 +32,14 @@ struct ProxyConfig
     float mvSign[2];        // AISS_MV_SIGN=x,y: multipliers on the motion vector scale (convention debugging)
     bool  fastMath;         // FFX_ML_RESCALE_FLOAT set at launch: fp32 requantisation in the ML graph (not bit exact)
     bool  xess;             // AISS_UPSCALER=xess: Intel XeSS (libxess.dll next to the proxy) instead of NSS
+    bool  fsr3;             // AISS_UPSCALER=fsr3: AMD FSR 3.1 from AMD's FSR SDK Vulkan DLL
     int   xessQuality;      // AISS_XESS_QUALITY: xess_quality_settings_t (100-105), 0 = from the render scale
     int   fsr4Model;        // AISS_UPSCALER=fsr4: AMD FSR 4 (amdxcffx64.dll in the aiss folder next to the proxy), Fsr4Model from
                             // AISS_FSR4_MODEL (auto, lite, int8, rdna2, fp8); -1 when FSR 4 is not asked for
     int   gpuTiming;        // AISS_GPU_TIMING=N: log the GPU time of the upscale, averaged over N evaluations
     bool  ratioForced;      // AISS_RATIO set: every mode uses that ratio, no equal-cost scaling
-    bool  equalCost;        // AISS_EQUAL_COST (default 1): equal-cost render scale per upscaler (cost_model.h)
+    bool  equalCost;        // AISS_EQUAL_COST=1 (default off): equal-cost render scale per upscaler (cost_model.h)
+    bool  dilateMv;         // AISS_FSR_DILATE_MV=1: dilate motion vectors by nearest depth ahead of FSR (mv_dilate.h)
 };
 
 const ProxyConfig& Config();
@@ -47,7 +49,7 @@ const ProxyConfig& Config();
 // (4 = Lite, 5 = INT8, 6 = INT8 RDNA 2, 7 = FP8, 8 = AMD's automatic choice). Re-read at most twice a second.
 // LiveNssQuality: the NSS quality, -1 when there is no file, no valid value or another upscaler is selected.
 int LiveNssQuality();
-// LiveUpscaler: the control file's first value (0-8), -1 when it selects nothing.
+// LiveUpscaler: the control file's upscaler value (0-9), -1 when it selects nothing.
 int LiveUpscaler();
 // Control file values for the FSR 4 models.
 int LiveCodeForFsr4(int model);
@@ -63,6 +65,8 @@ int LiveWatermark();    // 0 off, 1 on (AMD's FSR 4 banner)
 int LiveGpuTiming();    // 0 off, 1 on (log the GPU time of each upscale)
 int LiveXessQuality();  // xess_quality_settings_t, 0 = from the render scale
 int LiveEqualCost();    // 0 off, 1 on (equal-cost render scale)
+int LiveDilateMv();     // 0 off, 1 on (FSR motion vector dilation)
+bool DilateMvEnabled(); // the control file's dilate_mv, else AISS_FSR_DILATE_MV
 // The number of evaluations to average GPU timing over: the live gpu_timing toggle (120 when on), else AISS_GPU_TIMING.
 int GpuTimingFrames();
 // The control file as a Windows path (Z:\...), empty when AISS_CONTROL is not set.

@@ -7,6 +7,7 @@
 #include "common.h"
 #include "cost_model.h"
 #include "fsr4_common.h"
+#include "mv_dilate.h"
 #include "nss_upscaler.h"
 
 #include <windows.h>
@@ -32,11 +33,12 @@ struct Sdk
     PfnFfxCreateContext  create = nullptr;
     PfnFfxDestroyContext destroy = nullptr;
     PfnFfxQuery          query = nullptr;
+    PfnFfxConfigure      configure = nullptr;
     PfnFfxDispatch       dispatch = nullptr;
 };
 
 std::mutex g_mutex;
-bool       g_loadTried = false, g_loadOk = false, g_deviceFailed = false;
+bool       g_loadTried = false, g_loadOk = false, g_deviceFailed = false, g_fsr3Failed = false;
 Sdk        g_sdk;
 Fsr4Driver g_drv;  // the SDK DLL's FSR 4 networks (device checks wrapped, see fsr4_common)
 
@@ -101,6 +103,7 @@ bool LoadSdk()
     g_sdk.create   = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(g_sdk.lib, "ffxCreateContext"));
     g_sdk.destroy  = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(g_sdk.lib, "ffxDestroyContext"));
     g_sdk.query    = reinterpret_cast<PfnFfxQuery>(GetProcAddress(g_sdk.lib, "ffxQuery"));
+    g_sdk.configure = reinterpret_cast<PfnFfxConfigure>(GetProcAddress(g_sdk.lib, "ffxConfigure"));
     g_sdk.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(g_sdk.lib, "ffxDispatch"));
     if (!g_sdk.create || !g_sdk.destroy || !g_sdk.query || !g_sdk.dispatch)
     {
@@ -120,8 +123,9 @@ void FfxMessage(uint32_t type, const wchar_t* message)
     LOGI("FSR 4 Vulkan runtime %s: %ls", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
 }
 
-// The upscaler versions the DLL offers on this device; returns the id of the newest 4.x one (0 if none), logging all.
-uint64_t PickFsr4Version(VkDeviceContext* dc, std::string* name)
+// The upscaler versions the DLL offers on this device; returns the id of the newest <major>.x one (0 if none), logging
+// all.
+uint64_t PickVersion(VkDeviceContext* dc, std::string* name, char major)
 {
     ffxQueryDescGetVersions q = {};
     q.header.type             = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
@@ -143,7 +147,7 @@ uint64_t PickFsr4Version(VkDeviceContext* dc, std::string* name)
     {
         const char* n = names[i] ? names[i] : "?";
         list += std::string(list.empty() ? "" : ", ") + n;
-        if (n[0] == '4' && n[1] == '.' && (best == 0 || strcmp(n, name->c_str()) > 0))
+        if (n[0] == major && n[1] == '.' && (best == 0 || strcmp(n, name->c_str()) > 0))
             best = ids[i], *name = n;
     }
     LOGI("FSR 4 Vulkan: upscaler versions offered on this device: %s", list.c_str());
@@ -585,15 +589,52 @@ FfxApiResource Resource(const UpscalerImage& img, bool output)
                                state);
 }
 
+// FSR 3.1 settings (the SDK DLL's FSR 3.1.6, AISS_UPSCALER=fsr3 / control code 9). Defaults chosen so its output comes
+// closest to FSR 4 INT8's on the replay harness: 53.9 -> 56.1 dB tonemapped PSNR against INT8, frame-to-frame change at
+// static edges 0.08 -> 0.15 (INT8 0.21, Lite 0.16). Only accumulation and shading change moved it; sharpening only took
+// it further away (README, "FSR 3.1"). Each can be overridden for tuning:
+// AISS_FSR3_SHARPNESS (< 0 = sharpening off), AISS_FSR3_VELOCITY, AISS_FSR3_REACTIVENESS, AISS_FSR3_SHADING,
+// AISS_FSR3_ACCUMULATION, AISS_FSR3_MIN_DISOCCLUSION (the SDK's configure keys of the same names).
+struct Fsr3Tuning
+{
+    float sharpness        = -1.0f;
+    float velocity         = 1.0f;
+    float reactiveness     = 1.0f;
+    float shading          = 32.0f;   // AMD default 1.0
+    float accumulation     = 0.05f;   // AMD default 0.333
+    float minDisocclusion  = -0.333f;
+};
+
+const Fsr3Tuning& Fsr3Settings()
+{
+    static const Fsr3Tuning t = [] {
+        Fsr3Tuning r;
+        auto env = [](const char* name, float& v) {
+            if (const char* s = getenv(name); s && *s)
+                v = float(atof(s));
+        };
+        env("AISS_FSR3_SHARPNESS", r.sharpness);
+        env("AISS_FSR3_VELOCITY", r.velocity);
+        env("AISS_FSR3_REACTIVENESS", r.reactiveness);
+        env("AISS_FSR3_SHADING", r.shading);
+        env("AISS_FSR3_ACCUMULATION", r.accumulation);
+        env("AISS_FSR3_MIN_DISOCCLUSION", r.minDisocclusion);
+        return r;
+    }();
+    return t;
+}
+
 class Fsr4VkUpscaler : public Upscaler
 {
 public:
     static std::unique_ptr<Upscaler> Create(const VulkanDevice& device, const UpscalerCreateInfo& info)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_deviceFailed || !LoadSdk())
+        const bool fsr3 = info.backend == kBackendFsr3Vk;
+        if ((fsr3 ? g_fsr3Failed : g_deviceFailed) || !LoadSdk())
             return nullptr;
         std::unique_ptr<Fsr4VkUpscaler> up(new Fsr4VkUpscaler());
+        up->m_fsr3 = fsr3;
         up->m_dev  = device;
         up->m_info = info;
         up->m_dc   = {device.device, device.physicalDevice, device.gdpa};
@@ -623,16 +664,19 @@ public:
         const int     wanted = info.fsr4Model == kFsr4Auto && Fsr4ModelForGpu(gpu) > 0 ? Fsr4ModelForGpu(gpu) : info.fsr4Model;
         std::string   versionName;
         Fsr4BeginCreate(wanted);
-        const uint64_t versionId = PickFsr4Version(&up->m_dc, &versionName);
+        const uint64_t versionId = PickVersion(&up->m_dc, &versionName, fsr3 ? '3' : '4');
         g_dot2 = Dot2Enabled(device, CostGetApi());
-        if (!Shaders().dot2.empty())
+        if (!fsr3 && !Shaders().dot2.empty())
             LOGI("FSR 4 Vulkan: dot2 shader modules %s", g_dot2 ? "in use" : "not used (device lacks VK_VALVE_shader_mixed_float_dot_product or it is not enabled)");
         int            native    = 0;
         const int      accepted  = Fsr4EndCreate(&native);
         if (!versionId)
         {
-            LOGI("FSR 4 Vulkan: no FSR 4 upscaler offered on this device; FSR 4 goes through the D3D12 interop");
-            g_deviceFailed = true;
+            if (fsr3)
+                LOGI("FSR 3 Vulkan: no FSR 3 upscaler offered on this device; using NSS");
+            else
+                LOGI("FSR 4 Vulkan: no FSR 4 upscaler offered on this device; FSR 4 goes through the D3D12 interop");
+            (fsr3 ? g_fsr3Failed : g_deviceFailed) = true;
             return nullptr;
         }
 
@@ -667,10 +711,40 @@ public:
         const ffxReturnCode_t rc = g_sdk.create(&up->m_ctx, &create.header, nullptr);
         if (rc != FFX_API_RETURN_OK || !up->m_ctx)
         {
-            LOGI("FSR 4 Vulkan: createContext failed (%u); FSR 4 goes through the D3D12 interop", rc);
-            g_deviceFailed = true;
+            LOGI("FSR %d Vulkan: createContext failed (%u); %s", fsr3 ? 3 : 4, rc,
+                 fsr3 ? "using NSS" : "FSR 4 goes through the D3D12 interop");
+            (fsr3 ? g_fsr3Failed : g_deviceFailed) = true;
             up->m_ctx      = nullptr;
             return nullptr;
+        }
+        if (fsr3)
+        {
+            // FSR 3.1's own knobs (no network): the tuned defaults, or the AISS_FSR3_* overrides.
+            const Fsr3Tuning& t = Fsr3Settings();
+            const std::pair<uint64_t, float> keys[] = {
+                {FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR, t.velocity},
+                {FFX_API_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE, t.reactiveness},
+                {FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE, t.shading},
+                {FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME, t.accumulation},
+                {FFX_API_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION, t.minDisocclusion},
+            };
+            for (const auto& kv : keys)
+            {
+                float                           v = kv.second;
+                ffxConfigureDescUpscaleKeyValue c = {};
+                c.header.type                     = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+                c.key                             = kv.first;
+                c.ptr                             = &v;
+                if (g_sdk.configure)
+                    g_sdk.configure(&up->m_ctx, &c.header);
+            }
+            up->m_info.fsr4Active = -1;
+            LOGI("FSR 3 Vulkan: upscaler %s, context %ux%u -> %ux%u, flags 0x%x; sharpness %.2f, velocity %.2f, "
+                 "reactiveness %.2f, shading %.2f, accumulation %.3f, min disocclusion %.3f",
+                 versionName.c_str(), create.maxRenderSize.width, create.maxRenderSize.height, info.displayWidth,
+                 info.displayHeight, create.flags, t.sharpness, t.velocity, t.reactiveness, t.shading, t.accumulation,
+                 t.minDisocclusion);
+            return up;
         }
         up->m_info.fsr4Active = accepted;
         LOGI("FSR 4 Vulkan: upscaler %s, network %s (asked for %s; AMD's own checks accept: 0x%x), context %ux%u -> "
@@ -735,8 +809,22 @@ public:
     }
 
 private:
-    bool Record(VkCommandBuffer cmd, const UpscalerDispatch& d)
+    bool Record(VkCommandBuffer cmd, const UpscalerDispatch& in)
     {
+        // Optional motion vector dilation (render-resolution MVs only), switchable live.
+        UpscalerDispatch d = in;
+        if (!m_info.highResMv && DilateMvEnabled() && !m_dilatorFailed)
+        {
+            if (!m_dilator)
+            {
+                m_dilator = MvDilator::Create(m_dev, m_info.renderWidth, m_info.renderHeight);
+                m_dilatorFailed = !m_dilator;
+                LOGI("FSR %d Vulkan: motion vector dilation %s", m_fsr3 ? 3 : 4, m_dilator ? "on" : "unavailable");
+            }
+            if (m_dilator)
+                d.motionVectors = m_dilator->Record(cmd, in.depth, in.motionVectors, in.renderWidth, in.renderHeight,
+                                                    m_info.depthInverted);
+        }
         ffxDispatchDescUpscale up  = {};
         up.header.type             = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
         up.commandList             = cmd;
@@ -748,7 +836,8 @@ private:
         up.motionVectorScale       = {d.mvScaleX * Config().mvSign[0], d.mvScaleY * Config().mvSign[1]};
         up.renderSize              = {d.renderWidth, d.renderHeight};
         up.upscaleSize             = {d.output.width, d.output.height};
-        up.enableSharpening        = false;
+        up.enableSharpening        = m_fsr3 && Fsr3Settings().sharpness >= 0.0f;
+        up.sharpness               = m_fsr3 ? std::min(std::max(Fsr3Settings().sharpness, 0.0f), 1.0f) : 0.0f;
         up.frameTimeDelta          = d.frameTimeMs;
         up.preExposure             = 1.0f;
         up.reset                   = d.reset || m_dispatchCount == 0;
@@ -762,13 +851,13 @@ private:
         const ffxReturnCode_t rc = g_sdk.dispatch(&m_ctx, &up.header);
         ++m_dispatchCount;
         if ((m_dispatchCount % 600) == 1 || LogLevel() >= 2)
-            LOGI("FSR 4 Vulkan evaluate %llu: render %ux%u -> %ux%u, jitter %.3f,%.3f, mv scale %.2f,%.2f%s",
-                 (unsigned long long)m_dispatchCount, up.renderSize.width, up.renderSize.height, up.upscaleSize.width,
-                 up.upscaleSize.height, up.jitterOffset.x, up.jitterOffset.y, up.motionVectorScale.x,
-                 up.motionVectorScale.y, m_autoExposure ? " (auto exposure)" : "");
+            LOGI("FSR %d Vulkan evaluate %llu: render %ux%u -> %ux%u, jitter %.3f,%.3f, mv scale %.2f,%.2f%s",
+                 m_fsr3 ? 3 : 4, (unsigned long long)m_dispatchCount, up.renderSize.width, up.renderSize.height,
+                 up.upscaleSize.width, up.upscaleSize.height, up.jitterOffset.x, up.jitterOffset.y,
+                 up.motionVectorScale.x, up.motionVectorScale.y, m_autoExposure ? " (auto exposure)" : "");
         if (rc != FFX_API_RETURN_OK)
         {
-            LOGI("FSR 4 Vulkan: dispatch failed (%u)", rc);
+            LOGI("FSR %d Vulkan: dispatch failed (%u)", m_fsr3 ? 3 : 4, rc);
             return false;
         }
         return true;
@@ -776,6 +865,9 @@ private:
 
     Fsr4VkUpscaler() = default;
     PFN_vkCmdPipelineBarrier m_barrier = nullptr;
+    bool                     m_fsr3    = false;  // FSR 3.1 from the same DLL (no network, no shader replacement)
+    std::unique_ptr<MvDilator> m_dilator;
+    bool                       m_dilatorFailed = false;
     VkDeviceContext m_dc            = {};
     ffxContext      m_ctx           = nullptr;
     uint64_t        m_dispatchCount = 0;
@@ -786,6 +878,12 @@ private:
 std::unique_ptr<Upscaler> CreateFsr4VkUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info)
 {
     return Fsr4VkUpscaler::Create(device, info);
+}
+
+bool Fsr3VkUnavailable()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_fsr3Failed || (g_loadTried && !g_loadOk);
 }
 
 bool Fsr4VkUnavailable()

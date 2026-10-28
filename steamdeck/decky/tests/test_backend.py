@@ -631,14 +631,22 @@ class FakeLibraryTests(unittest.TestCase):
         # watermark, gpu timing and xess preset all go through the control file; the removed fsr4_path is ignored
         self.core.set_settings({"fsr4_path": 2, "watermark": 1, "gpu_timing": 1, "xess_quality": 101})
         self.assertEqual((ctl()["watermark"], ctl()["gpu_timing"], ctl()["xess_quality"]), ("1", "1", "101"))
-        # Equal-cost render scale: on by default, switchable through the control file.
-        self.assertEqual(ctl()["equal_cost"], "1")
-        self.core.set_settings({"equal_cost": 0})
-        self.assertEqual(ctl()["equal_cost"], "0")
-        self.core.set_settings({"equal_cost": 1})
+        # Motion vector dilation for FSR: off by default, switchable through the control file. Equal-cost render
+        # scale is gone: no longer written, and an old saved setting is dropped.
+        self.assertEqual(ctl()["dilate_mv"], "0")
+        self.core.set_settings({"dilate_mv": 1})
+        self.assertEqual(ctl()["dilate_mv"], "1")
+        self.core.set_settings({"dilate_mv": 0})
+        self.assertNotIn("equal_cost", ctl())
+        self.assertNotIn("equal_cost", self.core.state["settings"])
+        # FSR 3.1 (from AMD's SDK Vulkan DLL) is upscaler 9, written as such.
+        self.core.set_settings({"upscaler": 9})
+        self.assertEqual(ctl()["upscaler"], "9")
+        self.core.set_settings({"upscaler": 0})
         self.assertNotIn("fsr4_path", ctl())
         self.assertNotIn("fsr4_path", self.core.state["settings"])
-        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"xess_quality": 99}, {"nss_quality": 3}, {"equal_cost": 2}, {"quality": 7}):
+        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"xess_quality": 99}, {"nss_quality": 3}, {"dilate_mv": 2}, {"upscaler": 7},
+                    {"quality": 7}):
             with self.assertRaises(ValueError):
                 self.core.set_settings(bad)
         self.core.set_settings({"upscaler": 2})
@@ -687,7 +695,7 @@ class FakeLibraryTests(unittest.TestCase):
         st = asyncio.run(p.get_state(True))
         self.assertIn("games", st)
         self.assertIn("settings", st)
-        r = asyncio.run(p.set_settings({"upscaler": 9}))
+        r = asyncio.run(p.set_settings({"upscaler": 7}))  # FP8: not offered
         self.assertFalse(r["ok"])
         mod.Plugin.core = None
 

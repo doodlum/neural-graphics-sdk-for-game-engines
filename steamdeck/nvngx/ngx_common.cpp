@@ -127,7 +127,7 @@ int SelectedBackend(int* fsr4Model)
     int       backend = kBackendNss, model = kFsr4Auto;
     if (live >= 0)
     {
-        backend = live == 3 ? kBackendXess : live >= 4 ? kBackendFsr4 : kBackendNss;
+        backend = live == 3 ? kBackendXess : live == 9 ? kBackendFsr3Vk : live >= 4 ? kBackendFsr4 : kBackendNss;
         if (backend == kBackendFsr4)
             model = Fsr4ModelForLiveCode(live);
     }
@@ -136,10 +136,20 @@ int SelectedBackend(int* fsr4Model)
         backend = kBackendFsr4;
         model   = Config().fsr4Model;
     }
+    else if (Config().fsr3)
+        backend = kBackendFsr3Vk;
     else if (Config().xess)
         backend = kBackendXess;
     if (backend == kBackendXess && XessUnavailable())
         backend = kBackendNss;
+    if (backend == kBackendFsr3Vk && Fsr3VkUnavailable())
+    {
+        static bool logged = false;
+        if (!logged)
+            LOGI("FSR 3.1 unavailable (amd_fidelityfx_upscaler_vk.dll missing or offers no FSR 3); using NSS");
+        logged  = true;
+        backend = kBackendNss;
+    }
     // Neither AMD's SDK Vulkan DLL nor amdxcffx64 usable (missing / not 4.1.2 / refuses the model): NSS.
     if (backend == kBackendFsr4 && Fsr4VkUnavailable() && Fsr4Dx12Unavailable(model))
     {
@@ -160,6 +170,8 @@ const char* UpscalerName(const UpscalerCreateInfo& i)
     static thread_local char text[64];
     if (i.backend == kBackendXess)
         snprintf(text, sizeof(text), "XeSS");
+    else if (i.backend == kBackendFsr3Vk)
+        snprintf(text, sizeof(text), "FSR 3.1");
     else if (i.backend == kBackendFsr4 || i.backend == kBackendFsr4Dx12 || i.backend == kBackendFsr4Interop ||
              i.backend == kBackendFsr4Vk)
         snprintf(text, sizeof(text), "FSR 4 %s%s%s%s%s", Fsr4ModelName(i.fsr4Model),
@@ -222,7 +234,7 @@ static bool SameLiveSettings(const UpscalerCreateInfo& a, const UpscalerCreateIn
 {
     if (a.backend != b.backend)
         return false;
-    if (a.backend == kBackendXess)
+    if (a.backend == kBackendXess || a.backend == kBackendFsr3Vk)
         return true;
     if (a.backend == kBackendFsr4 || a.backend == kBackendFsr4Dx12 || a.backend == kBackendFsr4Interop ||
         a.backend == kBackendFsr4Vk)

@@ -1,0 +1,43 @@
+// Motion vector dilation pass recorded ahead of FSR (mv_dilate.comp): the proxy's own compute dispatch on the game's
+// VkDevice, writing a proxy-owned RG32F image that FSR then reads as its motion vectors.
+// SPDX-License-Identifier: MIT
+#pragma once
+
+#include "nss_upscaler.h"
+
+#include <memory>
+
+class MvDilator
+{
+public:
+    // Null when the pipeline or the image cannot be created (the caller then passes the game's motion vectors).
+    static std::unique_ptr<MvDilator> Create(const VulkanDevice& dev, uint32_t maxWidth, uint32_t maxHeight);
+    ~MvDilator();
+
+    // Records the dilation of `motion` by `depth` (both at the render size, in the layouts given) into the owned image
+    // and returns that image, in GENERAL layout and visible to compute reads, as FSR's motion vector input.
+    UpscalerImage Record(VkCommandBuffer cmd, const UpscalerImage& depth, const UpscalerImage& motion, uint32_t width,
+                         uint32_t height, bool depthInverted);
+
+private:
+    MvDilator() = default;
+    struct Fn;
+    std::unique_ptr<Fn> m_fn;
+    VulkanDevice        m_dev;
+    VkSampler             m_sampler    = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_setLayout  = VK_NULL_HANDLE;
+    VkPipelineLayout      m_pipeLayout = VK_NULL_HANDLE;
+    VkPipeline            m_pipeline   = VK_NULL_HANDLE;
+    VkDescriptorPool      m_pool       = VK_NULL_HANDLE;
+    VkImage               m_image      = VK_NULL_HANDLE;
+    VkDeviceMemory        m_memory     = VK_NULL_HANDLE;
+    VkImageView           m_view       = VK_NULL_HANDLE;
+    uint32_t              m_width = 0, m_height = 0;
+    bool                  m_initialised = false;  // m_image has left VK_IMAGE_LAYOUT_UNDEFINED
+    // Per-dispatch views of the game's depth and motion vectors, recycled once the ring wraps (frames in flight are far
+    // fewer than kRing).
+    static constexpr uint32_t kRing = 8;
+    VkDescriptorSet m_sets[kRing]       = {};
+    VkImageView     m_views[kRing * 2]  = {};
+    uint64_t        m_count             = 0;
+};

@@ -15,6 +15,12 @@ add_custom_command(
     COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -mfmt=num -o "${SPV_INC}" "${CMAKE_CURRENT_SOURCE_DIR}/depth_copy.comp"
     DEPENDS depth_copy.comp
     COMMENT "Compiling depth_copy.comp")
+set(DILATE_SPV_INC "${CMAKE_CURRENT_BINARY_DIR}/mv_dilate.spv.inc")
+add_custom_command(
+    OUTPUT "${DILATE_SPV_INC}"
+    COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -mfmt=num -o "${DILATE_SPV_INC}" "${CMAKE_CURRENT_SOURCE_DIR}/mv_dilate.comp"
+    DEPENDS mv_dilate.comp
+    COMMENT "Compiling mv_dilate.comp")
 set(EXPOSURE_SPV_INC "${CMAKE_CURRENT_BINARY_DIR}/exposure.spv.inc")
 add_custom_command(
     OUTPUT "${EXPOSURE_SPV_INC}"
@@ -51,7 +57,9 @@ add_library(nvngx SHARED
     frame_dump.cpp
     gpu_timing.cpp
     cost_model.cpp
+    mv_dilate.cpp
     "${SPV_INC}"
+    "${DILATE_SPV_INC}"
     "${EXPOSURE_SPV_INC}"
     ${REGION_COPY_INCS})
 

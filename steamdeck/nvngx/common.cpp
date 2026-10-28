@@ -76,11 +76,15 @@ const ProxyConfig& Config()
         for (int i = 0; i < 6; ++i)
             c.qualityRatio[i] = forced >= 1.0f ? forced : standard[i];
         c.ratioForced      = forced >= 1.0f;
-        c.equalCost        = EnvInt("AISS_EQUAL_COST", 1) != 0;
+        c.equalCost        = EnvInt("AISS_EQUAL_COST", 0) != 0;
+        c.dilateMv         = EnvInt("AISS_FSR_DILATE_MV", 0) != 0;
         c.nssQuality       = EnvInt("AISS_NSS_QUALITY", -1);
         c.xess             = false;
         if (const char* v = getenv("AISS_UPSCALER"))
             c.xess = !strcmp(v, "xess") || !strcmp(v, "XeSS") || !strcmp(v, "XESS") || !strcmp(v, "3");
+        c.fsr3             = false;
+        if (const char* v = getenv("AISS_UPSCALER"))
+            c.fsr3 = !_stricmp(v, "fsr3") || !_stricmp(v, "fsr3.1") || !strcmp(v, "9");
         c.xessQuality      = EnvInt("AISS_XESS_QUALITY", 0);
         c.fsr4Model        = -1;
         if (const char* v = getenv("AISS_UPSCALER"))
@@ -123,7 +127,7 @@ const ProxyConfig& Config()
 
 struct LiveControl
 {
-    int nssQuality  = -1;  // control-file upscaler value 0-8 (0-2 NSS, 3 XeSS, 4-8 FSR 4)
+    int nssQuality  = -1;  // control-file upscaler value 0-9 (0-2 NSS, 3 XeSS, 4-8 FSR 4, 9 FSR 3.1)
     int fastMath    = -1;
     int capture     = -1;
     int watermark   = -1;  // 0 off, 1 on
@@ -131,6 +135,7 @@ struct LiveControl
     int gpuTiming   = -1;  // 0 off, 1 on
     int xessQuality = -1;  // xess_quality_settings_t, 0 = from render scale
     int equalCost   = -1;  // 0 off, 1 on
+    int dilateMv    = -1;  // 0 off, 1 on
 };
 
 const std::string& ControlFilePath()
@@ -182,7 +187,7 @@ static LiveControl ReadLiveControl()
                 *eq           = 0;
                 const char* k = line;
                 const char* v = eq + 1;
-                if (!strcmp(k, "upscaler")) setInt(v, 0, 8, read.nssQuality);
+                if (!strcmp(k, "upscaler")) setInt(v, 0, 9, read.nssQuality);
                 else if (!strcmp(k, "fast_math")) setInt(v, 0, 1, read.fastMath);
                 else if (!strcmp(k, "capture")) setInt(v, 0, 1 << 30, read.capture);
                 else if (!strcmp(k, "fsr4_path")) {}  // older plugins wrote it; there is only one FSR 4 path now
@@ -191,6 +196,7 @@ static LiveControl ReadLiveControl()
                 else if (!strcmp(k, "gpu_timing")) setInt(v, 0, 1, read.gpuTiming);
                 else if (!strcmp(k, "xess_quality")) setInt(v, 0, 1000, read.xessQuality);
                 else if (!strcmp(k, "equal_cost")) setInt(v, 0, 1, read.equalCost);
+                else if (!strcmp(k, "dilate_mv")) setInt(v, 0, 1, read.dilateMv);
                 firstLine = false;
                 continue;
             }
@@ -198,7 +204,7 @@ static LiveControl ReadLiveControl()
             {
                 int q = -1, fast = -1, capture = -1;
                 const int n = sscanf(line, "%d %d %d", &q, &fast, &capture);
-                if (n >= 1 && q >= 0 && q <= 8) read.nssQuality = q;
+                if (n >= 1 && q >= 0 && q <= 9) read.nssQuality = q;
                 if (n >= 2 && (fast == 0 || fast == 1)) read.fastMath = fast;
                 if (n >= 3 && capture >= 0) read.capture = capture;
             }
@@ -259,6 +265,17 @@ int LiveXessQuality()
 int LiveEqualCost()
 {
     return ReadLiveControl().equalCost;
+}
+
+int LiveDilateMv()
+{
+    return ReadLiveControl().dilateMv;
+}
+
+bool DilateMvEnabled()
+{
+    const int live = LiveDilateMv();
+    return live >= 0 ? live != 0 : Config().dilateMv;
 }
 
 static int LiveLogLevelRaw()

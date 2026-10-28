@@ -101,13 +101,13 @@ WDO_ENV = "WINEDLLOVERRIDES"
 COMMAND = "%command%"
 
 DEFAULT_SETTINGS = {
-    # Upscaler family: 0 NSS, 3 XeSS, 4 FSR 4 (1 and 2 were NSS Balanced / Performance; set_settings still maps them
-    # to NSS + nss_quality). Applied live.
+    # Upscaler family: 0 NSS, 3 XeSS, 4 FSR 4, 9 FSR 3.1 (1 and 2 were NSS Balanced / Performance; set_settings still
+    # maps them to NSS + nss_quality). Applied live.
     "upscaler": 0,
     "nss_quality": 0,    # when upscaler == 0: Arm's FfxApiNssShaderQualityMode, 0 Quality, 1 Balanced, 2 Performance
     "fsr4_model": 0,     # when upscaler == 4: 0 Auto (AMD's choice), 1 Lite, 2 INT8, 3 INT8 RDNA 2
     "watermark": 0,      # 1 = draw AMD's FSR 4 version/network banner on the output
-    "equal_cost": 1,     # 1 = each upscaler renders at the size where the frame costs the same as with NSS Quality
+    "dilate_mv": 0,      # 1 = dilate motion vectors by nearest depth ahead of FSR 4 / FSR 3.1
     "xess_quality": 0,   # XeSS preset override: 0 = from the render scale, else 100-105 (Ultra Perf .. AA)
     "gpu_timing": 0,     # 1 = log the GPU time of each upscale (AISS_GPU_TIMING)
     "log": 1,            # AISS_LOG level 0-4; 1 is the core's default
@@ -115,8 +115,9 @@ DEFAULT_SETTINGS = {
 # FSR 4 model (setting value) -> control-file upscaler code (4 Lite, 5 INT8, 6 INT8 RDNA 2, 8 Auto).
 FSR4_MODEL_TO_CODE = {0: 8, 1: 4, 2: 5, 3: 6}
 
-# Control file upscaler values: 0-2 NSS, 3 XeSS, 4 FSR 4 Lite, 5 FSR 4 INT8, 6 FSR 4 INT8 RDNA 2 (the proxy also
-# understands 7 = FP8 and 8 = AMD's automatic choice, not offered: FP8 needs RDNA 4, auto is Lite on a Steam Deck).
+# Control file upscaler values: 0-2 NSS, 3 XeSS, 4 FSR 4 Lite, 5 FSR 4 INT8, 6 FSR 4 INT8 RDNA 2, 8 FSR 4 auto (AMD's
+# choice: Lite on a Steam Deck), 9 FSR 3.1 (the proxy also understands 7 = FP8, not offered: FP8 needs RDNA 4).
+UPSCALER_VALUES = (0, 3, 4, 9)
 
 def migrate_settings(s: dict) -> dict:
     """Bring an older settings dict up to date: the single 'quality' key (0-6) becomes upscaler + fsr4_model, and
@@ -125,6 +126,7 @@ def migrate_settings(s: dict) -> dict:
     s.pop("ratio", None)  # removed long ago
     s.pop("fsr4_path", None)  # removed: FSR 4 has a single path (amdxcffx64)
     s.pop("fast_math", None)  # removed: NSS always runs bit exact
+    s.pop("equal_cost", None)  # removed: every upscaler renders at the standard DLSS ratios
     if "quality" in s:
         _apply_upscaler_code(s, int(s.pop("quality")))
     if int(s.get("upscaler", 0)) in (1, 2):
@@ -714,7 +716,8 @@ class AissCore:
 
     def bundle_info(self) -> dict:
         info = {"missing": self.bundle_missing(), "version": "",
-                "fsr4": self.bundle_path("fsr4_dx12").is_file() or self.bundle_path("fsr4_vk").is_file()}
+                "fsr4": self.bundle_path("fsr4_dx12").is_file() or self.bundle_path("fsr4_vk").is_file(),
+                "fsr3": self.bundle_path("fsr4_vk").is_file()}  # FSR 3.1 comes from the same SDK Vulkan DLL
         try:
             info["version"] = (self.bin_dir / "VERSION").read_text(encoding="utf-8").strip()
         except OSError:
@@ -1316,11 +1319,11 @@ class AissCore:
         return {**self.state["settings"], "control": str(self.control_path)}
 
     def control_upscaler_code(self, s: dict | None = None) -> int:
-        """The single control-file upscaler value (0-8) from the upscaler, NSS quality and FSR 4 model settings."""
+        """The single control-file upscaler value (0-9) from the upscaler, NSS quality and FSR 4 model settings."""
         s = s if s is not None else self.state["settings"]
         u = int(s.get("upscaler", 0))
-        if u == 3:
-            return 3
+        if u in (3, 9):
+            return u
         if u == 4:
             return FSR4_MODEL_TO_CODE.get(int(s.get("fsr4_model", 0)), 8)
         q = int(s.get("nss_quality", 0))
@@ -1342,7 +1345,7 @@ class AissCore:
             f"log={int(s.get('log', 1))}",
             f"gpu_timing={1 if s.get('gpu_timing') else 0}",
             f"xess_quality={int(s.get('xess_quality', 0))}",
-            f"equal_cost={1 if s.get('equal_cost', 1) else 0}",
+            f"dilate_mv={1 if s.get('dilate_mv') else 0}",
         ]
         tmp.write_text("\n".join(lines) + "\n")
         os.replace(tmp, self.control_path)
@@ -1377,8 +1380,8 @@ class AissCore:
                 raise ValueError("quality must be 0-6 (NSS 0/1/2, XeSS 3, FSR 4 Lite/INT8/RDNA2 4/5/6)")
             _apply_upscaler_code(s, q)
         checks = {
-            "upscaler": (0, 4), "nss_quality": (0, 2), "fsr4_model": (0, 3), "watermark": (0, 1),
-            "gpu_timing": (0, 1), "log": (0, 4), "equal_cost": (0, 1),
+            "upscaler": (0, 9), "nss_quality": (0, 2), "fsr4_model": (0, 3), "watermark": (0, 1),
+            "gpu_timing": (0, 1), "log": (0, 4), "dilate_mv": (0, 1),
         }
         for key, (lo, hi) in checks.items():
             if key in settings:
@@ -1388,6 +1391,8 @@ class AissCore:
                 s[key] = v
         if int(s["upscaler"]) in (1, 2):  # older frontends: NSS Balanced / Performance were upscaler values
             _apply_upscaler_code(s, int(s["upscaler"]))
+        if int(s["upscaler"]) not in UPSCALER_VALUES:
+            raise ValueError(f"upscaler must be one of {UPSCALER_VALUES} (NSS, XeSS, FSR 4, FSR 3.1)")
         if "xess_quality" in settings:
             xq = int(settings["xess_quality"])
             if xq != 0 and not 100 <= xq <= 105:
