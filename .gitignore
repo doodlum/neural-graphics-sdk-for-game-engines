@@ -46,6 +46,8 @@ imgui.ini
 .android/
 result//build_win*/
 
-# AMD FSR 4 (amdvkffx64.dll) is bundled by steamdeck/decky/build.sh from ../third_party/amd; never committed
+# AMD FSR 4 DLLs and replacement shader packs are bundled by steamdeck/decky/build.sh from ../third_party/amd; never committed
 amdvkffx64.dll
 amdxcffx64.dll
+amd_fidelityfx_*.dll
+fsr4_shaders.bin

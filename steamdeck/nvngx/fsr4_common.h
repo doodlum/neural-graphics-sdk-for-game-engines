@@ -70,3 +70,14 @@ std::string Fsr4ModelList(const Fsr4Driver& drv);
 // vendor and accept nothing; `auto` then falls back to the network Fsr4ModelForGpu(gpu) names (destroying and
 // recreating the context). Returns the network that runs, or -1 (logging why), and leaves *context valid on success.
 int Fsr4CreateWithModel(const Fsr4Driver& drv, int wanted, const Fsr4Gpu& gpu, void* context, void* createDesc);
+
+// Points `module`'s import of dll!function at `replacement`; returns the previous target (null when not imported).
+void* Fsr4RedirectImport(HMODULE module, const char* dll, const char* function, void* replacement);
+
+// For a loaded FidelityFX SDK module that carries the FSR 4 networks (amd_fidelityfx_upscaler_vk.dll): answers its GPU
+// query with `gpu` and wraps each network's device check like Fsr4LoadDriver does. Returns the bitmask of networks found.
+int Fsr4PrepareModule(HMODULE lib, const Fsr4Gpu& gpu, Fsr4Driver& out);
+// Around a context creation that goes through wrapped device checks: Begin sets the network wanted (kFsr4Auto = AMD's
+// own pick); End returns the network that accepted (-1 if none) and AMD's own answers as a bitmask.
+void Fsr4BeginCreate(int wantedModel);
+int  Fsr4EndCreate(int* nativeMask);

@@ -140,11 +140,13 @@ int SelectedBackend(int* fsr4Model)
         backend = kBackendXess;
     if (backend == kBackendXess && XessUnavailable())
         backend = kBackendNss;
-    if (backend == kBackendFsr4 && Fsr4Dx12Unavailable(model))  // amdxcffx64 missing / not 4.1.2 / refuses the model
+    // Neither AMD's SDK Vulkan DLL nor amdxcffx64 usable (missing / not 4.1.2 / refuses the model): NSS.
+    if (backend == kBackendFsr4 && Fsr4VkUnavailable() && Fsr4Dx12Unavailable(model))
     {
         static bool logged = false;
         if (!logged)
-            LOGI("FSR 4 (%s) unavailable (amdxcffx64.dll); using NSS", Fsr4ModelName(model));
+            LOGI("FSR 4 (%s) unavailable (amd_fidelityfx_upscaler_vk.dll and amdxcffx64.dll); using NSS",
+                 Fsr4ModelName(model));
         logged  = true;
         backend = kBackendNss;
     }
@@ -158,12 +160,16 @@ const char* UpscalerName(const UpscalerCreateInfo& i)
     static thread_local char text[64];
     if (i.backend == kBackendXess)
         snprintf(text, sizeof(text), "XeSS");
-    else if (i.backend == kBackendFsr4 || i.backend == kBackendFsr4Dx12 || i.backend == kBackendFsr4Interop)
+    else if (i.backend == kBackendFsr4 || i.backend == kBackendFsr4Dx12 || i.backend == kBackendFsr4Interop ||
+             i.backend == kBackendFsr4Vk)
         snprintf(text, sizeof(text), "FSR 4 %s%s%s%s%s", Fsr4ModelName(i.fsr4Model),
                  i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? " (" : "",
                  i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? Fsr4ModelName(i.fsr4Active) : "",
                  i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? ")" : "",
-                 i.backend == kBackendFsr4Dx12 ? " DX12" : i.backend == kBackendFsr4Interop ? " DX12 interop" : "");
+                 i.backend == kBackendFsr4Dx12      ? " DX12"
+                 : i.backend == kBackendFsr4Interop ? " DX12 interop"
+                 : i.backend == kBackendFsr4Vk      ? " Vulkan"
+                                                    : "");
     else
         snprintf(text, sizeof(text), "NSS quality %d%s", i.nssQuality, i.fastMath ? " fast maths" : "");
     return text;
@@ -188,11 +194,28 @@ UpscalerCreateInfo NgxRemapInterop(const UpscalerCreateInfo& in)
 
 UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& in)
 {
-    // Vulkan games run FSR 4 through the D3D12 interop path too, with the AISS layer splitting the game's command
-    // buffer at the evaluate (see fsr4_interop.cpp); once that has failed, NSS.
-    UpscalerCreateInfo info = NgxRemapInterop(in);
-    info.layerSplit         = info.backend == kBackendFsr4Interop;
+    // Vulkan games run FSR 4 natively through AMD's FSR SDK Vulkan DLL (fsr4_vk.cpp). Without it (or when it refuses
+    // the device) they use the D3D12 interop path, with the AISS layer splitting the game's command buffer at the
+    // evaluate (see fsr4_interop.cpp); once that has failed too, NSS.
+    UpscalerCreateInfo info = in.backend == kBackendFsr4 && !Fsr4VkUnavailable() ? in : NgxRemapInterop(in);
+    if (info.backend == kBackendFsr4)
+        info.backend = kBackendFsr4Vk;
+    info.layerSplit = info.backend == kBackendFsr4Interop || info.backend == kBackendFsr4Vk;  // for the interop fallback
     return info;
+}
+
+UpscalerCreateInfo NgxRemapD3D11(const UpscalerCreateInfo& in)
+{
+    // D3D11 games (DXVK) run FSR 4 natively on DXVK's VkDevice like Vulkan games, recording into the proxy's own
+    // command buffer; without the SDK DLL, through the D3D12 interop (the front end's own submissions, no split).
+    if (in.backend == kBackendFsr4 && !Fsr4VkUnavailable())
+    {
+        UpscalerCreateInfo info = in;
+        info.backend            = kBackendFsr4Vk;
+        info.layerSplit         = false;
+        return info;
+    }
+    return NgxRemapInterop(in);
 }
 
 static bool SameLiveSettings(const UpscalerCreateInfo& a, const UpscalerCreateInfo& b)
@@ -201,7 +224,8 @@ static bool SameLiveSettings(const UpscalerCreateInfo& a, const UpscalerCreateIn
         return false;
     if (a.backend == kBackendXess)
         return true;
-    if (a.backend == kBackendFsr4 || a.backend == kBackendFsr4Dx12 || a.backend == kBackendFsr4Interop)
+    if (a.backend == kBackendFsr4 || a.backend == kBackendFsr4Dx12 || a.backend == kBackendFsr4Interop ||
+        a.backend == kBackendFsr4Vk)
         return a.fsr4Model == b.fsr4Model;
     return a.nssQuality == b.nssQuality && a.fastMath == b.fastMath;
 }

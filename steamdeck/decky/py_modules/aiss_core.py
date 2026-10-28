@@ -7,6 +7,8 @@ Per enabled game the plugin owns:
   * pfx/drive_c/windows/system32/_nvngx.dll        the NSS NGX core (a foreign file there is backed up and restored)
   * pfx/drive_c/windows/system32/libxess.dll       Intel XeSS (unmodified Intel binary), loaded by the core when the
                                                    XeSS upscaler is selected (same backup/restore rules)
+  * pfx/drive_c/windows/system32/aiss/amd_fidelityfx_upscaler_vk.dll, fsr4_shaders.bin   AMD's FSR SDK 2.4 Vulkan
+                                                   upscaler (unmodified) and replacement Lite shaders: FSR 4 for every API
   * pfx/drive_c/windows/system32/aiss/amdxcffx64.dll   AMD FSR 4 (unmodified D3D12 driver DLL), loaded by the core for
                                                    FSR 4 (native on D3D12 games, D3D12 interop on D3D11 games). It lives
                                                    in a private "aiss" subfolder so Proton's own older amdxcffx64.dll in
@@ -45,16 +47,21 @@ BIN_FILES = {
     "xess": "libxess.dll",                  # Intel XeSS SDK binary, redistributed unmodified
     "xess_license": "libxess-LICENSE.txt",  # its licence (Intel Simplified Software License), shipped with it
     "fsr4_dx12": "amdxcffx64.dll",          # AMD FSR 4 (D3D12 driver component), redistributed unmodified
+    "fsr4_vk": "amd_fidelityfx_upscaler_vk.dll",  # AMD FSR SDK 2.4 Vulkan upscaler (FSR 4.1.2), redistributed unmodified
+    "fsr4_vk_license": "amd_fidelityfx-LICENSE.md",  # the FSR SDK licence, shipped with it
+    "fsr4_shaders": "fsr4_shaders.bin",     # replacement FSR 4 Lite shader modules for the Vulkan path (not in the repo)
 }
 # Bundle files the plugin works without (the build skips them when they are not available locally).
-OPTIONAL_BIN = ("fsr4_dx12",)
+OPTIONAL_BIN = ("fsr4_dx12", "fsr4_vk", "fsr4_vk_license", "fsr4_shaders")
 CORE_DEST_NAME = "_nvngx.dll"
 XESS_DEST_NAME = "libxess.dll"
 # AMD's FSR 4 DLLs go in a private subfolder so Proton's own amdxcffx64.dll in system32 cannot shadow them.
 FSR4_SUBDIR = "aiss"
 # Files installed into each prefix's system32: (bundle key, dest path relative to system32, marker or None, state key).
 PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME, None, "xess"),
-                ("fsr4_dx12", f"{FSR4_SUBDIR}/amdxcffx64.dll", None, "fsr4_dx12"))
+                ("fsr4_dx12", f"{FSR4_SUBDIR}/amdxcffx64.dll", None, "fsr4_dx12"),
+                ("fsr4_vk", f"{FSR4_SUBDIR}/amd_fidelityfx_upscaler_vk.dll", None, "fsr4_vk"),
+                ("fsr4_shaders", f"{FSR4_SUBDIR}/fsr4_shaders.bin", None, "fsr4_shaders"))
 # Files earlier builds installed and this one no longer does: (state key, dest path relative to system32). They are
 # removed on install (upgrade) and uninstall when they still match what was installed.
 LEGACY_PREFIX_FILES = (("fsr4", f"{FSR4_SUBDIR}/amdvkffx64.dll"),)
@@ -704,7 +711,8 @@ class AissCore:
         return [f for f in PREFIX_FILES if f[0] not in OPTIONAL_BIN or self.bundle_path(f[0]).is_file()]
 
     def bundle_info(self) -> dict:
-        info = {"missing": self.bundle_missing(), "version": "", "fsr4": self.bundle_path("fsr4_dx12").is_file()}
+        info = {"missing": self.bundle_missing(), "version": "",
+                "fsr4": self.bundle_path("fsr4_dx12").is_file() or self.bundle_path("fsr4_vk").is_file()}
         try:
             info["version"] = (self.bin_dir / "VERSION").read_text(encoding="utf-8").strip()
         except OSError:

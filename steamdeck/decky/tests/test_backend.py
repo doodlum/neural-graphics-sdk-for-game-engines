@@ -81,6 +81,9 @@ def minimal_pe(imports: list[str]) -> bytes:
         name_rva += 0x20
     return bytes(img)
 
+# AMD FSR 4 bundle files (optional, never in the repo).
+AMD_FSR4_FILES = ("amdvkffx64.dll", "amdxcffx64.dll", "amd_fidelityfx_upscaler_vk.dll", "amd_fidelityfx-LICENSE.md", "fsr4_shaders.bin")
+
 class Quiet:
     def __init__(self):
         self.lines = []
@@ -395,17 +398,23 @@ class FakeLibraryTests(unittest.TestCase):
         withfsr = self.tmp / "bin_fsr4"
         withfsr.mkdir()
         for f in self.bin.iterdir():
-            if f.name not in ("amdvkffx64.dll", "amdxcffx64.dll"):
+            if f.name not in AMD_FSR4_FILES:
                 os.symlink(f.resolve(), withfsr / f.name)
         if (self.bin / "amdxcffx64.dll").is_file():
             os.symlink((self.bin / "amdxcffx64.dll").resolve(), withfsr / "amdxcffx64.dll")
         else:
             (withfsr / "amdxcffx64.dll").write_bytes(b"MZ stand-in for AMD amdxcffx64.dll")
+        (withfsr / "amd_fidelityfx_upscaler_vk.dll").write_bytes(b"MZ stand-in for AMD's FSR SDK Vulkan upscaler")
+        (withfsr / "amd_fidelityfx-LICENSE.md").write_text("AMD FSR SDK licence stand-in")
+        (withfsr / "fsr4_shaders.bin").write_bytes(b"AISSSPV1\0\0\0\0")
         # Proton's own amdxcffx64 sits in system32; ours must land in the private aiss subfolder, not shadow it
         self.put(sys32 / "amdxcffx64.dll", b"MZ proton builtin amdxcffx64 4.1.1")
         self.core = self.make_core(bin_dir=withfsr)
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
         self.assertEqual(sha256_of(aiss / "amdxcffx64.dll"), sha256_of(withfsr / "amdxcffx64.dll"))
+        for name in ("amd_fidelityfx_upscaler_vk.dll", "fsr4_shaders.bin"):  # the Vulkan FSR 4 path's files
+            self.assertEqual(sha256_of(aiss / name), sha256_of(withfsr / name))
+        self.assertFalse((aiss / "amd_fidelityfx-LICENSE.md").exists())  # the licence stays with the plugin
         self.assertEqual((sys32 / "amdxcffx64.dll").read_bytes(), b"MZ proton builtin amdxcffx64 4.1.1")  # untouched
         self.assertTrue(self.core.bundle_info()["fsr4"])
         # an earlier build also installed aiss/amdvkffx64.dll: removed on the next install (upgrade) ...
@@ -429,7 +438,7 @@ class FakeLibraryTests(unittest.TestCase):
         nofsr = self.tmp / "bin_nofsr4"
         nofsr.mkdir()
         for f in self.bin.iterdir():
-            if f.name not in ("amdvkffx64.dll", "amdxcffx64.dll"):
+            if f.name not in AMD_FSR4_FILES:
                 os.symlink(f.resolve(), nofsr / f.name)
         self.core = self.make_core(bin_dir=nofsr)
         self.assertEqual(self.core.bundle_missing(), [])

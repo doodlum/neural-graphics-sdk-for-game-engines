@@ -301,7 +301,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext*, 
         return NVSDK_NGX_Result_FAIL_NotInitialized;
 
     Registry().CollectGarbage();
-    auto upscaler = CreateUpscaler(g_vk, NgxRemapInterop(NgxCreateInfo(*NgxParams::From(params))));
+    auto upscaler = CreateUpscaler(g_vk, NgxRemapD3D11(NgxCreateInfo(*NgxParams::From(params))));
     if (!upscaler)
         return NVSDK_NGX_Result_FAIL_PlatformError;
     *outHandle = NgxNewHandle(Registry().Add(std::move(upscaler)));
@@ -325,7 +325,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext*
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     Upscaler* upscaler = Registry().Get(handle->Id);
     if (upscaler)
-        upscaler = NgxApplyLiveSettings(handle->Id, upscaler, {}, NgxRemapInterop);
+        upscaler = NgxApplyLiveSettings(handle->Id, upscaler, {}, NgxRemapD3D11);
     if (!upscaler || !g_interop || !g_submitter)
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
 

@@ -22,6 +22,10 @@ LAYER_DIR="${LAYER_DIR:-$REPO/build_layer}"
 XESS_SDK="${XESS_SDK:-$REPO/../third_party/xess/sdk}"  # Intel XeSS SDK: libxess.dll + LICENSE.txt, shipped unmodified
 # AMD FSR 4: amdxcffx64.dll from AMD's D3D12 driver (Adrenalin), shipped unmodified; optional, kept outside the repo
 FSR4_DX12_DLL="${FSR4_DX12_DLL:-$REPO/../third_party/amd/amdxcffx64.dll}"
+# AMD FSR SDK 2.4 Vulkan upscaler (amd_fidelityfx_upscaler_vk.dll, FSR 4.1.2) and its licence, shipped unmodified; and
+# replacement FSR 4 Lite shader modules (fsr4_shaders.bin). All optional, kept outside the repo.
+FSR4_VK_DIR="${FSR4_VK_DIR:-$REPO/../third_party/amd/sdk240}"
+FSR4_SHADERS="${FSR4_SHADERS:-$REPO/../third_party/amd/fsr4_shaders.bin}"
 DISTROBOX="${DISTROBOX:-aissbuild}"
 NAME="aiss-dlss-nss"
 
@@ -45,6 +49,17 @@ else
     rm -f "$HERE/bin/amdxcffx64.dll"
     echo "warning: $FSR4_DX12_DLL not found - building without FSR 4 (the plugin hides its upscaler option)" >&2
 fi
+for pair in "$FSR4_VK_DIR/amd_fidelityfx_upscaler_vk.dll:amd_fidelityfx_upscaler_vk.dll" \
+            "$FSR4_VK_DIR/license.md:amd_fidelityfx-LICENSE.md" "$FSR4_SHADERS:fsr4_shaders.bin"; do
+    src="${pair%%:*}"; dst="${pair##*:}"
+    if [ -f "$src" ]; then
+        install -m 0644 "$src" "$HERE/bin/$dst"
+        FSR4_SUM="$FSR4_SUM $dst"
+    else
+        rm -f "$HERE/bin/$dst"
+        echo "note: $src not found - building without $dst" >&2
+    fi
+done
 echo "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$REPO" diff --quiet 2>/dev/null || echo -dirty) built $(date -u +%Y-%m-%dT%H:%MZ)" > "$HERE/bin/VERSION"
 (cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_aiss_ngx.so VkLayer_aiss_ngx.json libxess.dll \
     libxess-LICENSE.txt $FSR4_SUM > SHA256SUMS)

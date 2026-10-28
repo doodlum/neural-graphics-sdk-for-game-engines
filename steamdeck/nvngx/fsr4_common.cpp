@@ -85,7 +85,7 @@ bool WrappedDeviceCheck(void* self, const void* backend)
     int none = -1;
     if (answer && backend)
         g_acceptedModel.compare_exchange_strong(none, w->model);
-    Log(2, "FSR 4 (%s): device check %s: AMD %d, answered %d", w->driver->name, Fsr4ModelName(w->model), native, answer);
+    LOGI("FSR 4 (%s): device check %s: AMD %d, answered %d", w->driver->name, Fsr4ModelName(w->model), native, answer);
     return answer;
 }
 
@@ -538,3 +538,54 @@ int Fsr4ModelFromName(const char* name)
     return -1;
 }
 
+void* Fsr4RedirectImport(HMODULE module, const char* dll, const char* function, void* replacement)
+{
+    return RedirectImport(module, dll, function, replacement);
+}
+
+int Fsr4PrepareModule(HMODULE lib, const Fsr4Gpu& gpu, Fsr4Driver& out)
+{
+    // Same treatment as a driver DLL (Fsr4LoadDriver) for a module that is not one: AMD's FidelityFX SDK DLL carries
+    // the same FSR 4 networks. Its GPU query (if it makes one) gets `gpu`; each network's device check is wrapped.
+    g_gpu      = gpu;
+    out.module = lib;
+    Redirects redir;
+    redir.module              = lib;
+    redir.sdkInfix            = L"_vk";
+    redir.realGetModuleHandleW = reinterpret_cast<decltype(redir.realGetModuleHandleW)>(
+        RedirectImport(lib, "KERNEL32.dll", "GetModuleHandleW", reinterpret_cast<void*>(&SdkModuleLookup)));
+    redir.realGetProcAddress = reinterpret_cast<decltype(redir.realGetProcAddress)>(
+        RedirectImport(lib, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void*>(&KmtProcLookup)));
+    if (redir.realGetModuleHandleW || redir.realGetProcAddress)
+        g_redirects.push_back(redir);
+    for (const ModelRtti& m : kModelRtti)
+    {
+        void** vtable = FindVtable(lib, m.rttiName);
+        if (!vtable)
+            continue;
+        auto original = reinterpret_cast<PFN_DeviceCheck>(vtable[kDeviceCheckSlot]);
+        if (!WritePointer(&vtable[kDeviceCheckSlot], reinterpret_cast<void*>(&WrappedDeviceCheck)))
+            continue;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_wrapped.push_back({vtable, &out, m.model, original});
+        }
+        out.modelsFound |= 1 << m.model;
+    }
+    Fsr4EnableWatermark();
+    return out.modelsFound;
+}
+
+void Fsr4BeginCreate(int wantedModel)
+{
+    g_wantedModel   = wantedModel;
+    g_acceptedModel = -1;
+    g_nativeMask    = 0;
+}
+
+int Fsr4EndCreate(int* nativeMask)
+{
+    if (nativeMask)
+        *nativeMask = g_nativeMask.load();
+    return g_acceptedModel.load();
+}

@@ -16,6 +16,7 @@
 //   --color16     replay B10G11R11 colour as RGBA16F (the same values)
 //   --loops L     play the replayed frames L times (reset only on the first)
 //   --anysize     accept any MaxPerf render size (e.g. with AISS_RATIO=1.5), not only 640x400
+//   --flags N     DLSS create flags (default 11: HDR, low-res MVs, inverted depth; 64 = auto exposure)
 //   --sync        wait for the GPU after every replayed frame
 // SPDX-License-Identifier: MIT
 #include <d3d11.h>
@@ -55,6 +56,9 @@ NGX_FN(NVSDK_NGX_D3D11_EvaluateFeature, ID3D11DeviceContext*, const Handle*, Par
 NGX_FN(NVSDK_NGX_D3D11_ReleaseFeature, Handle*)
 NGX_FN(NVSDK_NGX_D3D11_DestroyParameters, Params*)
 NGX_FN(NVSDK_NGX_D3D11_Shutdown1, ID3D11Device*)
+
+// DLSS create flags (--flags): HDR, low-res motion vectors, inverted depth by default.
+static int g_createFlags = (1 << 0) | (1 << 1) | (1 << 3);
 
 static uint16_t FloatToHalf(float f)
 {
@@ -213,6 +217,7 @@ int main(int argc, char** argv)
         else if (a == "--loops" && i + 1 < argc) loops = atoi(argv[++i]);
         else if (a == "--sync") sync = true;
         else if (a == "--anysize") anySize = true;
+        else if (a == "--flags" && i + 1 < argc) g_createFlags = atoi(argv[++i]);
         else { printf("FAIL: unknown option %s\n", argv[i]); return 1; }
     }
     HMODULE ngx = LoadLibraryA(dll);
@@ -299,7 +304,7 @@ int main(int argc, char** argv)
         p->Set("OutWidth", outW);
         p->Set("OutHeight", outH);
         p->Set("PerfQualityValue", 0);
-        p->Set("DLSS.Feature.Create.Flags", (1 << 0) | (1 << 1) | (1 << 3));  // HDR, low-res MVs, inverted depth
+        p->Set("DLSS.Feature.Create.Flags", g_createFlags);
         Handle* feature = nullptr;
         if (NVSDK_NGX_D3D11_CreateFeature(ctx, 1, p, &feature) != kSuccess) { printf("FAIL: CreateFeature\n"); return 1; }
         D3D11_TEXTURE2D_DESC od = {outW, outH, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT,
@@ -431,7 +436,7 @@ int main(int argc, char** argv)
     p->Set("OutWidth", outW);
     p->Set("OutHeight", outH);
     p->Set("PerfQualityValue", 0);
-    p->Set("DLSS.Feature.Create.Flags", (1 << 0) | (1 << 1) | (1 << 3));  // HDR, low-res MVs, inverted depth
+    p->Set("DLSS.Feature.Create.Flags", g_createFlags);
     Handle* feature = nullptr;
     if (NVSDK_NGX_D3D11_CreateFeature(ctx, 1, p, &feature) != kSuccess) { printf("FAIL: CreateFeature\n"); return 1; }
 

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -162,6 +163,126 @@ struct Dx12Timer
 };
 std::mutex g_timerMutex;
 Dx12Timer  g_timer;
+
+// AISS_FSR4_DX12_PROFILE=N: GPU time of each Dispatch AMD's DLL records, averaged over N evaluations (diagnostics).
+// The game's command list vtable entry for Dispatch is swapped only while the DLL records.
+struct DxPassProfiler
+{
+    static constexpr uint32_t kMax = 48, kRing = 6;
+    ID3D12QueryHeap*          heap = nullptr;
+    ID3D12Resource*           readback = nullptr;
+    double                    nsPerTick = 1.0;
+    uint64_t                  eval = 0;
+    uint32_t                  used[kRing] = {};
+    std::vector<std::string>  names[kRing];
+    std::vector<std::pair<std::string, double>> sums;
+    uint32_t                  summed = 0;
+    ID3D12GraphicsCommandList* cmd = nullptr;
+    void (STDMETHODCALLTYPE* realDispatch)(ID3D12GraphicsCommandList*, UINT, UINT, UINT) = nullptr;
+};
+DxPassProfiler g_dxProf;
+
+void STDMETHODCALLTYPE ProfDxDispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z)
+{
+    DxPassProfiler& p    = g_dxProf;
+    const uint32_t  ring = uint32_t(p.eval % DxPassProfiler::kRing);
+    uint32_t        q    = UINT32_MAX;
+    if (p.heap && p.used[ring] < DxPassProfiler::kMax)
+    {
+        q = (ring * DxPassProfiler::kMax + p.used[ring]) * 2;
+        p.names[ring].push_back("dispatch " + std::to_string(p.used[ring]) + " " + std::to_string(x) + "x" +
+                                std::to_string(y) + "x" + std::to_string(z));
+        ++p.used[ring];
+        cl->EndQuery(p.heap, D3D12_QUERY_TYPE_TIMESTAMP, q);
+    }
+    p.realDispatch(cl, x, y, z);
+    if (q != UINT32_MAX)
+    {
+        cl->EndQuery(p.heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
+        cl->ResolveQueryData(p.heap, D3D12_QUERY_TYPE_TIMESTAMP, q, 2, p.readback, q * sizeof(uint64_t));
+    }
+}
+
+void ProfDxBegin(ID3D12Device* device, ID3D12GraphicsCommandList* cmd)
+{
+    static const int every = getenv("AISS_FSR4_DX12_PROFILE") ? atoi(getenv("AISS_FSR4_DX12_PROFILE")) : 0;
+    if (every <= 0)
+        return;
+    DxPassProfiler& p = g_dxProf;
+    if (!p.heap)
+    {
+        Dx12Timer t;
+        if (!t.Setup(device))
+            return;
+        p.nsPerTick = t.nsPerTick;
+        t.heap->Release();
+        t.readback->Release();
+        D3D12_QUERY_HEAP_DESC hd = {};
+        hd.Type                  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        hd.Count                 = DxPassProfiler::kMax * 2 * DxPassProfiler::kRing;
+        device->CreateQueryHeap(&hd, __uuidof(ID3D12QueryHeap), reinterpret_cast<void**>(&p.heap));
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type                  = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd   = {};
+        rd.Dimension             = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width                 = sizeof(uint64_t) * hd.Count;
+        rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.SampleDesc.Count             = 1;
+        rd.Layout                       = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                        __uuidof(ID3D12Resource), reinterpret_cast<void**>(&p.readback));
+    }
+    ++p.eval;
+    const uint32_t ring = uint32_t(p.eval % DxPassProfiler::kRing);
+    if (p.used[ring])
+    {
+        void* ptr = nullptr;
+        if (SUCCEEDED(p.readback->Map(0, nullptr, &ptr)) && ptr)
+        {
+            const uint64_t* t = static_cast<const uint64_t*>(ptr) + ring * DxPassProfiler::kMax * 2;
+            if (p.sums.size() != p.used[ring])
+                p.sums.assign(p.used[ring], {"", 0.0}), p.summed = 0;
+            for (uint32_t i = 0; i < p.used[ring]; ++i)
+                p.sums[i] = {p.names[ring][i], p.sums[i].second + double(t[i * 2 + 1] - t[i * 2]) * p.nsPerTick / 1000.0};
+            p.readback->Unmap(0, nullptr);
+            if (++p.summed >= uint32_t(every))
+            {
+                double total = 0;
+                for (auto& sp : p.sums)
+                    total += sp.second;
+                LOGI("FSR 4 DX12 profile: %zu dispatches, %.1f us per evaluate", p.sums.size(), total / p.summed);
+                for (auto& sp : p.sums)
+                    LOGI("  %8.1f us  %s", sp.second / p.summed, sp.first.c_str());
+                p.sums.clear();
+                p.summed = 0;
+            }
+        }
+    }
+    p.used[ring] = 0;
+    p.names[ring].clear();
+    // Swap the command list's Dispatch (vtable slot 14 of ID3D12GraphicsCommandList) for the recording.
+    void** vtbl = *reinterpret_cast<void***>(cmd);
+    if (!p.realDispatch)
+        p.realDispatch = reinterpret_cast<decltype(p.realDispatch)>(vtbl[14]);
+    DWORD old = 0;
+    VirtualProtect(&vtbl[14], sizeof(void*), PAGE_READWRITE, &old);
+    vtbl[14] = reinterpret_cast<void*>(&ProfDxDispatch);
+    VirtualProtect(&vtbl[14], sizeof(void*), old, &old);
+    p.cmd = cmd;
+}
+
+void ProfDxEnd()
+{
+    DxPassProfiler& p = g_dxProf;
+    if (!p.cmd)
+        return;
+    void** vtbl = *reinterpret_cast<void***>(p.cmd);
+    DWORD  old  = 0;
+    VirtualProtect(&vtbl[14], sizeof(void*), PAGE_READWRITE, &old);
+    vtbl[14] = reinterpret_cast<void*>(p.realDispatch);
+    VirtualProtect(&vtbl[14], sizeof(void*), old, &old);
+    p.cmd = nullptr;
+}
 }  // namespace
 
 Fsr4Dx12* Fsr4Dx12::Create(ID3D12Device* device, uint32_t maxRenderW, uint32_t maxRenderH, uint32_t displayW,
@@ -296,7 +417,9 @@ bool Fsr4Dx12::Dispatch(ID3D12GraphicsCommandList* cmd, const Fsr4Dx12Dispatch& 
         }
     }
 
+    ProfDxBegin(m_device, cmd);
     const uint32_t rc = g_drv.provider.dispatch(&m_ctx, &up.header);
+    ProfDxEnd();
     ++m_dispatchCount;
 
     if (timerSlot != UINT32_MAX)

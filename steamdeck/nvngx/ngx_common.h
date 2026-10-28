@@ -38,7 +38,9 @@ int SelectedBackend(int* fsr4Model);
 
 // Vulkan and D3D11 front ends: FSR 4 runs through the D3D12 interop path (NSS once that has failed).
 UpscalerCreateInfo NgxRemapInterop(const UpscalerCreateInfo& info);  // D3D11: FSR 4 through D3D12 interop (else NSS)
-UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& info);   // Vulkan: same, with the AISS layer split
+UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& info);   // Vulkan: FSR 4 native (fsr4_vk), else interop + layer split
+UpscalerCreateInfo NgxRemapD3D11(const UpscalerCreateInfo& info);    // D3D11: FSR 4 native on DXVK's device, else interop
+UpscalerCreateInfo NgxRemapD3D11(const UpscalerCreateInfo& in);
 
 // "NSS quality 2", "XeSS", "FSR 4 Lite", ...
 const char* UpscalerName(const UpscalerCreateInfo& info);

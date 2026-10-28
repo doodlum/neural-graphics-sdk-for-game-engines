@@ -337,6 +337,15 @@ bool XessUnavailable()
 
 std::unique_ptr<Upscaler> CreateUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info)
 {
+    if (info.backend == kBackendFsr4Vk)
+    {
+        if (auto native = CreateFsr4VkUpscaler(device, info))
+            return native;
+        // The interop way instead (layerSplit, set by the Vulkan front end's remap, keeps the AISS layer's split).
+        UpscalerCreateInfo interop = info;
+        interop.backend            = kBackendFsr4Interop;
+        return CreateUpscaler(device, interop);
+    }
     if (info.backend == kBackendFsr4Interop || info.backend == kBackendFsr4)
     {
         if (auto interop = CreateFsr4InteropUpscaler(device, info))

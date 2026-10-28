@@ -76,13 +76,17 @@ private:
     std::unique_ptr<Fsr4Dx12> m_fsr4;
 };
 
-// D3D12 games run FSR 4 natively on their own device (amdxcffx64); once that has failed, NSS.
+// D3D12 games run FSR 4 through AMD's FSR SDK Vulkan DLL on vkd3d-proton's own VkDevice, recorded into the game's
+// command list like NSS (fsr4_vk.cpp: the faster path, and the one with the proxy's shader fixes). Without it, natively
+// on the game's D3D12 device (amdxcffx64); once that has failed too, NSS.
 UpscalerCreateInfo RemapD3D12(const UpscalerCreateInfo& in)
 {
     UpscalerCreateInfo info = in;
     if (info.backend == kBackendFsr4)
     {
-        if (Fsr4Dx12Unavailable(info.fsr4Model))
+        if (!Fsr4VkUnavailable())
+            info.backend = kBackendFsr4Vk;
+        else if (Fsr4Dx12Unavailable(info.fsr4Model))
         {
             info.backend   = kBackendNss;
             info.fsr4Model = kFsr4Auto;
@@ -93,20 +97,26 @@ UpscalerCreateInfo RemapD3D12(const UpscalerCreateInfo& in)
     return info;
 }
 
-// The upscaler for a D3D12 create: the native FSR 4 path when asked and available, else the Vulkan-device path. The
-// display size may only be known from the output resource at evaluate time, so pass a fallback here.
-std::unique_ptr<Upscaler> CreateD3D12Upscaler(const UpscalerCreateInfo& info, uint32_t outW, uint32_t outH)
+// The upscaler for a D3D12 create: FSR 4 on the Vulkan device or natively when asked and available, else the
+// Vulkan-device path. The display size may only be known from the output resource at evaluate time, so pass a fallback.
+std::unique_ptr<Upscaler> CreateD3D12Upscaler(const UpscalerCreateInfo& in, uint32_t outW, uint32_t outH)
 {
+    UpscalerCreateInfo info = in;
+    if (info.backend == kBackendFsr4Vk)
+    {
+        if (auto vk = CreateFsr4VkUpscaler(g_vk, info))
+            return vk;
+        info.backend = Fsr4Dx12Unavailable(info.fsr4Model) ? kBackendNss : kBackendFsr4Dx12;
+    }
     if (info.backend == kBackendFsr4Dx12 && g_device)
     {
         if (auto c = Dx12Carrier::Create(g_vk, info, g_device, outW, outH))
             return c;
         LOGI("FSR 4 DX12 (%s) unavailable; falling back to NSS", Fsr4ModelName(info.fsr4Model));
-        UpscalerCreateInfo nss = info;
-        nss.backend            = kBackendNss;
-        nss.fsr4Model          = kFsr4Auto;
-        return CreateUpscaler(g_vk, nss);
+        info.backend = kBackendNss;
     }
+    if (info.backend == kBackendNss)
+        info.fsr4Model = kFsr4Auto;
     return CreateUpscaler(g_vk, info);
 }
 

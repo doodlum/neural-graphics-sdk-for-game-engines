@@ -35,8 +35,10 @@ constexpr double kDefaultG     = 60.0;    // ms per extra render megapixel befor
 // measured at render ratios 3, 2.5, 2 and 1.5 (Streamline sample, AISS_RATIO, mean of 2x 120 evaluations; sweep in
 // steamdeck/README.md) and interpolated linearly in render pixels between them. NSS takes its exact-2x path (static
 // LUT) only at exactly 2x, so for NSS the 2x column is used at exactly 2x and the other ratios interpolate around it.
-// The FSR 4 interop rows add 2.8 ms to the upscale's own GPU time: the frame-rate drop measured against NSS at the same
-// render size is that much larger, the GPU idling while the Vulkan and D3D12 queues wait on each other.
+// FSR 4 Lite in [0] is the SDK Vulkan DLL with the replacement shaders (about 10% under AMD's D3D12 DLL, which the
+// other [0] FSR 4 rows measured), used on every API when that DLL works. The FSR 4 interop rows add 2.8 ms to the
+// upscale's own GPU time: the frame-rate drop measured against NSS at the same render size is that much larger, the GPU
+// idling while the Vulkan and D3D12 queues wait on each other.
 struct UpscaleCost
 {
     double ms[4];  // at ratio 3, 2.5, 2, 1.5
@@ -65,7 +67,7 @@ const UpscaleCost kCost[2][kCostRows] = {
         /* NSS Balanced    */ {{1.285, 1.184, 1.217, 2.411}, true},
         /* NSS Performance */ {{1.155, 1.048, 1.089, 2.282}, true},
         /* XeSS            */ {{3.098, 3.128, 3.192, 3.355}, false},
-        /* FSR 4 Lite      */ {{3.051, 3.053, 3.064, 3.099}, false},
+        /* FSR 4 Lite      */ {{2.746, 2.748, 2.758, 2.789}, false},
         /* FSR 4 INT8      */ {{5.035, 5.006, 5.019, 5.050}, false},
         /* FSR 4 INT8 RDNA2*/ {{4.954, 4.964, 4.976, 5.021}, false},
     },
@@ -93,9 +95,12 @@ CostKey KeyFor(int backend, int fsr4Model, int nssQuality, CostApi api)
     const int group = api == CostApi::D3D12 ? 0 : 1;
     if (backend == kBackendXess)
         return {group, kXess};
-    if (backend == kBackendFsr4 || backend == kBackendFsr4Dx12 || backend == kBackendFsr4Interop)
+    if (backend == kBackendFsr4 || backend == kBackendFsr4Dx12 || backend == kBackendFsr4Interop || backend == kBackendFsr4Vk)
     {
-        const bool interop = backend == kBackendFsr4Interop || (backend == kBackendFsr4 && api != CostApi::D3D12);
+        // Every API runs FSR 4 through AMD's SDK Vulkan DLL when it works (fsr4_vk.cpp; about the cost of native D3D12),
+        // else D3D12 natively and D3D11 / Vulkan through the interop.
+        const bool interop = backend == kBackendFsr4Interop ||
+                             (backend == kBackendFsr4 && api != CostApi::D3D12 && Fsr4VkUnavailable());
         const int  m       = fsr4Model == kFsr4Int8 ? 1 : fsr4Model == kFsr4Rdna2 ? 2 : 0;  // Auto is Lite on the Deck
         return {interop ? 1 : 0, kRowFsr4Lite + m};
     }
@@ -442,7 +447,8 @@ float EqualCostRatio(int perfQuality, float standardRatio, unsigned outW, unsign
     const int backend = SelectedBackend(&model);
     const int nssQ    = backend == kBackendNss ? NssQualityForDlss(perfQuality) : 0;
     const CostApi api = static_cast<CostApi>(g_api.load());
-    const bool interopDown = backend == kBackendFsr4 && api != CostApi::D3D12 && Fsr4InteropUnavailable(model);
+    const bool interopDown = backend == kBackendFsr4 && api != CostApi::D3D12 && Fsr4VkUnavailable() &&
+                             Fsr4InteropUnavailable(model);
     if (interopDown)
         return standardRatio;  // runs NSS Quality
     const CostKey key = KeyFor(backend, model, nssQ, api);

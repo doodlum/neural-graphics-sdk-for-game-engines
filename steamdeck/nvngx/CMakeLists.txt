@@ -47,6 +47,7 @@ add_library(nvngx SHARED
     fsr4_common.cpp
     fsr4_dx12.cpp
     fsr4_interop.cpp
+    fsr4_vk.cpp
     frame_dump.cpp
     gpu_timing.cpp
     cost_model.cpp
