@@ -50,11 +50,14 @@ NVSDK_NGX_Result InitDevice(VkInstance instance, VkPhysicalDevice pd, VkDevice d
     return NVSDK_NGX_Result_Success;
 }
 
-// Extensions the NSS ML kernels can use. Only those the device has are requested.
+// Extensions the upscalers can use. Only those the device has are requested.
 const char* const kNssDeviceExtensions[] = {
     VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
     VK_KHR_8BIT_STORAGE_EXTENSION_NAME,               VK_KHR_16BIT_STORAGE_EXTENSION_NAME,
     VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,      VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME,
+    // FSR 4 through D3D12 interop (fsr4_interop.cpp): shared D3D12 textures and fence on the game's device.
+    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,      VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+    VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
 };
 
 // NGX returns extension lists either by pointing the caller at its own array or by filling the caller's array.

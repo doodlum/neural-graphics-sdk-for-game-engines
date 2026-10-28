@@ -44,6 +44,7 @@ struct UpscalerCreateInfo
     int      backend       = 0;      // UpscalerBackend
     int      fsr4Model     = 0;      // Fsr4Model, for kBackendFsr4: the one asked for
     int      fsr4Active    = -1;     // the FSR 4 network that runs (set by the upscaler)
+    bool     layerSplit    = false;  // FSR 4 interop on a Vulkan game: the AISS layer splits the game's command buffer
 };
 
 enum UpscalerBackend : int
@@ -55,9 +56,10 @@ enum UpscalerBackend : int
     kBackendFsr4Interop = 4,  // AMD FSR 4 via amdxcffx64.dll on an in-process D3D12 device (Vulkan / D3D11 games)
 };
 
-// Lets an upscaler split its work over several submissions on the front end's queue (only the D3D11 front end, which
-// submits its own command buffers): Begin() starts a command buffer, Submit() submits it, optionally waiting for and/or
-// signalling a timeline semaphore value.
+// Lets an upscaler split its work over several submissions on the front end's queue: Begin() starts a command buffer,
+// Submit() submits it, optionally waiting for and/or signalling a timeline semaphore value. The D3D11 front end submits
+// its own command buffers; for Vulkan games the interop upscaler implements it with the AISS layer's command buffer
+// split (one game command buffer, cut where Submit() is called).
 struct SplitSubmitter
 {
     virtual VkCommandBuffer Begin() = 0;

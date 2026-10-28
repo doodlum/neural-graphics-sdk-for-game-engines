@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(aiss_layer C)
 
 set(NGSDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH "Neural graphics SDK checkout")
+# aiss_cmd_trampolines.inc is generated and committed: python3 gen_cmd_trampolines.py <vulkan_core.h> aiss_cmd_trampolines.inc
 add_library(VkLayer_aiss_ngx SHARED aiss_layer.c)
 target_include_directories(VkLayer_aiss_ngx PRIVATE "${NGSDK_ROOT}/sdk/include/vulkan-headers")
 target_compile_options(VkLayer_aiss_ngx PRIVATE -O2 -Wall -Wno-unused-parameter -fvisibility=hidden)

@@ -186,18 +186,10 @@ UpscalerCreateInfo NgxRemapInterop(const UpscalerCreateInfo& in)
 
 UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& in)
 {
-    // FSR 4 runs only through amdxcffx64 (D3D12); Vulkan games cannot hand it frames (see fsr4_interop.cpp): NSS.
-    UpscalerCreateInfo info = in;
-    if (info.backend == kBackendFsr4)
-    {
-        static bool logged = false;
-        if (!logged)
-            LOGI("FSR 4 is not available for Vulkan games (NGX gives the proxy only the game's command buffer, and "
-                 "handing a frame to the D3D12 FSR 4 inside it stalls; see fsr4_interop.cpp); using NSS");
-        logged         = true;
-        info.backend   = kBackendNss;
-        info.fsr4Model = kFsr4Auto;
-    }
+    // Vulkan games run FSR 4 through the D3D12 interop path too, with the AISS layer splitting the game's command
+    // buffer at the evaluate (see fsr4_interop.cpp); once that has failed, NSS.
+    UpscalerCreateInfo info = NgxRemapInterop(in);
+    info.layerSplit         = info.backend == kBackendFsr4Interop;
     return info;
 }
 

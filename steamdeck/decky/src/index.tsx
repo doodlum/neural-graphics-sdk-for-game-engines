@@ -306,7 +306,7 @@ function Content() {
             description={
               "Switches live in-game. NSS Quality: best NSS network. NSS Balanced / Performance: smaller networks, faster, more ghosting. XeSS: Intel XeSS (dynamic resolution)." +
               (state.bundle.fsr4
-                ? " FSR 4: AMD's networks through its D3D12 DLL (D3D12 and D3D11 games; Vulkan games use NSS)."
+                ? " FSR 4: AMD's networks through its D3D12 DLL (D3D12, D3D11 and Vulkan games)."
                 : "")
             }
             rgOptions={state.bundle.fsr4 ? [...UPSCALER_OPTIONS, FSR4_UPSCALER_OPTION] : UPSCALER_OPTIONS}

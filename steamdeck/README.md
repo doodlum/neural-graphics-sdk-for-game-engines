@@ -35,7 +35,7 @@ are written from scratch.
 | --- | --- | --- |
 | `nvngx.dll` | `steamdeck/nvngx` | Replacement NGX core. Implements the NGX D3D12, Vulkan and D3D11 entry points and runs NSS for the SuperSampling feature. Installed as `C:\windows\system32\_nvngx.dll` in the game's prefix, where NGX looks for the driver's core. |
 | Loader shim | `steamdeck/loader` | `dbghelp.dll` (Streamline games) or `dxgi.dll` (others), placed next to the game. Forwards to the system DLL and redirects NGX's signature check of the core to an NVIDIA-signed DLL the game ships (its `nvngx_dlss.dll`), so the unsigned core is accepted. Only import tables are patched; `LoadLibrary` still loads the proxy. |
-| Vulkan layer | `steamdeck/layer` | Native Linux implicit layer `VK_LAYER_AISS_ngx`, active only with `AISS_LAYER=1`. Emulates `VK_NVX_binary_import`, `VK_NVX_image_view_handle` and `VK_NV_low_latency(2)`, which Vulkan DLSS/Reflex integrations require, and enables the int8 / dot-product / subgroup-size features the ML kernels need on every device (DXVK's and vkd3d-proton's included). |
+| Vulkan layer | `steamdeck/layer` | Native Linux implicit layer `VK_LAYER_AISS_ngx`, active only with `AISS_LAYER=1`. Emulates `VK_NVX_binary_import`, `VK_NVX_image_view_handle` and `VK_NV_low_latency(2)`, which Vulkan DLSS/Reflex integrations require, and enables the int8 / dot-product / subgroup-size features the ML kernels need on every device (DXVK's and vkd3d-proton's included). Splits a Vulkan game's command buffer at the evaluate for FSR 4 (D3D12 interop). |
 | Decky plugin | `steamdeck/decky` | Finds installed games that ship DLSS and sets them up (files, prefix, launch options) per game. |
 
 Each API runs NSS on the game's own Vulkan device, with no copies:
@@ -135,7 +135,8 @@ The proxy can also run AMD FSR 4.1.2 through `amdxcffx64.dll`, the FSR 4 compone
 - **D3D12 games**: natively on the game's own `ID3D12Device` and command list (`fsr4_dx12.cpp`), no copies.
 - **D3D11 games** (DXVK): through **D3D12 interop** (`fsr4_interop.cpp`): an in-process vkd3d-proton D3D12 device that
   shares textures and a fence with the game's VkDevice (below).
-- **Vulkan games**: not available; they use NSS (see "No FSR 4 for Vulkan games").
+- **Vulkan games**: through the same D3D12 interop, with the Vulkan layer splitting the game's command buffer at the
+  evaluate (see "FSR 4 for Vulkan games"); needs `AISS_LAYER=1` (the plugin sets it).
 
 The plugin's "Upscaler" dropdown offers **FSR 4**, with an "FSR 4 model" choice of **Auto** (AMD's choice: Lite on a
 Steam Deck), **Lite**, **INT8** and **INT8 RDNA 2**. Control-file upscaler values: 4 Lite, 5 INT8, 6 INT8 RDNA 2, 8 Auto;
@@ -229,23 +230,63 @@ The normalised column divides by the clock ratio measured with NSS Quality on bo
 (copies + sync) is 0.9-1.5 ms per frame at harness clocks (~0.6-0.9 ms normalised); the D3D12 dispatch itself scales like
 the native one. For reference: NSS Quality 2.21 / 3.53 ms, XeSS 2.88 / 3.03 ms in the sample (D3D12, 2x / 1.5x).
 
-### No FSR 4 for Vulkan games
+### FSR 4 for Vulkan games
 
-NGX gives the proxy only the game's Vulkan command buffer, which the game submits later; a command buffer cannot signal a
-semaphore halfway, so a same-frame copy-in → D3D12 FSR 4 → copy-out needs a GPU-side wait inside the game's command
-buffer (`vkCmdWaitEvents` on a host-set `VkEvent`, with a CPU thread that submits the D3D12 work once a copy-in event is
-set). Both variants were built and measured, and the D3D12 work never runs while the game's gfx job waits:
+NGX gives the proxy only the game's Vulkan command buffer, which the game submits later, and a command buffer cannot
+signal a semaphore halfway. So the native layer (`VK_LAYER_AISS_ngx`) **cuts the game's command buffer in two at the
+evaluate**; the submissions then look exactly like the D3D11 path's, in the same frame:
 
-- sharing D3D12 textures between the devices: the game's job ran into amdgpu's 5 s gfx lockup timeout —
-  `amdgpu 0000:04:00.0: ring gfx_0.0.0 timeout ... Starting gfx_0.0.0 ring reset ... reset succeeded` in the kernel log,
-  once per attempt (three times; `lockup_timeout` = `5000,10000,10000,5000`);
-- staging through the same host pages imported separately on each device (`VK_EXT_external_memory_host` on the game's,
-  `ID3D12Device3::OpenExistingHeapFromAddress` on vkd3d-proton's, so the jobs share no kernel BO), with the wait
-  released after 750 ms to stay clear of the timeout: every frame reached the 750 ms release with the D3D12 work still
-  unfinished (no ring reset).
+```
+game cb:  [ game ... | proxy copy-in ] CUT [ proxy copy-out | game ... ]
+submit:   { game's waits, part 1, signal fence=N }  ->  D3D12 queue: wait N, FSR 4, signal N+1
+          { wait fence>=N+1, part 2, game's signals + fence }
+```
 
-Both were removed. A pipeline that shows the upscaled image a frame or more late would avoid the wait, but puts the
-scene behind the HUD, so it is not offered. Selecting FSR 4 in a Vulkan game logs this and uses NSS.
+- The proxy talks to the layer with ordinary Vulkan calls the layer recognises and swallows (winevulkan does not
+  forward private entry points; contract in `steamdeck/layer/aiss_split_abi.h`): a `vkWaitSemaphores` with a magic
+  timeout registers (the layer answers `VK_TIMEOUT`, so without the layer the game gets NSS); `vkCmdFillBuffer` on a
+  magic marker buffer marks the evaluate start and the cut.
+- After the cut the layer records the game's commands into a fresh command buffer of the same queue family: every
+  `vkCmd*` entry point goes through a generated trampoline (`aiss_cmd_trampolines.inc`, from `vulkan_core.h` by
+  `gen_cmd_trampolines.py`). At `vkQueueSubmit` / `vkQueueSubmit2` the game's batch is expanded into the parts; the
+  game's waits stay on the first, its signals and fence on the last.
+- Proton's winevulkan emulates D3D12 fences: each wait or signal of a D3D12-fence semaphore becomes a temporary host
+  semaphore that a winevulkan worker thread (`signaller_worker`) bridges to the shared fence. A semaphore operation the
+  layer adds on its own is never seen (the first attempt hung that way: `err:winevulkan:signaller_worker wait timed out
+  with non-empty poll list`). So right after the cut the proxy makes a "capture" `vkQueueSubmit2` (signal N, wait N+1)
+  that goes through winevulkan's conversion; the layer keeps the converted host semaphores for the cut and does not
+  submit it.
+- Engines that end render passes lazily (NVRHI: the Streamline sample) call evaluate with a render pass still open.
+  The layer ends it at the evaluate marker and drops the game's own end later, so the copies and the cut are outside
+  any render pass. A cut is refused (the fence is then signalled after the whole command buffer, a frame-late input but
+  never a hang) in secondary command buffers and ones allocated before the layer saw them. A command buffer submitted
+  twice without re-recording runs its parts without the fence operations; one reset before it was ever submitted
+  releases the D3D12 wait on the host.
+- Only native Vulkan games' devices get this (not DXVK / vkd3d-proton); `AISS_LAYER_SPLIT=0` turns it off (FSR 4 then
+  falls back to NSS with a log line). The layer also enables `timelineSemaphore`; the proxy requests
+  `VK_KHR_external_memory_win32`, `VK_KHR_external_semaphore_win32` and `VK_KHR_timeline_semaphore` through NGX's
+  device-extension query.
+
+Measured in the Streamline sample (Vulkan, ray tracing on, 1200 frames, `AISS_GPU_TIMING`), game-queue GPU time per
+upscale, with the D3D12 dispatch timed on the interop queue:
+
+| Ratio | Network | Total (game queue) | copy-in | wait for D3D12 | of which D3D12 dispatch | copy-out | FPS | NSS Quality (same run setup) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2x | Lite | 4.59 ms | 0.13 | 4.25 | 3.47 | 0.21 | 22.8 | 2.57 ms, 25.4 FPS |
+| 2x | INT8 | 6.59 ms | 0.13 | 6.25 | 5.51 | 0.21 | 21.8 | |
+| 2x | INT8 RDNA 2 | 6.58 ms | 0.13 | 6.24 | 5.50 | 0.21 | 22.0 | |
+| 1.5x | Lite | 4.63 ms | 0.23 | 4.19 | 3.44 | 0.21 | 17.8 | 3.78 ms, 18.5 FPS |
+| 1.5x | INT8 | 6.77 ms | 0.23 | 6.32 | 5.55 | 0.21 | 16.7 | |
+| 1.5x | INT8 RDNA 2 | 6.71 ms | 0.23 | 6.26 | 5.50 | 0.21 | 16.8 | |
+
+2x = 640x392 → 1280x785, 1.5x = 853x523 → 1280x785. Overhead against FSR 4 itself: copies ~0.35-0.45 ms and a sync gap
+of ~0.75 ms between the first part's end and the second part's start (winevulkan's worker thread relays both fence
+hops). The D3D12 dispatch on the interop compute queue is slower than native D3D12 FSR 4 on the game's own queue
+(Lite 3.47 ms vs 2.77 ms in the D3D12 sample). The watermark reads "FSR4L-i8 Upscale 4.1.2 DRS 2.00x Source: Driver".
+
+GPU-side waits inside one command buffer were tried first and do not work (removed): `vkCmdWaitEvents` on a host-set
+event with shared D3D12 textures ran into amdgpu's 5 s gfx lockup timeout (`ring gfx_0.0.0 timeout ... ring reset`,
+three times); host-memory staging with a 750 ms release never saw the D3D12 work finish while the game's job waited.
 
 ### Limitations
 
@@ -299,7 +340,7 @@ Use the Decky plugin for this. By hand:
 | `AISS_NSS_QUALITY=0/1/2` | NSS shader quality at launch: 0 = Quality network (default), 1 = Balanced, 2 = Performance |
 | `AISS_CONTROL=/path` | File holding "upscaler [fast maths] [capture]": 0/1/2 (NSS model), 3 (XeSS), 4/5/6 (FSR 4 Lite / INT8 / INT8 RDNA 2), 7 (FSR 4 FP8), 8 (FSR 4, AMD's choice); re-read twice a second; switches the upscaler while the game runs (set by the plugin) |
 | `AISS_UPSCALER=xess` | XeSS instead of NSS at launch (the control file overrides it) |
-| `AISS_UPSCALER=fsr4`, `AISS_FSR4_MODEL=auto/lite/int8/rdna2` | AMD FSR 4 (amdxcffx64.dll: native on D3D12, D3D12 interop on D3D11; Vulkan games use NSS) at launch, with that network (default auto: Lite on a Steam Deck); also `AISS_UPSCALER=fsr4-lite` etc. |
+| `AISS_UPSCALER=fsr4`, `AISS_FSR4_MODEL=auto/lite/int8/rdna2` | AMD FSR 4 (amdxcffx64.dll: native on D3D12, D3D12 interop on D3D11 and Vulkan) at launch, with that network (default auto: Lite on a Steam Deck); also `AISS_UPSCALER=fsr4-lite` etc. |
 | `AISS_FSR4_DIR=C:\path` | Folder amdxcffx64.dll is loaded from (default: the `aiss` subfolder next to `_nvngx.dll`) |
 | `AISS_FSR4_ALLOW_ANY_VERSION=1` | Accept an FSR 4 provider that is not 4.1.2 (diagnostics; normally such a provider is refused and the proxy uses NSS) |
 | `AISS_FSR4_WATERMARK=1` (or `FSR_WATERMARK=1`) | FSR 4: have AMD's DLL draw its banner (network name, version) on the output |
@@ -319,6 +360,8 @@ Use the Decky plugin for this. By hand:
 | `AISS_LAYER_LOG=1` | Vulkan layer: log instances, device extensions and NULL proc lookups to stderr |
 | `AISS_LAYER_FEATURES=0`, `AISS_LAYER_EMULATE=0` | Vulkan layer: don't force ML features / don't emulate the NVIDIA extensions (debugging) |
 | `AISS_LAYER_XESS=0` | Vulkan layer: don't enable the XeSS device features (debugging) |
+| `AISS_LAYER_SPLIT=0` | Vulkan layer: no command buffer split (FSR 4 on Vulkan games then falls back to NSS) |
+| `AISS_LAYER_RPLOG=1` | Vulkan layer: log render pass begin/end on split devices (debugging) |
 
 ## Tested
 
