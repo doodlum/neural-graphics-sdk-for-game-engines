@@ -1736,13 +1736,19 @@ static FfxErrorCode nssDispatch(FfxNssContext_Private* context, const FfxNssDisp
     }
     else
     {
-        // The exact-2x sparse (BALANCE/PERFORMANCE) compute shader handles a 2x2 output quad per thread.
-        const bool    quadPerThread = (context->pipelineFlags & NSS_SHADER_PERMUTATION_SCALE_PRESET_X2) != 0 &&
-                                   context->contextDescription.qualityMode != FFX_NSS_SHADER_QUALITY_MODE_QUALITY;
-        const uint32_t threadsX     = quadPerThread ? FFX_DIVIDE_ROUNDING_UP(params->upscaleSize.width, 2u) : params->upscaleSize.width;
-        const uint32_t threadsY     = quadPerThread ? FFX_DIVIDE_ROUNDING_UP(params->upscaleSize.height, 2u) : params->upscaleSize.height;
-        const int32_t  dispatchDstX = FFX_DIVIDE_ROUNDING_UP(threadsX, FFX_NSS_THREAD_GROUP_WIDTH);
-        const int32_t  dispatchDstY = FFX_DIVIDE_ROUNDING_UP(threadsY, FFX_NSS_THREAD_GROUP_HEIGHT);
+        // The exact-2x compute shaders handle a 2x2 output quad per thread: aligned quads for the sparse filter
+        // (BALANCE/PERFORMANCE); for the dense filter (QUALITY) the groups start at 2g - (LutOffset & 1), so one more per axis.
+        const bool     x2            = (context->pipelineFlags & NSS_SHADER_PERMUTATION_SCALE_PRESET_X2) != 0;
+        const bool     quadPerThread = x2 && context->contextDescription.qualityMode != FFX_NSS_SHADER_QUALITY_MODE_QUALITY;
+        const bool     denseGroups   = x2 && context->contextDescription.qualityMode == FFX_NSS_SHADER_QUALITY_MODE_QUALITY;
+        const uint32_t threadsX      = quadPerThread ? FFX_DIVIDE_ROUNDING_UP(params->upscaleSize.width, 2u)
+                                     : denseGroups   ? params->upscaleSize.width / 2u + 1u
+                                                     : params->upscaleSize.width;
+        const uint32_t threadsY      = quadPerThread ? FFX_DIVIDE_ROUNDING_UP(params->upscaleSize.height, 2u)
+                                     : denseGroups   ? params->upscaleSize.height / 2u + 1u
+                                                     : params->upscaleSize.height;
+        const int32_t  dispatchDstX  = FFX_DIVIDE_ROUNDING_UP(threadsX, FFX_NSS_THREAD_GROUP_WIDTH);
+        const int32_t  dispatchDstY  = FFX_DIVIDE_ROUNDING_UP(threadsY, FFX_NSS_THREAD_GROUP_HEIGHT);
         scheduleDispatch(context, params, &context->pipelineNssPostprocess, dispatchDstX, dispatchDstY, "Postprocess");
     }
 

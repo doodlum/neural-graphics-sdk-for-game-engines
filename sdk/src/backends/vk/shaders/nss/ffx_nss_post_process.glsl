@@ -42,6 +42,11 @@
 #if (SCALE_PRESET_MODE == 1) && (NSS_SHADER_QUALITY_MODE != 0)
 #define NSS_POSTPROCESS_QUAD 1
 #endif
+// Exact-2x dense filter (QUALITY): one thread per 2x2 group of pixels sharing their 3x3 taps (see PostprocessQuadDense2x;
+// ffx_nss.cpp dispatches W / 2 + 1 x H / 2 + 1 threads).
+#if (SCALE_PRESET_MODE == 1) && (NSS_SHADER_QUALITY_MODE == 0)
+#define NSS_POSTPROCESS_QUAD_DENSE2X 1
+#endif
 
 // Compute path: the dense dynamic-LUT filter (QUALITY, non-2x) shares per-column/row tap mapping through LDS.
 #define NSS_POSTPROCESS_AXIS_LDS 1
@@ -57,6 +62,8 @@ void main()
 {
 #if NSS_POSTPROCESS_QUAD
     PostprocessQuad(int32_t2(gl_GlobalInvocationID.xy));
+#elif NSS_POSTPROCESS_QUAD_DENSE2X
+    PostprocessQuadDense2x(int32_t2(gl_GlobalInvocationID.xy));
 #else
     Postprocess(int32_t2(gl_GlobalInvocationID.xy));
 #endif

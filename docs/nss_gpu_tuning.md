@@ -371,6 +371,77 @@ Floors at 640x400: the preprocess moves ~61 B per LR pixel (~15.6 MB per frame, 
 large layers run at ~75% of the int8 dot4 peak; the postprocess is down to ~466 VALU per pixel, most of it the
 moments/history/tonemap math that must stay as written.
 
+### Full network (QUALITY), Steam Deck, round 3
+
+Interleaved runs of the round-2 build (`steamdeck` 0d6fee6) and this round (us, 1500-frame medians, 3 alternating runs
+averaged, 1280x800 output):
+
+| Pass | 640x400 before | 640x400 after | 853x533 before | 853x533 after |
+| --- | --- | --- | --- | --- |
+| Depth scatter | 32 | 32 | 63 | 63 |
+| Preprocess | 246 | 247 | 445 | 441 |
+| ML graph (high) | 1459 | **1362** | 2548 | **2400** |
+| Dynamic offset LUT | - | - | 0.1 | 0.1 |
+| Postprocess | 675 | **570** | 904 | **828** |
+| Total | 2416 | **2220** (-8.1%) | 3971 | **3740** (-5.8%) |
+
+The graph changes also apply to BALANCED/PERFORMANCE (mid_low): BALANCED 742x464 graph 557 -> 518 us, PERFORMANCE
+640x400 graph 426 -> 412 us (their postprocess shaders are unchanged; those totals moved by +-1%). All bit exact:
+replay suite (quality 0/1/2) ALL IDENTICAL against a baseline saved from the unmodified build, 64-frame hashes identical
+at the 7 QUALITY ratios (HDR off and on) plus BALANCED/PERFORMANCE at 640x400, 853x533 and 1000x700, 24-frame hashes
+identical for odd and small exact-2x sizes (321x201 -> 642x402, 641x401 -> 1282x802, 400x250 -> 800x500, 640x360 ->
+1280x720) and 427x241 -> 640x360, and `ffx_ml_runtime_test` EXACT on every path at 960x544, 864x544, 640x400 and
+128x128.
+
+Per layer (ML_PROFILE, high, 400x640 input, us, best of 2): layer 0 104 -> 68, 4 47 -> 36, 5 91 -> 78, 9 80 -> 73,
+13 96 -> 83, the others within 1-4%; sum of layers 1309 -> 1205, whole graph 1359 -> 1261.
+
+What worked:
+
+| Change | Effect |
+| --- | --- |
+| Graph: the conv bias initialises the accumulators instead of being added per output in the epilogue (exact integer sums in any order; KSPLIT layers keep it in the epilogue so only one partial sum carries it). Besides one VALU per output, the per-output-word epilogue blocks merge into one basic block (scheduled together, `buffer_store_dwordx4`) on the 1-pixel layers. Round 2 measured a variant of this as slower; this one is not | batched high 640x400 1.396 -> 1.314 ms; in-frame graph 1446 -> 1358 (640x400), 2499 -> 2397 us (853x533); layer 0 104 -> 68 us |
+| Graph: nearest RESIZE with a power-of-two numerator (the 2x upsamples feeding layers 7, 10, 13) as `y >> log2(n)` and `y & (n - 1)` instead of the signed constant division (~20 VALU with a quarter-rate multiply per input column and row); a specialization constant, so it folds | layer 13 VALU 1066 -> 976; graph -15 us at 640x400 |
+| Graph: the TABLE in shared memory as 256 sign-extended words, one LDS read per lookup (the + 128 folds into the offset) instead of read + `bitfieldExtract` | layers 9 and 13 -2..-8 us |
+| Exact-2x postprocess (mode 0), one thread per 2x2 group of output pixels that share their 3x3 LR taps: a pixel's taps are `clamp(((px + off) >> 1) - 1 + {0,1,2})` per axis, so the pixels `2g - (off & 1) + {0,1}` (off = LutOffset) all use LR `{g-1, g, g+1}`, and the slot is the LUT tile (a compile-time pattern). Colours, their squares, LR/KPN coordinates and KPN pixel words are computed once per group, the KPN reads of a slot use constant word offsets; each pixel then accumulates the same values in the same order and runs the unchanged steps 3-6. Dispatch W/2+1 x H/2+1 threads (`ffx_nss.cpp`) | 466 -> 381 VALU/px, 670 -> 623 us |
+| ... the two KPN words each tap's 4 slots read loaded once per group (18 instead of 36 loads), XORed with 0x80808080 so a byte converts with one `v_cvt_f32_ubyteN`: `Dequantize(q) = (q + 127) * s = (u - 1) * s` and `fma(u, s, -s)` rounds the same exact product once (fp32 build only; the fp16 experiment keeps the old form) | 623 -> 614 us |
+| ... the four pixels without branches (only the stores guarded), so one pixel's history fetches overlap another's math | ~ -6 us |
+| ... only slot (1,1) has the centre tap; for the other three `centre_sample` is 0 and `mix(x, Tonemap4(0), alpha * 0 * reset)` is `x + (+0 * -x)` = `x + 0.0` for the finite `x` here, written as a `precise` add so the -0 -> +0 of the original is kept | 381 -> 334 VALU/px, 608 -> 568 us |
+| Dynamic-LUT postprocess (mode 2): ranks are listed in increasing order and offset (0,0) is rank 0, so only the first selected tap can be the centre; one select instead of a compare + 3 selects per tap | 682 -> 641 VALU, 882 -> 844 us |
+| ... the per-workgroup axis tables built by one lane per column/row (one wave) instead of one lane per (line, offset) spread over 3 waves; same per-axis arithmetic | 849 -> 834 us |
+
+What did not work (measured, reverted), and dead ends:
+
+- Cheaper exact requantisation. The output only depends on which of the 255 thresholds the accumulator passes, so any
+  monotone integer form can be proved exact by checking those thresholds. A 24-bit form `(clamp(acc - L) * M' + C) >> S`
+  (full-rate `v_mad_u32_u24` instead of the quarter-rate `v_mul_hi_i32`) needs `D * M' < 2^32` with D = 2^15..2^18
+  accumulator steps between saturation points; an exact (M', C, S) exists for only 69 of the 424 high-model channels
+  (pairwise-constraint search over all S). `v_mul_hi_u32_u24` only reaches scales below 2^-8, and most channels have
+  shift 35..38 (scale 2^-4.5..2^-7.5). A 48-bit product from two 24-bit halves costs as much as the current form.
+- Precomputed rounding constant and shift per channel (removes 4 SALU per output): neutral. Epilogue computed for every
+  output with only the store guarded: 1.31 -> 1.40 ms batched. One column guard per thread when OUT_W is a multiple of
+  PX (PX > 1 layers): neutral.
+- Summed weights for the nearest-2x-upsampled layers (7, 10, 13; a 3x3 tap window covers 2x2 source pixels): the sums of
+  2 or 4 int8 weights overflow int8 (max |sum| 104..414), so splitting them into int8 pieces needs 7.25-8.25 dot4 per
+  output word instead of 9, for a new parity-class kernel. Not built. Weight sparsity: 0-10 all-zero words per layer.
+- Thread target (`FFX_ML_DOT4_TARGET_THREADS`) 2048/8192/16384/32768 in-frame: 1428 -> 1460/1459/1625/1918 us (4096
+  stays).
+- Mode-0 group: squares recomputed per pixel (96 VGPRs, 10 waves instead of 128 VGPRs, 8 waves): 623 -> 638 us. Mode-2
+  axis tables split over two waves (x lines in wave 0, y lines in wave 1): 826 -> 840 us.
+- Colours of the mode-0 group stored as fp16 pairs with `v_fma_mix` use (to cut VGPRs): not done, it is only exact for
+  colour formats with at most fp16 precision, and the game's input can be 8-bit UNORM.
+
+Floors and ideas left:
+
+- Graph: the epilogue is still ~9 VALU per output (`v_mul_hi_i32` 4, add, shift, clamp, ~1.25 pack) against 27-108 dot4
+  per output, so it is 8-25% of a layer; the layers run at ~93% of their VALU bound (layer 1: 2304 dot4 + ~420 other
+  VALU per thread predicts 212 us, 222 measured). Only fewer instructions per output can help.
+- Exact-2x postprocess: 334 VALU/px predicts ~400 us; 570 measured, so it is no longer purely VALU bound (128 VGPRs, 8
+  waves, ~24 history/temporal fetches per group, of which the 5-tap Catmull history is per pixel by nature).
+- BALANCED/PERFORMANCE exact-2x (mode 1): the same centre fold applies per slot with a uniform branch on the slot's tile
+  (not done, outside QUALITY).
+- Preprocess and depth scatter unchanged (at the memory floor, see round 2).
+
 ### Non-exact experiment (QUALITY, Steam Deck): what dropping bit exactness buys
 
 Everything here is opt-in and off by default (the replay suite stays ALL IDENTICAL and `ffx_ml_runtime_test` EXACT

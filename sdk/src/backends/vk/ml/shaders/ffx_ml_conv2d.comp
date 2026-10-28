@@ -166,11 +166,23 @@ uint ZpWord()
 int NearestCoord(int v, int scaleN, int scaleD, int offset, int size)
 {
     // TOSA RESIZE (NEAREST_NEIGHBOR), integer form.
-    int y  = v * scaleD + offset;
-    int iy = y / scaleN;
-    if (iy * scaleN > y)
-        iy--;
-    int ry = y - iy * scaleN;
+    int y = v * scaleD + offset;
+    int iy, ry;
+    if ((scaleN & (scaleN - 1)) == 0)
+    {
+        // Power-of-two numerator (the NSS 2x upsamples; a specialization constant, so this folds): floor division and
+        // its non-negative remainder are an arithmetic shift and a mask. Same values as the general form below, without
+        // its signed constant division (~20 VALU with a quarter-rate multiply per coordinate on AMD).
+        iy = y >> findLSB(scaleN);
+        ry = y & (scaleN - 1);
+    }
+    else
+    {
+        iy = y / scaleN;
+        if (iy * scaleN > y)
+            iy--;
+        ry = y - iy * scaleN;
+    }
     int i0 = max(iy, 0);
     int i1 = min(iy + 1, size - 1);
     return (2 * ry >= scaleN) ? i1 : i0;
@@ -258,19 +270,20 @@ int OC_PARAM_STRIDE()
 }
 
 #if ML_DOT4_TILED
-// The 256-entry TABLE is copied to shared memory once per workgroup (one SSBO load per output value otherwise).
-shared int sTable[64];
+// The 256-entry TABLE is copied to shared memory once per workgroup (one SSBO load per output value otherwise), one
+// sign-extended entry per word, so a lookup is a single LDS read (the + 128 folds into its offset).
+shared int sTable[256];
 #endif
 
 int TableLookup(int v)
 {
     int index = v + 128;
 #if ML_DOT4_TILED
-    int word = sTable[index >> 2];
+    return sTable[index];
 #else
     int word  = params[3 * OC_PARAM_STRIDE() + (index >> 2)];
-#endif
     return bitfieldExtract(word, (index & 3) * 8, 8);
+#endif
 }
 
 int Epilogue(int acc, int oc)
@@ -539,14 +552,17 @@ void main()
 
     if ((FLAGS & FLAG_TABLE) != 0)
     {
-        for (uint i = gl_LocalInvocationIndex; i < 64u; i += WG_SIZE * WG_Y * uint(KSPLIT))
-            sTable[i] = params[3 * OC_PARAM_STRIDE() + int(i)];
+        for (uint i = gl_LocalInvocationIndex; i < 256u; i += WG_SIZE * WG_Y * uint(KSPLIT))
+            sTable[i] = bitfieldExtract(params[3 * OC_PARAM_STRIDE() + int(i >> 2)], int(i & 3u) * 8, 8);
         barrier();
     }
 
-    int acc[PX * OCB];
+    // The bias starts the accumulators (an exact integer sum in any order) instead of being added per output in the
+    // epilogue; with KSPLIT only one partial sum may carry it, so it stays in the epilogue there.
+    const bool biasInAcc = KSPLIT == 1 && SCALE_FLOAT == 0;
+    int        acc[PX * OCB];
     [[unroll]] for (int i = 0; i < PX * OCB; ++i)
-        acc[i] = 0;
+        acc[i] = biasInAcc ? params[ocBlock * OCB + (i % OCB)] : 0;
 
     const int wBlockBase = ocBlock * (KERNEL_H * KERNEL_W * IC_WORDS * OCB);
     const int s0Words    = S0_C / 4;
@@ -663,7 +679,7 @@ void main()
         [[unroll]] for (int j = 0; j < 4; ++j)
         {
             if (OC_FULL != 0 || oc + j < OUT_C)
-                r[j] = SCALE_FLOAT != 0 ? EpilogueFloat(fin[q * 4 + j], oc + j) : EpilogueBiased(fin[q * 4 + j] + params[oc + j], oc + j);
+                r[j] = SCALE_FLOAT != 0 ? EpilogueFloat(fin[q * 4 + j], oc + j) : EpilogueBiased(fin[q * 4 + j] + (biasInAcc ? 0 : params[oc + j]), oc + j);
         }
         dst[((oy * OUT_W + ox) * OUT_STRIDE + oc) >> 2] = PackResult(r);
     }
