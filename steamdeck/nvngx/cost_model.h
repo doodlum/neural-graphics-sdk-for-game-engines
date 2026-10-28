@@ -15,6 +15,7 @@ enum class CostApi : int
 
 // The front end the game initialised (FSR 4 costs differ: native on D3D12, interop on D3D11 / Vulkan).
 void CostSetApi(CostApi api);
+CostApi CostGetApi();
 
 // Called once per evaluate with the upscaler that ran and the sizes: feeds the game-cost estimate.
 void CostNoteEvaluate(const UpscalerCreateInfo& info, unsigned renderW, unsigned renderH, unsigned outW, unsigned outH);

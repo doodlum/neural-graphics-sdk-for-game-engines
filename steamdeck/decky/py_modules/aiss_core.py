@@ -50,9 +50,10 @@ BIN_FILES = {
     "fsr4_vk": "amd_fidelityfx_upscaler_vk.dll",  # AMD FSR SDK 2.4 Vulkan upscaler (FSR 4.1.2), redistributed unmodified
     "fsr4_vk_license": "amd_fidelityfx-LICENSE.md",  # the FSR SDK licence, shipped with it
     "fsr4_shaders": "fsr4_shaders.bin",     # replacement FSR 4 Lite shader modules for the Vulkan path (not in the repo)
+    "fsr4_shaders_dot2": "fsr4_shaders_dot2.bin",  # their v_dot2 variants, used when the device has the VALVE extension
 }
 # Bundle files the plugin works without (the build skips them when they are not available locally).
-OPTIONAL_BIN = ("fsr4_dx12", "fsr4_vk", "fsr4_vk_license", "fsr4_shaders")
+OPTIONAL_BIN = ("fsr4_dx12", "fsr4_vk", "fsr4_vk_license", "fsr4_shaders", "fsr4_shaders_dot2")
 CORE_DEST_NAME = "_nvngx.dll"
 XESS_DEST_NAME = "libxess.dll"
 # AMD's FSR 4 DLLs go in a private subfolder so Proton's own amdxcffx64.dll in system32 cannot shadow them.
@@ -61,7 +62,8 @@ FSR4_SUBDIR = "aiss"
 PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME, None, "xess"),
                 ("fsr4_dx12", f"{FSR4_SUBDIR}/amdxcffx64.dll", None, "fsr4_dx12"),
                 ("fsr4_vk", f"{FSR4_SUBDIR}/amd_fidelityfx_upscaler_vk.dll", None, "fsr4_vk"),
-                ("fsr4_shaders", f"{FSR4_SUBDIR}/fsr4_shaders.bin", None, "fsr4_shaders"))
+                ("fsr4_shaders", f"{FSR4_SUBDIR}/fsr4_shaders.bin", None, "fsr4_shaders"),
+                ("fsr4_shaders_dot2", f"{FSR4_SUBDIR}/fsr4_shaders_dot2.bin", None, "fsr4_shaders_dot2"))
 # Files earlier builds installed and this one no longer does: (state key, dest path relative to system32). They are
 # removed on install (upgrade) and uninstall when they still match what was installed.
 LEGACY_PREFIX_FILES = (("fsr4", f"{FSR4_SUBDIR}/amdvkffx64.dll"),)

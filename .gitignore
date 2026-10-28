@@ -50,4 +50,4 @@ result//build_win*/
 amdvkffx64.dll
 amdxcffx64.dll
 amd_fidelityfx_*.dll
-fsr4_shaders.bin
+fsr4_shaders*.bin

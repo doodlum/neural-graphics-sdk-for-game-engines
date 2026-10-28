@@ -26,6 +26,7 @@ FSR4_DX12_DLL="${FSR4_DX12_DLL:-$REPO/../third_party/amd/amdxcffx64.dll}"
 # replacement FSR 4 Lite shader modules (fsr4_shaders.bin). All optional, kept outside the repo.
 FSR4_VK_DIR="${FSR4_VK_DIR:-$REPO/../third_party/amd/sdk240}"
 FSR4_SHADERS="${FSR4_SHADERS:-$REPO/../third_party/amd/fsr4_shaders.bin}"
+FSR4_SHADERS_DOT2="${FSR4_SHADERS_DOT2:-$REPO/../third_party/amd/fsr4_shaders_dot2.bin}"
 DISTROBOX="${DISTROBOX:-aissbuild}"
 NAME="aiss-dlss-nss"
 
@@ -50,7 +51,8 @@ else
     echo "warning: $FSR4_DX12_DLL not found - building without FSR 4 (the plugin hides its upscaler option)" >&2
 fi
 for pair in "$FSR4_VK_DIR/amd_fidelityfx_upscaler_vk.dll:amd_fidelityfx_upscaler_vk.dll" \
-            "$FSR4_VK_DIR/license.md:amd_fidelityfx-LICENSE.md" "$FSR4_SHADERS:fsr4_shaders.bin"; do
+            "$FSR4_VK_DIR/license.md:amd_fidelityfx-LICENSE.md" "$FSR4_SHADERS:fsr4_shaders.bin" \
+            "$FSR4_SHADERS_DOT2:fsr4_shaders_dot2.bin"; do
     src="${pair%%:*}"; dst="${pair##*:}"
     if [ -f "$src" ]; then
         install -m 0644 "$src" "$HERE/bin/$dst"

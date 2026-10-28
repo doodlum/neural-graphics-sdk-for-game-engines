@@ -1415,6 +1415,7 @@ typedef struct FeatureStorage
     VkPhysicalDeviceScalarBlockLayoutFeatures       scalar;
     VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableDesc;
     VkPhysicalDeviceTimelineSemaphoreFeatures       timeline;
+    VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE mixedDot;
     VkPhysicalDeviceFeatures2                       features2;
     VkPhysicalDeviceFeatures                        features;
 } FeatureStorage;
@@ -1535,6 +1536,31 @@ static void EnableMlFeatures(InstanceData* inst, VkPhysicalDevice pd, VkDeviceCr
                      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, timeline,
                      VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, VK_API_VERSION_1_2,
                      t->timelineSemaphore = VK_TRUE;);
+
+    // FSR 4: the proxy's replacement prepass shaders can use v_dot2_f32_f16 (SPV_VALVE_mixed_float_dot_product), which
+    // is only valid when the device enabled the extension. vkd3d-proton enables it itself; Vulkan and DXVK devices get it
+    // here. Never core.
+    if (DriverHasExtension(inst, pd, VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME))
+    {
+        VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE q = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+        VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &q};
+        inst->getFeatures2(pd, &f);
+        if (q.shaderMixedFloatDotProductFloat16AccFloat32)
+        {
+            VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE* t = (VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE*)
+                FindInChain(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE);
+            if (!t)
+            {
+                t = &st->mixedDot;
+                memset(t, 0, sizeof(*t));
+                t->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE;
+                Append(info, t);
+            }
+            t->shaderMixedFloatDotProductFloat16AccFloat32 = VK_TRUE;
+            AddExtension(exts, extCount, VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
+        }
+    }
 
     // XeSS (see the top of the file).
     const char* xessEnv = getenv("AISS_LAYER_XESS");

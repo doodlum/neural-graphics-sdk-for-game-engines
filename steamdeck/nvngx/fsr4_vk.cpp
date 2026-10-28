@@ -5,6 +5,7 @@
 // is only logged against what runs.
 // SPDX-License-Identifier: MIT
 #include "common.h"
+#include "cost_model.h"
 #include "fsr4_common.h"
 #include "nss_upscaler.h"
 
@@ -15,6 +16,7 @@
 #include "amd_ffx/ffx_upscale.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -218,14 +220,49 @@ std::vector<uint32_t> ReadSpirv(const char* path)
 
 // Where replacement modules come from (none of them are part of this repository):
 //  - AISS_FSR4_VK_SHADER_DIR=dir: dir\<hash>.spv files (shader development);
-//  - else fsr4_shaders.bin beside the DLL, installed by the plugin when it has one: "AISSSPV1", u32 count, then per
-//    module u64 hash, u32 word count and the SPIR-V words.
-// AISS_FSR4_VK_SHADERS=0 turns replacement off.
+//  - else packs beside the DLL, installed by the plugin when it has them: fsr4_shaders.bin, and fsr4_shaders_dot2.bin
+//    whose modules use v_dot2_f32_f16 (SPV_VALVE_mixed_float_dot_product) and take precedence when the device has
+//    VK_VALVE_shader_mixed_float_dot_product enabled (see Dot2Enabled). Format: "AISSSPV1", u32 count, then per module
+//    u64 hash, u32 word count and the SPIR-V words.
+// AISS_FSR4_VK_SHADERS=0 turns replacement off; AISS_FSR4_VK_DOT2=0 keeps to fsr4_shaders.bin.
+using ShaderPack = std::vector<std::pair<uint64_t, std::vector<uint32_t>>>;
+
 struct ShaderSource
 {
-    std::string                                             dir;
-    std::vector<std::pair<uint64_t, std::vector<uint32_t>>> pack;
+    std::string dir;
+    ShaderPack  pack, dot2;
 };
+
+ShaderPack ReadPack(const wchar_t* name)
+{
+    ShaderPack   pack;
+    std::wstring path = DllPath();
+    path              = path.substr(0, path.find_last_of(L'\\') + 1) + name;
+    FILE* f           = _wfopen(path.c_str(), L"rb");
+    if (!f)
+        return pack;
+    char     magic[8] = {};
+    uint32_t count    = 0;
+    bool ok = fread(magic, 1, 8, f) == 8 && !memcmp(magic, "AISSSPV1", 8) && fread(&count, 4, 1, f) == 1 && count < 4096;
+    for (uint32_t i = 0; ok && i < count; ++i)
+    {
+        uint64_t hash  = 0;
+        uint32_t words = 0;
+        ok = fread(&hash, 8, 1, f) == 1 && fread(&words, 4, 1, f) == 1 && words > 5 && words < (16u << 20);
+        if (!ok)
+            break;
+        std::vector<uint32_t> code(words);
+        ok = fread(code.data(), 4, words, f) == words && code[0] == 0x07230203u;  // SPIR-V magic
+        if (ok)
+            pack.push_back({hash, std::move(code)});
+    }
+    fclose(f);
+    if (!ok)
+        pack.clear();
+    LOGI("FSR 4 Vulkan: %ls: %s", path.c_str(),
+         ok ? (std::to_string(pack.size()) + " replacement shader modules").c_str() : "unreadable, not used");
+    return pack;
+}
 
 const ShaderSource& Shaders()
 {
@@ -238,34 +275,34 @@ const ShaderSource& Shaders()
             s.dir = env;
             return s;
         }
-        std::wstring path = DllPath();
-        path              = path.substr(0, path.find_last_of(L'\\') + 1) + L"fsr4_shaders.bin";
-        FILE* f           = _wfopen(path.c_str(), L"rb");
-        if (!f)
-            return s;
-        char     magic[8] = {};
-        uint32_t count    = 0;
-        bool ok = fread(magic, 1, 8, f) == 8 && !memcmp(magic, "AISSSPV1", 8) && fread(&count, 4, 1, f) == 1 && count < 4096;
-        for (uint32_t i = 0; ok && i < count; ++i)
-        {
-            uint64_t hash  = 0;
-            uint32_t words = 0;
-            ok = fread(&hash, 8, 1, f) == 1 && fread(&words, 4, 1, f) == 1 && words > 5 && words < (16u << 20);
-            if (!ok)
-                break;
-            std::vector<uint32_t> code(words);
-            ok = fread(code.data(), 4, words, f) == words && code[0] == 0x07230203u;  // SPIR-V magic
-            if (ok)
-                s.pack.push_back({hash, std::move(code)});
-        }
-        fclose(f);
-        if (!ok)
-            s.pack.clear();
-        LOGI("FSR 4 Vulkan: %ls: %s", path.c_str(),
-             ok ? (std::to_string(s.pack.size()) + " replacement shader modules").c_str() : "unreadable, not used");
+        s.pack = ReadPack(L"fsr4_shaders.bin");
+        if (const char* off = getenv("AISS_FSR4_VK_DOT2"); !(off && !strcmp(off, "0")))
+            s.dot2 = ReadPack(L"fsr4_shaders_dot2.bin");
         return s;
     }();
     return src;
+}
+
+// Whether the dot2 modules are valid on the FSR 4 device: the GPU must have VK_VALVE_shader_mixed_float_dot_product, and
+// the device must have enabled it, which vkd3d-proton does itself (D3D12 games) and the AISS layer does for every other
+// device (AISS_LAYER=1, which the plugin sets). Set by Fsr4VkUpscaler::Create before the DLL builds its pipelines.
+std::atomic<bool> g_dot2{false};
+
+bool Dot2Enabled(const VulkanDevice& dev, CostApi api)
+{
+    if (Shaders().dot2.empty() || !(api == CostApi::D3D12 || Config().mlFeaturesForced))
+        return false;
+    auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        dev.gipa(dev.instance, "vkEnumerateDeviceExtensionProperties"));
+    uint32_t n = 0;
+    if (!enumerate || enumerate(dev.physicalDevice, nullptr, &n, nullptr) != VK_SUCCESS)
+        return false;
+    std::vector<VkExtensionProperties> exts(n);
+    enumerate(dev.physicalDevice, nullptr, &n, exts.data());
+    for (const auto& e : exts)
+        if (!strcmp(e.extensionName, "VK_VALVE_shader_mixed_float_dot_product"))
+            return true;
+    return false;
 }
 
 PFN_vkCreateShaderModule g_realCreateShaderModule = nullptr;
@@ -300,6 +337,10 @@ VkResult VKAPI_CALL HookedCreateShaderModule(VkDevice device, const VkShaderModu
         for (const auto& m : src.pack)
             if (m.first == hash)
                 code = m.second;
+        if (g_dot2)
+            for (const auto& m : src.dot2)
+                if (m.first == hash)
+                    code = m.second, snprintf(path, sizeof(path), "fsr4_shaders_dot2.bin");
     }
     if (!code.empty())
     {
@@ -583,6 +624,9 @@ public:
         std::string   versionName;
         Fsr4BeginCreate(wanted);
         const uint64_t versionId = PickFsr4Version(&up->m_dc, &versionName);
+        g_dot2 = Dot2Enabled(device, CostGetApi());
+        if (!Shaders().dot2.empty())
+            LOGI("FSR 4 Vulkan: dot2 shader modules %s", g_dot2 ? "in use" : "not used (device lacks VK_VALVE_shader_mixed_float_dot_product or it is not enabled)");
         int            native    = 0;
         const int      accepted  = Fsr4EndCreate(&native);
         if (!versionId)

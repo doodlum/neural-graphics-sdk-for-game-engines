@@ -60,6 +60,8 @@ const char* const kNssDeviceExtensions[] = {
     // FSR 4 through D3D12 interop (fsr4_interop.cpp): shared D3D12 textures and fence on the game's device.
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,      VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
     VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+    // FSR 4 replacement shaders with v_dot2_f32_f16 (fsr4_vk.cpp).
+    "VK_VALVE_shader_mixed_float_dot_product",
 };
 
 // NGX returns extension lists either by pointing the caller at its own array or by filling the caller's array.

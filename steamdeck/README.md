@@ -209,17 +209,32 @@ Out of the box the SDK DLL offers only FSR 3.1.6 and 2.3.4 on a Steam Deck. Thre
   `DEPTH_STENCIL_READ_ONLY_OPTIMAL`) are moved to a supported one for the dispatch and back.
 
 **Replacement shader modules.** The proxy can replace any shader module the DLL creates, keyed by an FNV-1a hash of
-the original SPIR-V, so a replacement only ever applies to the exact module it was made for. They come from
-`system32\aiss\fsr4_shaders.bin` (format in `tools/pack_fsr4_shaders.py`; the plugin installs it when its bundle has
-one) or from `AISS_FSR4_VK_SHADER_DIR`. **No replacement shaders are part of this repository.** The ones used on the
-Deck are bit-identical in output to AMD's (all 16 combinations of HDR, motion-vector resolution, depth direction and
-auto exposure) and about 10% faster:
+the original SPIR-V, so a replacement only ever applies to the exact module it was made for. They come from packs in
+`system32\aiss\` (format in `tools/pack_fsr4_shaders.py`; the plugin installs them when its bundle has them) or from
+`AISS_FSR4_VK_SHADER_DIR`. **No replacement shaders are part of this repository.**
+
+- `fsr4_shaders.bin`: the Deck's set. Bit-exact changes to AMD's passes (wave-uniform weights loaded into SGPRs, LDS
+  sharing of colour taps, unrolled loops, integer requantisation and output tails, cheaper byte packing) plus two small
+  precision changes in the prepass: the input convolution accumulates exact f16 products in one f32 chain
+  (`v_fma_mix_f32`) instead of rounding each product to f16, and the history reprojection uses a 5-tap instead of a 9-tap
+  Catmull-Rom.
+- `fsr4_shaders_dot2.bin`: the prepass variants with that convolution on `v_dot2_f32_f16`
+  (`SPV_VALVE_mixed_float_dot_product`), the instruction AMD's own D3D12 build of this network compiles to. Used only
+  when the device has `VK_VALVE_shader_mixed_float_dot_product` enabled: vkd3d-proton enables it itself, and the Vulkan
+  layer enables it on Vulkan and DXVK devices (`AISS_LAYER=1`, set by the plugin). `AISS_FSR4_VK_DOT2=0` keeps to the
+  first pack.
+
+Against AMD's own shaders, replaying 8 captured game frames ×4 through the D3D11 path for all 16 combinations of HDR,
+motion-vector resolution, depth direction and auto exposure, the output stays within 67.4–71.9 dB (tonemapped PSNR;
+the largest differences are single pixels in a dithered shadow edge, invisible at 1:1). Frame-to-frame flicker on static
+content and edges in the Streamline sample is unchanged (0.172 vs 0.168 mean 8-bit change at edges; flipping the jitter
+sign on X raises it to 0.246, which also confirms the jitter convention).
 
 | FSR 4 Lite, 2x | AMD's shaders | Replacement shaders |
 | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.71 ms |
-| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 2.50 ms |
-| D3D11 (replay harness, 640x361 → 1280x722) | 3.45 ms | 3.11 ms |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.50 ms |
+| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 2.30 ms |
+| D3D11 (replay harness, 640x361 → 1280x722) | 3.44 ms | 2.90 ms |
 
 For comparison, the D3D12 interop that Vulkan games used before cost 4.6 ms plus about 2.8 ms of cross-queue idle
 per frame, and AMD's D3D12 DLL natively 2.8 ms.
@@ -432,7 +447,7 @@ Use the Decky plugin for this. By hand:
 | `AISS_UPSCALER=xess` | XeSS instead of NSS at launch (the control file overrides it) |
 | `AISS_UPSCALER=fsr4`, `AISS_FSR4_MODEL=auto/lite/int8/rdna2` | AMD FSR 4 (amdxcffx64.dll: native on D3D12, D3D12 interop on D3D11 and Vulkan) at launch, with that network (default auto: Lite on a Steam Deck); also `AISS_UPSCALER=fsr4-lite` etc. |
 | `AISS_FSR4_DIR=C:\path` | Folder amd_fidelityfx_upscaler_vk.dll and amdxcffx64.dll are loaded from (default: the `aiss` subfolder next to `_nvngx.dll`) |
-| `AISS_FSR4_VK_SHADERS=0`, `AISS_FSR4_VK_SHADER_DIR=C:\path` | FSR 4 on the SDK Vulkan DLL: no replacement shader modules / take them from `<path>\<hash>.spv` instead of `aiss\fsr4_shaders.bin` |
+| `AISS_FSR4_VK_SHADERS=0`, `AISS_FSR4_VK_SHADER_DIR=C:\path`, `AISS_FSR4_VK_DOT2=0` | FSR 4 on the SDK Vulkan DLL: no replacement shader modules / take them from `<path>\<hash>.spv` instead of the `aiss\fsr4_shaders*.bin` packs / skip the dot2 pack |
 | `AISS_FSR4_VK_PROFILE=N`, `AISS_FSR4_DX12_PROFILE=N`, `AISS_FSR4_VK_DUMP=dir` | FSR 4 diagnostics: per-dispatch GPU time (SDK Vulkan / D3D12 DLL), dump the SDK DLL's shader modules |
 | `AISS_FSR4_ALLOW_ANY_VERSION=1` | Accept an FSR 4 provider that is not 4.1.2 (diagnostics; normally such a provider is refused and the proxy uses NSS) |
 | `AISS_FSR4_WATERMARK=1` (or `FSR_WATERMARK=1`) | FSR 4: have AMD's DLL draw its banner (network name, version) on the output |
@@ -446,7 +461,7 @@ Use the Decky plugin for this. By hand:
 | `AISS_EXPOSURE` | Exposure passed to NSS (default 1.0) |
 | `AISS_LOG=0..4` | Log to `aiss_nvngx.log` next to the exe: 1 lifecycle (default), 2 per-frame, 3 NGX calls, 4 every parameter |
 | `AISS_DEBUG_VIEW=0..16` | Write NSS's internal views instead of the image (0 = 4x4 grid) |
-| `AISS_DUMP_FRAME=N` | Write output frame N to `aiss_frame_N.ppm` (any upscaler) |
+| `AISS_DUMP_FRAME=N` | Write output frame N to `aiss_frame_N.ppm` (any upscaler); for upscalers other than NSS, `AISS_DUMP_FRAME_COUNT=K` writes frames N..N+K-1 |
 | `FFX_PROFILE_PASSES=file` | Per-pass GPU timings |
 | `FFX_ML_RESCALE_FLOAT=1` | Fast maths: fp32 requantisation in the ML graph, ~1-2% faster, not bit exact; launch option only (the plugin no longer offers it and always writes fast maths off) |
 | `AISS_DUMP_INPUTS=first,count` | Raw colour/depth/MV/output per dispatch next to the game exe (the plugin's "Capture frames" button does the same for the next 8 frames of a running game, into `~/.local/share/aiss-dlss-nss/captures/`) |

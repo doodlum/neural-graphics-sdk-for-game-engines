@@ -1,6 +1,7 @@
 // AISS_DUMP_FRAME=N for the upscalers other than NSS (NSS writes its own): copies the output of evaluation N to a
 // host-visible buffer, reads it back 16 evaluations later (the proxy never waits on the game's queue) and writes
-// aiss_frame_<N>.ppm next to the game, tone mapped like NSS's dump.
+// aiss_frame_<N>.ppm next to the game, tone mapped like NSS's dump. AISS_DUMP_FRAME_COUNT=K writes evaluations N..N+K-1
+// (consecutive frames, e.g. to measure temporal stability).
 // SPDX-License-Identifier: MIT
 #include "ngx_common.h"
 
@@ -11,7 +12,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
+#include <vector>
 
 namespace
 {
@@ -22,11 +25,21 @@ struct Dump
     VkDeviceMemory memory = VK_NULL_HANDLE;
     UpscalerImage  image;
     uint64_t       readAt = 0;
+    uint64_t       index  = 0;  // evaluation index the dump holds
 };
 
 std::mutex g_mutex;
 uint64_t   g_count = 0;  // evaluations of non-NSS upscalers
-Dump       g_dump;
+std::vector<Dump> g_dumps;
+
+int DumpCount()
+{
+    static const int n = [] {
+        const char* v = getenv("AISS_DUMP_FRAME_COUNT");
+        return v && atoi(v) > 0 ? atoi(v) : 1;
+    }();
+    return n;
+}
 
 float HalfBits(uint16_t h)
 {
@@ -55,7 +68,7 @@ void Write(Dump& d)
     if (reinterpret_cast<PFN_vkMapMemory>(fn("vkMapMemory"))(d.dev.device, d.memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS)
     {
         char name[64];
-        snprintf(name, sizeof(name), "aiss_frame_%d.ppm", Config().dumpFrame);
+        snprintf(name, sizeof(name), "aiss_frame_%llu.ppm", (unsigned long long)d.index);
         if (FILE* f = fopen(name, "wb"))
         {
             const uint32_t w = d.image.width, h = d.image.height;
@@ -91,7 +104,6 @@ void Write(Dump& d)
     }
     reinterpret_cast<PFN_vkDestroyBuffer>(fn("vkDestroyBuffer"))(d.dev.device, d.buffer, nullptr);
     reinterpret_cast<PFN_vkFreeMemory>(fn("vkFreeMemory"))(d.dev.device, d.memory, nullptr);
-    d = Dump();
 }
 
 void Record(const VulkanDevice& dev, VkCommandBuffer cmd, const UpscalerImage& output)
@@ -142,7 +154,8 @@ void Record(const VulkanDevice& dev, VkCommandBuffer cmd, const UpscalerImage& o
     barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     d.image  = output;
     d.readAt = g_count + 16;
-    g_dump   = d;
+    d.index  = g_count - 1;
+    g_dumps.push_back(d);
 }
 }  // namespace
 
@@ -152,8 +165,15 @@ void NgxDumpFrame(const Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerI
         return;
     std::lock_guard<std::mutex> lock(g_mutex);
     ++g_count;
-    if (g_count == uint64_t(Config().dumpFrame) + 1)
+    const uint64_t first = uint64_t(Config().dumpFrame) + 1;
+    if (g_count >= first && g_count < first + uint64_t(DumpCount()))
         Record(upscaler->Device(), cmd, output);
-    else if (g_dump.buffer && g_count == g_dump.readAt)
-        Write(g_dump);
+    for (size_t i = 0; i < g_dumps.size();)
+        if (g_count == g_dumps[i].readAt)
+        {
+            Write(g_dumps[i]);
+            g_dumps.erase(g_dumps.begin() + i);
+        }
+        else
+            ++i;
 }
