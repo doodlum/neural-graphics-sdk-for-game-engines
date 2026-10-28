@@ -20,9 +20,7 @@ NVNGX_DLL="${NVNGX_DLL:-$REPO/build_win_nvngx/nvngx.dll}"
 LOADER_DIR="${LOADER_DIR:-$REPO/build_win_loader}"
 LAYER_DIR="${LAYER_DIR:-$REPO/build_layer}"
 XESS_SDK="${XESS_SDK:-$REPO/../third_party/xess/sdk}"  # Intel XeSS SDK: libxess.dll + LICENSE.txt, shipped unmodified
-# AMD FSR 4 driver DLLs (Adrenalin), shipped unmodified; optional, kept outside the repo. amdvkffx64 (Vulkan) serves
-# every API; amdxcffx64 (D3D12) adds the faster native D3D12 path.
-FSR4_VK_DLL="${FSR4_VK_DLL:-${FSR4_DLL:-$REPO/../third_party/amd/amdvkffx64.dll}}"
+# AMD FSR 4: amdxcffx64.dll from AMD's D3D12 driver (Adrenalin), shipped unmodified; optional, kept outside the repo
 FSR4_DX12_DLL="${FSR4_DX12_DLL:-$REPO/../third_party/amd/amdxcffx64.dll}"
 DISTROBOX="${DISTROBOX:-aissbuild}"
 NAME="aiss-dlss-nss"
@@ -39,19 +37,13 @@ chmod 0644 "$HERE/bin/VkLayer_aiss_ngx.json"
 install -m 0644 "$XESS_SDK/bin/libxess.dll" "$HERE/bin/libxess.dll"
 install -m 0644 "$XESS_SDK/LICENSE.txt" "$HERE/bin/libxess-LICENSE.txt"
 FSR4_SUM=""
-if [ -f "$FSR4_VK_DLL" ]; then
-    install -m 0644 "$FSR4_VK_DLL" "$HERE/bin/amdvkffx64.dll"
-    FSR4_SUM="$FSR4_SUM amdvkffx64.dll"
-else
-    rm -f "$HERE/bin/amdvkffx64.dll"
-    echo "warning: $FSR4_VK_DLL not found - building without FSR 4 (the plugin hides its upscaler options)" >&2
-fi
+rm -f "$HERE/bin/amdvkffx64.dll"  # no longer used (FSR 4 runs only through amdxcffx64)
 if [ -f "$FSR4_DX12_DLL" ]; then
     install -m 0644 "$FSR4_DX12_DLL" "$HERE/bin/amdxcffx64.dll"
-    FSR4_SUM="$FSR4_SUM amdxcffx64.dll"
+    FSR4_SUM="amdxcffx64.dll"
 else
     rm -f "$HERE/bin/amdxcffx64.dll"
-    echo "warning: $FSR4_DX12_DLL not found - building without the native D3D12 FSR 4 path (it uses the Vulkan DLL)" >&2
+    echo "warning: $FSR4_DX12_DLL not found - building without FSR 4 (the plugin hides its upscaler option)" >&2
 fi
 echo "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$REPO" diff --quiet 2>/dev/null || echo -dirty) built $(date -u +%Y-%m-%dT%H:%MZ)" > "$HERE/bin/VERSION"
 (cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_aiss_ngx.so VkLayer_aiss_ngx.json libxess.dll \

@@ -73,7 +73,7 @@ Streamline sample (ray tracing on), 1280x800 fullscreen on the Deck, installed e
 
 Every DLSS mode uses NSS's full network by default. On the Deck it costs about 1.3 ms more per frame than the
 small one at 640x400 → 1280x800, and the small network ghosts visibly. The Decky plugin switches between them while the
-game runs: the plugin's Quick Access panel carries every option (upscaler, FSR 4 model and path, watermark, fast
+game runs: the plugin's Quick Access panel carries every option (upscaler, FSR 4 model and watermark, fast
 maths, XeSS preset, GPU-time logging, log level, capture) through a control file the proxy re-reads twice a second
 (`AISS_CONTROL`). The file is `key=value` lines (upscaler 0 = NSS Quality, 1 = Balanced, 2 = Performance, 3 = XeSS,
 4-6/8 = FSR 4), with a legacy first line `<upscaler> <fast_math> <capture>` so older proxies still parse it.
@@ -129,146 +129,143 @@ The XeSS SDK is not part of this repository: the build takes its headers from `.
 
 ## AMD FSR 4 (alternative upscaler)
 
-The proxy can also run AMD FSR 4.1.2 from AMD's Windows driver (Adrenalin 26.10.1), on two paths:
+The proxy can also run AMD FSR 4.1.2 through `amdxcffx64.dll`, the FSR 4 component of AMD's Windows D3D12 driver
+(Adrenalin 26.10.1, FidelityFX 2.4.0.4370). It is the only FSR 4 path:
 
-- **Vulkan DLL** (`amdvkffx64.dll`): runs on the proxy's own Vulkan device, so it serves every API (D3D12, Vulkan, D3D11).
-- **D3D12 DLL** (`amdxcffx64.dll`): runs natively on the game's own `ID3D12Device` and command list, no Vulkan interop.
-  Used on D3D12 by default, where it is about 2.1-2.5x faster than the Vulkan DLL (see the table).
+- **D3D12 games**: natively on the game's own `ID3D12Device` and command list (`fsr4_dx12.cpp`), no copies.
+- **D3D11 games** (DXVK): through **D3D12 interop** (`fsr4_interop.cpp`): an in-process vkd3d-proton D3D12 device that
+  shares textures and a fence with the game's VkDevice (below).
+- **Vulkan games**: not available; they use NSS (see "No FSR 4 for Vulkan games").
 
-The plugin's "Upscaler" dropdown offers **FSR 4 Lite**, **FSR 4 INT8** and **FSR 4 INT8 RDNA 2**. The control file values
-are 4, 5 and 6. The launch options are `AISS_UPSCALER=fsr4` with `AISS_FSR4_MODEL=lite|int8|rdna2|auto`, or
-`AISS_UPSCALER=fsr4-lite` and so on; `AISS_FSR4_PATH=dx12|vk` forces a path (default: D3D12 native on D3D12, Vulkan
-elsewhere). FSR 4 switches live like the other upscalers.
+The plugin's "Upscaler" dropdown offers **FSR 4**, with an "FSR 4 model" choice of **Auto** (AMD's choice: Lite on a
+Steam Deck), **Lite**, **INT8** and **INT8 RDNA 2**. Control-file upscaler values: 4 Lite, 5 INT8, 6 INT8 RDNA 2, 8 Auto;
+launch options `AISS_UPSCALER=fsr4` with `AISS_FSR4_MODEL=lite|int8|rdna2|auto`. FSR 4 switches live like the other
+upscalers.
 
-**4.1.2 is required.** Both DLLs are loaded by full path from a private `aiss` subfolder of the prefix's `system32`
-(`system32\aiss\`, next to the proxy as `_nvngx.dll`'s folder) — not from `system32` itself, because Proton ships its
-own older `amdxcffx64.dll` (FSR 4.1.1) there and reinstalls it on every launch, which would shadow ours. The proxy
-reads each DLL's file version, loads it, and checks the FidelityFX provider's version name: anything that is not 4.1.2
-(an older 4.0.x/4.1.1, or an FSR 3.1 fallback) is **refused loudly** and the proxy stays on NSS
-(`AISS_FSR4_ALLOW_ANY_VERSION=1` overrides the check for diagnostics). When a DLL is missing, hands out no provider, or
-refuses the requested network, the proxy logs why and falls back — D3D12 to the Vulkan DLL, then to NSS; other APIs
-straight to NSS — with output bit-identical to plain NSS (checked with the Streamline replay).
+**4.1.2 is required.** The DLL is loaded by full path from a private `aiss` subfolder of the prefix's `system32`
+(`system32\aiss\`, next to `_nvngx.dll`), not from `system32` itself, because Proton ships its own older
+`amdxcffx64.dll` (FSR 4.1.1, sha256 4e7dc37a…) there and reinstalls it on every launch, which would shadow ours. The
+proxy logs the DLL's file version, loads it, and checks the FidelityFX provider's version name: anything that is not
+4.1.2 (an older 4.0.x/4.1.1, or an FSR 3.1 fallback) is **refused loudly**. If the DLL is missing, refused, hands out no
+provider, rejects the network, or interop fails at any step, the proxy logs why and **falls back to NSS**, with output
+bit-identical to plain NSS (Streamline replay hash a4958bfb with the DLL removed).
 
-### How it is driven
+### How amdxcffx64 is driven
 
-Both DLLs export the same FidelityFX provider entry point and carry the same per-network provider classes; the shared
-code is `steamdeck/nvngx/fsr4_common.cpp`, the Vulkan path is `fsr4_upscaler.cpp` and the D3D12 path is `fsr4_dx12.cpp`.
-The proxy uses each DLL only through the FidelityFX API provider it exports (`UpdateFfxApiProvider`) and AMD's public
-FidelityFX SDK 2.3 types (`steamdeck/nvngx/amd_ffx/`, MIT). The file on disk is never changed. These things are done
-in memory, and they are what make it work under Proton on a Steam Deck (points 1-3 apply to both DLLs; 4 is Vulkan-only):
+The proxy uses the DLL only through the FidelityFX provider it exports (`UpdateFfxApiProvider`) and AMD's public
+FidelityFX SDK 2.3 types (`steamdeck/nvngx/amd_ffx/`, MIT); the file is never changed. In memory
+(`fsr4_common.cpp`):
 
-1. **SDK module check.** The DLL hands out providers only when it finds signed FidelityFX SDK modules through
-   `GetModuleHandleW` (`amd_fidelityfx_*_vk.dll` for the Vulkan DLL, `..._dx12.dll` for the D3D12 DLL). The proxy points
-   each DLL's `GetModuleHandleW` import at a lookup that answers those names with the DLL itself. AMD signed it with the
-   same certificate, and Wine's `WinVerifyTrust` accepts the signature.
+1. **SDK module check.** The DLL hands out providers only when it finds signed FidelityFX SDK modules
+   (`amd_fidelityfx_*_dx12.dll`) through `GetModuleHandleW`. The proxy points the DLL's `GetModuleHandleW` import at a
+   lookup that answers those names with the DLL itself (same signing certificate; Wine's `WinVerifyTrust` accepts it).
 2. **GPU family.** AMD's device checks read the GPU family and revision from the Windows kernel driver
-   (`D3DKMTEnumAdapters` + `D3DKMTQueryAdapterInfo`, AMD private data, looked up with `GetProcAddress`; the D3D12 DLL
-   also uses AMD's `amdxc64.dll` driver extension). Wine has no answer to that query, so the DLL refuses every FSR 4
-   network on its own — the same problem FSR4Injector solved with a GE-Proton `amdxc64` shim. The proxy points each
-   DLL's `GetProcAddress` import at a lookup that returns its own D3DKMT pair, which answers with the amdgpu family and
-   external revision: 144 / 1 on Van Gogh (both Steam Deck models; read with `DRM_IOCTL_AMDGPU_INFO` on an OLED;
-   `AISS_FSR4_GPU=family,revision` overrides it). This in-process answer means no extra shim DLL is needed.
-3. **Model selection.** Each network is its own provider class in the DLL (RTTI `ffxProvider_FSR4`,
-   `..._FSR4_Int8`, `..._FSR4_Int8_Navi2`, `..._FSR4Lite_Int8`). Each class has a device check, which is the third
-   virtual function. FidelityFX asks FP8, INT8, INT8 RDNA 2 and then Lite, and runs the first network that accepts.
-   AMD's checks accept Lite for family 144 revision 1-0x7F (and Strix Point), INT8 for RDNA 3 / Strix Halo, INT8 RDNA 2
-   for family 143 revision 0x28-0x4F, and FP8 for RDNA 4. The proxy wraps those vtable entries: with a model selected,
-   only that network's check accepts; with `auto`, AMD's own answer goes through unchanged. AMD's checks run only for
-   an AMD vendor ID, and under `PROTON_FORCE_NVAPI=1` the Vulkan device reports NVIDIA (10de), so they accept nothing.
-   In that case `auto` falls back to the network AMD picks for the family, which is Lite on the Deck. Without the
-   spoof (the D3D11 harness), AMD's checks pick Lite by themselves.
-4. **Shaders (Vulkan DLL only).** `amdvkffx64`'s SPIR-V declares images with 16-bit float texels, which only AMD's own
-   driver accepts. RADV crashes compiling the pipeline (`vkCreateComputePipelines` access violation). The DLL gets a
-   `vkGetDeviceProcAddr` whose `vkCreateShaderModule` rewrites those images to 32-bit float texels, with `OpFConvert`
-   after each read and before each write (`spirv_half_images.cpp`; the results pass `spirv-val --target-env vulkan1.3`).
-   The D3D12 DLL ships DXIL, which vkd3d-proton translates, and needs no such rewrite.
+   (`D3DKMTEnumAdapters` + `D3DKMTQueryAdapterInfo`, AMD private data, looked up with `GetProcAddress`; it also uses
+   AMD's `amdxc64.dll` extension, which Proton ships). Wine has no answer to the D3DKMT query, so the DLL would refuse
+   every FSR 4 network — the problem FSR4Injector solved with a GE-Proton `amdxc64` shim. The proxy points the DLL's
+   `GetProcAddress` import at its own D3DKMT pair answering with the amdgpu family / external revision: 144 / 1 on Van
+   Gogh (read with `DRM_IOCTL_AMDGPU_INFO`; `AISS_FSR4_GPU=family,revision` overrides). No extra shim DLL is needed.
+3. **Model selection.** Each network is its own provider class (RTTI `ffxProvider_FSR4`, `..._FSR4_Int8`,
+   `..._FSR4_Int8_Navi2`, `..._FSR4Lite_Int8`) whose device check is the third virtual function; FidelityFX asks FP8,
+   INT8, INT8 RDNA 2, then Lite and runs the first that accepts. The proxy wraps those checks: with a model selected only
+   that network accepts; with Auto, AMD's answer goes through (AMD's checks run only for an AMD vendor ID, so under
+   `PROTON_FORCE_NVAPI=1` Auto falls back to the family's network, Lite on the Deck).
+4. The upscaler version description is left out: this DLL's `createContext` returns `ERROR_PARAMETER` with it.
 
-Proof of which network and version ran (collected for both paths):
+Proof of which network and version ran:
 
-- The log names the DLL's file version (`2.4.0.4370`), the provider (`"4.1.2 *"`, id `…1002`), the network that
-  accepted, and AMD's own choice. Proton's bundled `amdxcffx64.dll` reports `"4.1.1 *"` (id `…1001`) and is refused by
-  the 4.1.2 gate — the private `aiss` subfolder is what keeps the real 4.1.2 file in use.
-- `AISS_FSR4_WATERMARK=1` (or `FSR_WATERMARK=1`) sets `MLSR-WATERMARK`, the variable both DLLs read, and the DLL draws
-  its banner on the output. The banners seen on the Deck were `FSR4L-i8` (Lite), `FSR4-i8` (INT8) and `FSR4-i8-2`
-  (INT8 RDNA 2), each followed by `Upscale 4.1.2 DRS 2.00x Source: Driver`, on both the Vulkan and the D3D12 path
-  (`testlogs/fsr4/*_watermark.png`).
-- The Vulkan networks also differ in their pipelines: Lite builds 13 shaders (4 network passes), INT8 and INT8 RDNA 2
-  build 30 each (13 passes), with different code (`AISS_FSR4_DUMP_SPIRV=<dir>` writes them out).
+- The log names the file version (2.4.0.4370), the provider (`"4.1.2 *"`, id `…1002`), the network that runs, and AMD's
+  own choice.
+- `AISS_FSR4_WATERMARK=1` / `FSR_WATERMARK=1` / the plugin's "FSR 4 watermark" set `MLSR-WATERMARK`, and the DLL draws
+  `FSR4L-i8` (Lite), `FSR4-i8` (INT8) or `FSR4-i8-2` (INT8 RDNA 2) followed by `Upscale 4.1.2 DRS 2.00x Source: Driver`,
+  on D3D12 and through interop (`testlogs/fsr4/dx12_lite_watermark.png`, `d3d11_interop_lite_watermark.png`).
 
-### Inputs and device features
+### Inputs
 
-- Inputs are colour, depth (passed directly), motion vectors with the DLSS MV scale, and jitter. DLSS and FSR share
-  the jitter convention; this was checked visually, and the other three sign combinations leave jagged edges on static
-  detail (`testlogs/fsr4/jitter_sign_grid.png`). Reset, HDR, inverted depth (near and far swapped, the FidelityFX
-  convention), display-resolution motion vectors when `MVLowRes` is not set, and sharpening off are also passed.
-- FSR 4 needs an exposure. DLSS AutoExposure maps to FidelityFX auto exposure; otherwise the proxy passes a 1x1
-  exposure texture holding 1 (or `AISS_EXPOSURE`).
-- Dynamic resolution works. The context is created with `FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION`, and every dispatch
-  passes the DLSS render subrect as `renderSize` (`ngx_d3d11_test --dyn` passes with all three networks).
-- The shaders use `SPV_KHR_integer_dot_product` (DotProductInput4x8BitPacked), `Int8`, `Float16`,
-  `SPV_KHR_compute_shader_derivatives` (DerivativeGroupLinear), `GroupNonUniformQuad`,
-  `StorageImageWriteWithoutFormat` and `StorageImageExtendedFormats`. With `AISS_LAYER=1` the Vulkan layer now also
-  enables `VK_KHR_compute_shader_derivatives` with `computeDerivativeGroupLinear`, and
-  `shaderStorageImageExtendedFormats`, alongside the int8 / fp16 / dot-product features it already enabled
-  (`AISS_LAYER_FSR4=0` skips the FSR 4 additions). RADV runs the shaders without the layer too.
-- The Vulkan DLL uses the same device and command buffer path as NSS and XeSS on D3D12 (vkd3d-proton interop), Vulkan
-  and D3D11 (DXVK interop, the proxy's own command buffer). The D3D12 DLL instead takes the game's own `ID3D12Resource`s
-  and `ID3D12GraphicsCommandList` directly (`ngx_d3d12.cpp`), with no interop and no copies; it ships DXIL (vkd3d-proton
-  translates it), so it needs no SPIR-V rewrite.
+Colour, depth (passed directly natively; as R32F through interop), motion vectors with the DLSS MV scale, jitter (DLSS
+and FSR share the convention; the other three sign combinations leave jagged edges on static detail, checked
+visually), reset, HDR, inverted depth (near and far swapped, the FidelityFX convention), display-resolution motion
+vectors when `MVLowRes` is not set, DLSS AutoExposure → FidelityFX auto exposure, sharpening off. Dynamic resolution:
+the context is created with `FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION` and every dispatch passes the DLSS render subrect as
+`renderSize` (`ngx_d3d11_test --dyn` passes for Lite, INT8 and INT8 RDNA 2 through interop). FP8 is refused (it needs
+RDNA 4).
+
+### D3D12 interop for D3D11 games
+
+- The proxy creates a D3D12 device in-process (vkd3d-proton) on the game's adapter (LUID from
+  `VkPhysicalDeviceIDProperties`, matched with `IDXGIFactory4::EnumAdapterByLuid`) with a **compute** queue, the first
+  time FSR 4 is used.
+- Memory is shared through D3D12 committed **2D textures** created with `D3D12_HEAP_FLAG_SHARED` and
+  `ID3D12Device::CreateSharedHandle`, imported into the game's VkDevice as `VkImage`s with `VK_KHR_external_memory_win32`
+  (handle type `D3D12_RESOURCE`, dedicated allocation, the usage vkd3d-proton gives the texture so both drivers lay it
+  out alike). Under Proton vkd3d-proton returns `S_OK` with a **null handle** for a shared committed *buffer* and
+  `E_NOTIMPL` (0x80004001) for `CreateSharedHandle` on a shared *heap*, so textures are what is shared. FSR 4 reads the
+  shared colour / depth (copied through a buffer into R32F: a depth aspect cannot be copied to a colour image) /
+  motion-vector textures and writes the shared output directly.
+- Sync is one shared `ID3D12Fence` imported as a Vulkan **timeline semaphore** (`VK_KHR_external_semaphore_win32`,
+  `D3D12_FENCE` handle): the copy-in submission signals N, the D3D12 queue waits N, runs FSR 4 and signals N+1, the
+  copy-out submission waits N+1. The proxy owns these submissions on DXVK's queue (it already submits its own command
+  buffers there), so all waits are on the GPU / in the kernel and the CPU never waits per frame. A warm-up dispatch at
+  creation builds FSR 4's pipelines once.
 
 ### Performance
 
-GPU time per upscale (`AISS_GPU_TIMING`, averaged over 120) and frame rate (the proxy's evaluations/s), Streamline
-sample (ray tracing on), Steam Deck. The two bold columns are the native D3D12 DLL (`amdxcffx64.dll`), the three before
-them the Vulkan DLL (`amdvkffx64.dll`); both are FSR 4.1.2.
+GPU time per upscale (`AISS_GPU_TIMING`), Steam Deck. Native D3D12 is the Streamline sample (ray tracing on); interop is
+the D3D11 harness (DXVK, `AISS_LAYER=1`, 64 evaluations), which does little else, so the GPU runs at lower clocks there:
+compare a row's interop columns with each other, and with native only through the "normalised" column.
 
-| API | Mode | NSS Quality | NSS Performance | XeSS | FSR 4 Lite (vk) | FSR 4 INT8 (vk) | FSR 4 RDNA 2 (vk) | **FSR 4 Lite (dx12)** | **FSR 4 INT8 (dx12)** |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| D3D12 | 640→1280 (2x)   | 2.21 ms, 24.9 | 1.01 ms, 25.8 | 2.88 ms, 24.7 | 6.69 ms, 22.8 | 11.33 ms, 20.5 | 9.48 ms, 21.3 | **2.77 ms, 24.9** | **4.53 ms, 23.8** |
-| D3D12 | 853→1280 (1.5x) | 3.53 ms, 17.7 | 2.10 ms, 18.2 | 3.03 ms, 17.8 | 7.02 ms, 16.6 | 11.54 ms, 15.4 | 9.62 ms, 15.9 | **2.79 ms, 17.8** | **4.56 ms, 17.3** |
-| Vulkan | 640→1280 (2x)   | 2.58 ms, 27.5 | 1.29 ms, 27.3 | 3.19 ms, 26.1 | 7.34 ms, 23.8 | 12.34 ms, 21.0 | 10.20 ms, 22.0 | n/a | n/a |
-| Vulkan | 853→1280 (1.5x) | 3.80 ms, 18.7 | 2.29 ms, 19.6 | 3.36 ms, 19.1 | 7.4 ms, ~17 | 12.98 ms, 15.5 | 10.3 ms, ~17 | n/a | n/a |
+| Ratio | Network | Native D3D12 (sample) | Interop total (harness) | of which: copy-in | D3D12 dispatch | sync gap | copy-out | Interop normalised to sample clocks |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2x | Lite | 2.77 ms, 24.9 FPS | 5.71 ms | 0.16 | 4.81 | 0.50 | 0.24 | ~3.5 ms |
+| 2x | INT8 | 4.53 ms, 23.8 FPS | 9.37 ms | 0.18 | 8.03 | 0.90 | 0.26 | ~5.7 ms |
+| 2x | INT8 RDNA 2 | 4.50 ms, 23.9 FPS | 8.77 ms | 0.17 | 7.88 | 0.47 | 0.25 | ~5.4 ms |
+| 1.5x | Lite | 2.79 ms, 17.8 FPS | 5.93 ms | 0.29 | 4.86 | 0.54 | 0.24 | ~3.7 ms |
+| 1.5x | INT8 | 4.56 ms, 17.3 FPS | 9.12 ms | 0.29 | 7.98 | 0.61 | 0.24 | ~5.7 ms |
+| 1.5x | INT8 RDNA 2 | 4.53 ms, 17.3 FPS | 9.11 ms | 0.30 | 7.63 | 0.94 | 0.24 | ~5.7 ms |
 
-INT8 RDNA 2 on the D3D12-native path is 4.50 ms (2x) / 4.53 ms (1.5x). So native D3D12 is about 2.4x faster than the
-Vulkan DLL for Lite, 2.5x for INT8 and 2.1x for INT8 RDNA 2 — it is the default on D3D12. Even so, FSR 4 on the Deck
-still costs more than NSS Quality (2.2-3.8 ms) or XeSS (2.9-3.4 ms); its cost depends little on the input size. All
-three networks cost about the same on the native path because the GPU time is dominated by the fixed-size convolutions.
+2x = 640x361 → 1280x722 in the sample, 640x400 → 1280x800 in the harness; 1.5x = 853x481 / 853x533 → 1280x722 / 1280x800.
+The normalised column divides by the clock ratio measured with NSS Quality on both (harness 3.61 / 5.65 ms vs sample
+2.21 / 3.53 ms: 1.63 / 1.60), so it is an estimate; everything else is measured. Interop's own measured overhead
+(copies + sync) is 0.9-1.5 ms per frame at harness clocks (~0.6-0.9 ms normalised); the D3D12 dispatch itself scales like
+the native one. For reference: NSS Quality 2.21 / 3.53 ms, XeSS 2.88 / 3.03 ms in the sample (D3D12, 2x / 1.5x).
 
-### Why there is no D3D12 interop for Vulkan/D3D11 games
+### No FSR 4 for Vulkan games
 
-The native D3D12 DLL only runs where there is an `ID3D12Device` — D3D12 games. For Vulkan and D3D11 games the proxy
-gets the game's resources as `VkImage`s on the game's own Vulkan device (directly, or through DXVK interop), and those
-images are not created with external-memory/shared-handle flags, so they cannot be imported into a separate
-vkd3d-proton D3D12 device without a per-frame copy, plus cross-device fence synchronisation that is fragile under
-Proton. A copy each frame at display resolution would eat much of the ~5 ms the native path saves. So those APIs keep
-the Vulkan DLL (also FSR 4.1.2); only D3D12 uses the native path. This was assessed, not implemented.
+NGX gives the proxy only the game's Vulkan command buffer, which the game submits later; a command buffer cannot signal a
+semaphore halfway, so a same-frame copy-in → D3D12 FSR 4 → copy-out needs a GPU-side wait inside the game's command
+buffer (`vkCmdWaitEvents` on a host-set `VkEvent`, with a CPU thread that submits the D3D12 work once a copy-in event is
+set). Both variants were built and measured, and the D3D12 work never runs while the game's gfx job waits:
+
+- sharing D3D12 textures between the devices: the game's job ran into amdgpu's 5 s gfx lockup timeout —
+  `amdgpu 0000:04:00.0: ring gfx_0.0.0 timeout ... Starting gfx_0.0.0 ring reset ... reset succeeded` in the kernel log,
+  once per attempt (three times; `lockup_timeout` = `5000,10000,10000,5000`);
+- staging through the same host pages imported separately on each device (`VK_EXT_external_memory_host` on the game's,
+  `ID3D12Device3::OpenExistingHeapFromAddress` on vkd3d-proton's, so the jobs share no kernel BO), with the wait
+  released after 750 ms to stay clear of the timeout: every frame reached the 750 ms release with the D3D12 work still
+  unfinished (no ring reset).
+
+Both were removed. A pipeline that shows the upscaled image a frame or more late would avoid the wait, but puts the
+scene behind the HUD, so it is not offered. Selecting FSR 4 in a Vulkan game logs this and uses NSS.
 
 ### Limitations
 
-- **FP8 cannot run on the Deck.** Its shaders need `SPV_EXT_float8`, `SPV_KHR_cooperative_matrix` and
-  `SPV_NV_cooperative_matrix2`, and RADV on Van Gogh has neither `VK_EXT_shader_float8` nor
-  `VK_KHR_cooperative_matrix`. Forcing it crashes in pipeline creation, so the proxy refuses it unless the device has
-  both extensions (`AISS_FSR4_FORCE_FP8=1` overrides that). The control file value is 7 and it is not offered in the
-  plugin.
-- INT8 and INT8 RDNA 2 run on the Deck only because the proxy overrides AMD's device check; AMD limits them to RDNA 3
-  and to RDNA 2 desktop GPUs. They are much slower than Lite there (see the table).
-- No reactive or transparency mask is passed (DLSS has none), and colour/output subrect offsets are ignored, as for
-  the other upscalers.
-- Each live switch creates a new FidelityFX context (one effect context per context). The DLL's Vulkan backend is
-  known to run out of pipeline-layout slots when one context rebuilds its network many times on preset changes. The
-  dynamic-resolution flag keeps it on one preset, and 30 live switches in a row ran cleanly.
+- FP8 needs RDNA 4 and is refused.
+- INT8 and INT8 RDNA 2 run on the Deck only because the proxy overrides AMD's device check (AMD limits them to RDNA 3 /
+  RDNA 2 desktop GPUs); they cost about 1.6x Lite.
+- Interop supports colour/motion formats RGBA16F/32F, R11G11B10, RGB10A2, RGBA8/BGRA8 (+sRGB), RG16F/32F and depth
+  D32 / D32S8; anything else falls back to NSS with a log line.
+- No reactive or transparency mask is passed (DLSS has none), and colour/output subrect offsets are ignored, as for the
+  other upscalers.
 
 ### Licence
 
-`amdvkffx64.dll` and `amdxcffx64.dll` are AMD's files, unmodified, under AMD's licence (they ship with AMD Software:
-Adrenalin Edition). They are not in this repository: `.gitignore` excludes them, and `steamdeck/decky/build.sh` bundles
-them from `../third_party/amd/` (`FSR4_VK_DLL=` / `FSR4_DX12_DLL=` override the paths). When a file is absent the build
-warns; without `amdvkffx64.dll` the plugin hides the FSR 4 options, without `amdxcffx64.dll` it uses the Vulkan DLL on
-D3D12 too. The headers in `steamdeck/nvngx/amd_ffx/` are AMD's MIT-licensed FidelityFX SDK headers. The ABI facts above
-(provider block layout, the backend description types `0x01000003` for Vulkan and `0x00000002` for D3D12, the upscaler
-version description `0x0001000B`, the provider classes and the model check order, the D3DKMT private-data offsets, and
-`MLSR-WATERMARK`) come from reading OptiScaler's FSR 4 notes and FSR4Injector's README, and from disassembling the DLLs.
-None of OptiScaler's or FSR4Injector's code is used.
+`amdxcffx64.dll` is AMD's file, unmodified, under AMD's licence (it ships with AMD Software: Adrenalin Edition). It is
+not in this repository: `.gitignore` excludes it, and `steamdeck/decky/build.sh` bundles it from
+`../third_party/amd/amdxcffx64.dll` (`FSR4_DX12_DLL=` overrides). When it is absent the build warns and the plugin hides
+the FSR 4 option. The headers in `steamdeck/nvngx/amd_ffx/` are AMD's MIT-licensed FidelityFX SDK headers. The ABI
+facts above (provider block layout, the D3D12 backend description type `0x00000002`, the provider classes and their
+check order, the D3DKMT private-data offsets, `MLSR-WATERMARK`) come from reading OptiScaler's FSR 4 notes,
+FSR4Injector's README and GE-Proton's amdxc64, and from disassembling the DLL. None of their code is used.
 
 ## Build
 
@@ -287,7 +284,7 @@ ML kernels bit-for-bit and times them on the Deck.
 
 Use the Decky plugin for this. By hand:
 
-1. Copy `build_win_nvngx/nvngx.dll` to `steamapps/compatdata/<appid>/pfx/drive_c/windows/system32/_nvngx.dll`. The prefix exists after the first launch. For XeSS, put `libxess.dll` next to it; for FSR 4, put `amdvkffx64.dll` and `amdxcffx64.dll` in a `system32\aiss\` subfolder (not `system32` itself, where Proton's own older `amdxcffx64.dll` would shadow them).
+1. Copy `build_win_nvngx/nvngx.dll` to `steamapps/compatdata/<appid>/pfx/drive_c/windows/system32/_nvngx.dll`. The prefix exists after the first launch. For XeSS, put `libxess.dll` next to it; for FSR 4, put `amdxcffx64.dll` in a `system32\aiss\` subfolder (not `system32` itself, where Proton's own older `amdxcffx64.dll` would shadow it).
 2. Copy the loader shim next to the game executable:
    - `build_win_loader/dbghelp/dbghelp.dll` if the game ships `sl.interposer.dll`;
    - `build_win_loader/dxgi/dxgi.dll` otherwise.
@@ -302,14 +299,11 @@ Use the Decky plugin for this. By hand:
 | `AISS_NSS_QUALITY=0/1/2` | NSS shader quality at launch: 0 = Quality network (default), 1 = Balanced, 2 = Performance |
 | `AISS_CONTROL=/path` | File holding "upscaler [fast maths] [capture]": 0/1/2 (NSS model), 3 (XeSS), 4/5/6 (FSR 4 Lite / INT8 / INT8 RDNA 2), 7 (FSR 4 FP8), 8 (FSR 4, AMD's choice); re-read twice a second; switches the upscaler while the game runs (set by the plugin) |
 | `AISS_UPSCALER=xess` | XeSS instead of NSS at launch (the control file overrides it) |
-| `AISS_UPSCALER=fsr4`, `AISS_FSR4_MODEL=auto/lite/int8/rdna2/fp8` | AMD FSR 4 at launch, with that network (default auto: AMD's choice, Lite on a Steam Deck); also `AISS_UPSCALER=fsr4-lite` etc. |
-| `AISS_FSR4_PATH=auto/vk/dx12` | FSR 4 path: native D3D12 (`amdxcffx64.dll`) where possible (auto/dx12) or the Vulkan DLL (`amdvkffx64.dll`); Vulkan/D3D11 games always use the Vulkan DLL |
-| `AISS_FSR4_DIR=C:\path` | Folder the FSR 4 DLLs are loaded from (default: the `aiss` subfolder next to `_nvngx.dll`) |
+| `AISS_UPSCALER=fsr4`, `AISS_FSR4_MODEL=auto/lite/int8/rdna2` | AMD FSR 4 (amdxcffx64.dll: native on D3D12, D3D12 interop on D3D11; Vulkan games use NSS) at launch, with that network (default auto: Lite on a Steam Deck); also `AISS_UPSCALER=fsr4-lite` etc. |
+| `AISS_FSR4_DIR=C:\path` | Folder amdxcffx64.dll is loaded from (default: the `aiss` subfolder next to `_nvngx.dll`) |
 | `AISS_FSR4_ALLOW_ANY_VERSION=1` | Accept an FSR 4 provider that is not 4.1.2 (diagnostics; normally such a provider is refused and the proxy uses NSS) |
 | `AISS_FSR4_WATERMARK=1` (or `FSR_WATERMARK=1`) | FSR 4: have AMD's DLL draw its banner (network name, version) on the output |
 | `AISS_FSR4_GPU=family,revision` | FSR 4: amdgpu family / revision handed to AMD's GPU query (default 144,1 on a Steam Deck, nothing elsewhere) |
-| `AISS_FSR4_DUMP_SPIRV=C:\dir` | FSR 4: write every shader module the DLL creates (before the half-float image rewrite) |
-| `AISS_FSR4_NO_SPIRV_FIX=1`, `AISS_FSR4_FORCE_FP8=1` | FSR 4 debugging: skip the Vulkan shader rewrite (RADV then crashes) / allow FP8 without float8 + cooperative matrix support |
 | `AISS_FSR4_DX12_VER=0xVER` | FSR 4 D3D12: chain an upscaler version desc with this value (default: none; the 4.1.2 DLL rejects it) |
 | `AISS_XESS_QUALITY=100..105` | XeSS preset (default 100, Ultra Performance: the widest input range) |
 | `AISS_GPU_TIMING=N` | Log the GPU time of the upscale and the evaluations per second, averaged over N evaluations |
@@ -325,7 +319,6 @@ Use the Decky plugin for this. By hand:
 | `AISS_LAYER_LOG=1` | Vulkan layer: log instances, device extensions and NULL proc lookups to stderr |
 | `AISS_LAYER_FEATURES=0`, `AISS_LAYER_EMULATE=0` | Vulkan layer: don't force ML features / don't emulate the NVIDIA extensions (debugging) |
 | `AISS_LAYER_XESS=0` | Vulkan layer: don't enable the XeSS device features (debugging) |
-| `AISS_LAYER_FSR4=0` | Vulkan layer: don't enable the FSR 4 device features (debugging) |
 
 ## Tested
 

@@ -1,7 +1,6 @@
-// Shared plumbing for the two AMD FSR 4 paths: amdvkffx64.dll (Vulkan, fsr4_upscaler.cpp) and amdxcffx64.dll (D3D12,
-// fsr4_dx12.cpp). Both DLLs export the same FidelityFX provider entry point and carry the same per-network provider
-// classes; only the graphics backend and the way they learn the GPU family differ. This loads one such DLL, answers
-// its GPU query, wraps its per-network device checks for model selection, and hands back the upscaler provider.
+// AMD FSR 4 driver plumbing for amdxcffx64.dll (AMD's D3D12 FSR 4, used natively on D3D12 games by fsr4_dx12.cpp and
+// through D3D12 interop on D3D11 games by fsr4_interop.cpp): loads the DLL, answers its GPU query, wraps its
+// per-network device checks for model selection, and hands back the upscaler provider.
 // SPDX-License-Identifier: MIT
 #pragma once
 

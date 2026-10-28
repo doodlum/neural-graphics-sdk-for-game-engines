@@ -7,11 +7,11 @@ Per enabled game the plugin owns:
   * pfx/drive_c/windows/system32/_nvngx.dll        the NSS NGX core (a foreign file there is backed up and restored)
   * pfx/drive_c/windows/system32/libxess.dll       Intel XeSS (unmodified Intel binary), loaded by the core when the
                                                    XeSS upscaler is selected (same backup/restore rules)
-  * pfx/drive_c/windows/system32/aiss/amdvkffx64.dll   AMD FSR 4 Vulkan DLL (unmodified), loaded by the core for FSR 4
-  * pfx/drive_c/windows/system32/aiss/amdxcffx64.dll   AMD FSR 4 D3D12 DLL (unmodified), the faster native D3D12 path
-                                                   Both live in a private "aiss" subfolder so Proton's own (older) copy
-                                                   of amdxcffx64.dll in system32 cannot shadow them; installed only when
-                                                   the bundle has them.
+  * pfx/drive_c/windows/system32/aiss/amdxcffx64.dll   AMD FSR 4 (unmodified D3D12 driver DLL), loaded by the core for
+                                                   FSR 4 (native on D3D12 games, D3D12 interop on D3D11 games). It lives
+                                                   in a private "aiss" subfolder so Proton's own older amdxcffx64.dll in
+                                                   system32 cannot shadow it; installed only when the bundle has it.
+                                                   (Older builds also installed aiss/amdvkffx64.dll; it is removed.)
   * <exe dir>/dbghelp.dll or <exe dir>/dxgi.dll   the loader shim (never overwrites a file that is not ours)
   * HKLM\\Software\\NVIDIA Corporation\\Global {41FCC608-...}=hex:01 in pfx/system.reg (only while the game is not
     running, with a one-time backup of system.reg)
@@ -44,19 +44,20 @@ BIN_FILES = {
     "layer_json": "VkLayer_aiss_ngx.json",
     "xess": "libxess.dll",                  # Intel XeSS SDK binary, redistributed unmodified
     "xess_license": "libxess-LICENSE.txt",  # its licence (Intel Simplified Software License), shipped with it
-    "fsr4": "amdvkffx64.dll",               # AMD FSR 4 Vulkan DLL (AMD driver component), redistributed unmodified
-    "fsr4_dx12": "amdxcffx64.dll",          # AMD FSR 4 D3D12 DLL (AMD driver component), redistributed unmodified
+    "fsr4_dx12": "amdxcffx64.dll",          # AMD FSR 4 (D3D12 driver component), redistributed unmodified
 }
 # Bundle files the plugin works without (the build skips them when they are not available locally).
-OPTIONAL_BIN = ("fsr4", "fsr4_dx12")
+OPTIONAL_BIN = ("fsr4_dx12",)
 CORE_DEST_NAME = "_nvngx.dll"
 XESS_DEST_NAME = "libxess.dll"
 # AMD's FSR 4 DLLs go in a private subfolder so Proton's own amdxcffx64.dll in system32 cannot shadow them.
 FSR4_SUBDIR = "aiss"
 # Files installed into each prefix's system32: (bundle key, dest path relative to system32, marker or None, state key).
 PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME, None, "xess"),
-                ("fsr4", f"{FSR4_SUBDIR}/amdvkffx64.dll", None, "fsr4"),
                 ("fsr4_dx12", f"{FSR4_SUBDIR}/amdxcffx64.dll", None, "fsr4_dx12"))
+# Files earlier builds installed and this one no longer does: (state key, dest path relative to system32). They are
+# removed on install (upgrade) and uninstall when they still match what was installed.
+LEGACY_PREFIX_FILES = (("fsr4", f"{FSR4_SUBDIR}/amdvkffx64.dll"),)
 CORE_BACKUP_SUFFIX = ".aiss-orig"
 REG_BACKUP_SUFFIX = ".aiss-bak"
 
@@ -94,7 +95,6 @@ DEFAULT_SETTINGS = {
     # Upscaler family: 0 NSS Quality, 1 NSS Balanced, 2 NSS Performance, 3 XeSS, 4 FSR 4. Applied live.
     "upscaler": 0,
     "fsr4_model": 0,     # when upscaler == 4: 0 Auto (AMD's choice), 1 Lite, 2 INT8, 3 INT8 RDNA 2
-    "fsr4_path": 0,      # FSR 4 path: 0 Auto (native D3D12 where possible), 1 Vulkan DLL, 2 D3D12 native
     "watermark": 0,      # 1 = draw AMD's FSR 4 version/network banner on the output
     "fast_math": 0,      # NSS only: 1 = fp32 requantisation in the ML graph (~2% faster, not bit exact)
     "xess_quality": 0,   # XeSS preset override: 0 = from the render scale, else 100-105 (Ultra Perf .. AA)
@@ -111,6 +111,7 @@ def migrate_settings(s: dict) -> dict:
     """Bring an older settings dict up to date: the single 'quality' key (0-6) becomes upscaler + fsr4_model."""
     s = {**DEFAULT_SETTINGS, **s}
     s.pop("ratio", None)  # removed long ago
+    s.pop("fsr4_path", None)  # removed: FSR 4 has a single path (amdxcffx64)
     if "quality" in s:
         q = int(s.pop("quality"))
         if q in (0, 1, 2, 3):
@@ -687,8 +688,7 @@ class AissCore:
         return [f for f in PREFIX_FILES if f[0] not in OPTIONAL_BIN or self.bundle_path(f[0]).is_file()]
 
     def bundle_info(self) -> dict:
-        info = {"missing": self.bundle_missing(), "version": "", "fsr4": self.bundle_path("fsr4").is_file(),
-                "fsr4_dx12": self.bundle_path("fsr4_dx12").is_file()}
+        info = {"missing": self.bundle_missing(), "version": "", "fsr4": self.bundle_path("fsr4_dx12").is_file()}
         try:
             info["version"] = (self.bin_dir / "VERSION").read_text(encoding="utf-8").strip()
         except OSError:
@@ -1007,8 +1007,25 @@ class AissCore:
     def _marker(key: str) -> bytes | None:
         return CORE_MARKER if key == "core" else None
 
+    def _remove_legacy(self, gs: dict) -> None:
+        """Remove files earlier builds installed (e.g. aiss/amdvkffx64.dll) if they are still what was installed."""
+        for sk, _ in LEGACY_PREFIX_FILES:
+            path, digest = gs.pop(f"{sk}_path", None), gs.pop(f"{sk}_hash", None)
+            gs.pop(f"{sk}_backup", None)
+            if not path:
+                continue
+            p = Path(path)
+            try:
+                if p.is_file() and (not digest or sha256_file(p) == digest):
+                    p.unlink()
+                if p.parent.name == FSR4_SUBDIR and p.parent.is_dir() and not any(p.parent.iterdir()):
+                    p.parent.rmdir()
+            except OSError as e:
+                self.log.warning(f"cannot remove old {p}: {e}")
+
     def _install_core(self, gs: dict, pfx: Path) -> None:
-        """_nvngx.dll and libxess.dll into system32, and (when bundled) AMD's FSR 4 DLLs into system32/aiss."""
+        """_nvngx.dll and libxess.dll into system32, and (when bundled) AMD's FSR 4 DLL into system32/aiss."""
+        self._remove_legacy(gs)
         for key, name, _, sk in self.prefix_files():
             dst = pfx / "drive_c/windows/system32" / name
             dst.parent.mkdir(parents=True, exist_ok=True)  # the aiss subfolder for the FSR 4 DLLs
@@ -1025,6 +1042,7 @@ class AissCore:
 
     def _remove_core(self, gs: dict) -> list[str]:
         warnings = []
+        self._remove_legacy(gs)
         subdirs: set[Path] = set()
         for key, _, _, sk in PREFIX_FILES:
             path = gs.get(f"{sk}_path")
@@ -1275,7 +1293,6 @@ class AissCore:
             f"upscaler={code}",
             f"fast_math={fast}",
             f"capture={capture}",
-            f"fsr4_path={int(s.get('fsr4_path', 0))}",
             f"watermark={1 if s.get('watermark') else 0}",
             f"log={int(s.get('log', 1))}",
             f"gpu_timing={1 if s.get('gpu_timing') else 0}",
@@ -1314,7 +1331,7 @@ class AissCore:
                 raise ValueError("quality must be 0-6 (NSS 0/1/2, XeSS 3, FSR 4 Lite/INT8/RDNA2 4/5/6)")
             self._apply_quality(s, q)
         checks = {
-            "upscaler": (0, 4), "fsr4_model": (0, 3), "fsr4_path": (0, 2), "watermark": (0, 1),
+            "upscaler": (0, 4), "fsr4_model": (0, 3), "watermark": (0, 1),
             "fast_math": (0, 1), "gpu_timing": (0, 1), "log": (0, 4),
         }
         for key, (lo, hi) in checks.items():

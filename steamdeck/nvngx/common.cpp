@@ -124,7 +124,6 @@ struct LiveControl
     int nssQuality  = -1;  // control-file upscaler value 0-8 (0-2 NSS, 3 XeSS, 4-8 FSR 4)
     int fastMath    = -1;
     int capture     = -1;
-    int fsr4Path    = -1;  // 0 auto, 1 vk, 2 dx12
     int watermark   = -1;  // 0 off, 1 on
     int logLevel    = -1;  // 0-4
     int gpuTiming   = -1;  // 0 off, 1 on
@@ -183,7 +182,7 @@ static LiveControl ReadLiveControl()
                 if (!strcmp(k, "upscaler")) setInt(v, 0, 8, read.nssQuality);
                 else if (!strcmp(k, "fast_math")) setInt(v, 0, 1, read.fastMath);
                 else if (!strcmp(k, "capture")) setInt(v, 0, 1 << 30, read.capture);
-                else if (!strcmp(k, "fsr4_path")) setInt(v, 0, 2, read.fsr4Path);
+                else if (!strcmp(k, "fsr4_path")) {}  // older plugins wrote it; there is only one FSR 4 path now
                 else if (!strcmp(k, "watermark")) setInt(v, 0, 1, read.watermark);
                 else if (!strcmp(k, "log")) setInt(v, 0, 4, read.logLevel);
                 else if (!strcmp(k, "gpu_timing")) setInt(v, 0, 1, read.gpuTiming);
@@ -236,11 +235,6 @@ int LiveFastMath()
 int LiveCaptureRequest()
 {
     return ReadLiveControl().capture;
-}
-
-int LiveFsr4Path()
-{
-    return ReadLiveControl().fsr4Path;
 }
 
 int LiveWatermark()

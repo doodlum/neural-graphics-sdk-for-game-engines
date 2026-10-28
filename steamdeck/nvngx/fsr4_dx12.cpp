@@ -1,5 +1,5 @@
 // AMD FSR 4 on the game's D3D12 device (amdxcffx64.dll). The driver loading, GPU-family answer and per-network model
-// selection are shared with the Vulkan path (fsr4_common). amdxcffx64 learns the GPU family through AMD's amdxc64 driver
+// selection are shared with the D3D12 interop path (fsr4_common). amdxcffx64 learns the GPU family through AMD's amdxc64 driver
 // extension or a D3DKMT query; Proton Experimental ships a GE-Proton-derived amdxc64.dll stand-in, and the D3DKMT answer
 // in fsr4_common covers the rest. The FFX DX12 backend runs the network straight on the game's device and command list,
 // so there is no Vulkan interop here.
@@ -193,7 +193,7 @@ Fsr4Dx12* Fsr4Dx12::Create(ID3D12Device* device, uint32_t maxRenderW, uint32_t m
     BackendDx12Desc backend = {};
     backend.header.type     = backendType;
     backend.device          = device;
-    // amdxcffx64 4.1.1 rejects the upscaler version desc that amdvkffx64 4.1.2 requires (createContext returns
+    // amdxcffx64 rejects the upscaler version desc (createContext returns
     // ERROR_PARAMETER); on DX12 it is left out unless AISS_FSR4_DX12_VER forces a value.
     UpscaleVersionDesc version = {};
     version.header.type        = kUpscaleVersionDesc;

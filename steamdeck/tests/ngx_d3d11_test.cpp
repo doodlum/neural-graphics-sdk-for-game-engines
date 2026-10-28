@@ -15,6 +15,7 @@
 //   --crop        replay with colour and motion vectors cropped to the render size (the exact-size reference)
 //   --color16     replay B10G11R11 colour as RGBA16F (the same values)
 //   --loops L     play the replayed frames L times (reset only on the first)
+//   --anysize     accept any MaxPerf render size (e.g. with AISS_RATIO=1.5), not only 640x400
 //   --sync        wait for the GPU after every replayed frame
 // SPDX-License-Identifier: MIT
 #include <d3d11.h>
@@ -194,6 +195,7 @@ int main(int argc, char** argv)
     int         first = 0, replayCount = 8;
     bool        crop = false, color16 = false;
     int         loops = 1;
+    bool        anySize = false;  // accept the render size the proxy reports (AISS_RATIO), not only 640x400
     bool        sync = false;
     for (int i = 2; i < argc; ++i)
     {
@@ -210,6 +212,7 @@ int main(int argc, char** argv)
         else if (a == "--color16") color16 = true;
         else if (a == "--loops" && i + 1 < argc) loops = atoi(argv[++i]);
         else if (a == "--sync") sync = true;
+        else if (a == "--anysize") anySize = true;
         else { printf("FAIL: unknown option %s\n", argv[i]); return 1; }
     }
     HMODULE ngx = LoadLibraryA(dll);
@@ -374,7 +377,7 @@ int main(int argc, char** argv)
     caps->Get("OutHeight", &rh);
     printf("SuperSampling.Available=%d, MaxPerf render size for %ux%u: %ux%u\n", available, outW, outH, rw, rh);
     NVSDK_NGX_D3D11_DestroyParameters(caps);
-    if (!available || rw != 640 || rh != 400) { printf("FAIL: capability parameters\n"); return 1; }
+    if (!available || (!anySize && (rw != 640 || rh != 400))) { printf("FAIL: capability parameters\n"); return 1; }
 
     auto tex = [&](UINT w, UINT h, DXGI_FORMAT fmt, UINT bind, const void* data, UINT pitch) {
         D3D11_TEXTURE2D_DESC d = {w, h, 1, 1, fmt, {1, 0}, D3D11_USAGE_DEFAULT, bind, 0, 0};

@@ -48,7 +48,7 @@ def bin_dir(tmp: Path) -> Path:
     else:  # stand-ins: the tests only move the files around
         (d / "libxess.dll").write_bytes(b"MZ stand-in for Intel libxess.dll")
         (d / "libxess-LICENSE.txt").write_text("stand-in licence\n")
-    for amd in ("amdvkffx64.dll", "amdxcffx64.dll"):
+    for amd in ("amdxcffx64.dll",):
         src = REPO.parent / "third_party/amd" / amd
         if src.is_file():
             os.symlink(src, d / amd)  # tens of MB: linked, not copied
@@ -340,13 +340,14 @@ class FakeLibraryTests(unittest.TestCase):
             # XeSS (Intel's binary) and FSR 4 (AMD's) go next to the core, unmodified
             self.assertEqual((p / "drive_c/windows/system32/libxess.dll").read_bytes(),
                              (self.bin / "libxess.dll").read_bytes())
-            # AMD's FSR 4 DLLs go in a private system32/aiss subfolder (Proton's own amdxcffx64 in system32 can't shadow them)
-            for amd in ("amdvkffx64.dll", "amdxcffx64.dll"):
-                dst = p / "drive_c/windows/system32/aiss" / amd
-                if (self.bin / amd).is_file():
-                    self.assertEqual(sha256_of(dst), sha256_of(self.bin / amd))
-                else:
-                    self.assertFalse(dst.exists())
+            # AMD's FSR 4 DLL goes in a private system32/aiss subfolder (Proton's own amdxcffx64 in system32 can't
+            # shadow it); the Vulkan DLL is no longer installed
+            dst = p / "drive_c/windows/system32/aiss/amdxcffx64.dll"
+            if (self.bin / "amdxcffx64.dll").is_file():
+                self.assertEqual(sha256_of(dst), sha256_of(self.bin / "amdxcffx64.dll"))
+            else:
+                self.assertFalse(dst.exists())
+            self.assertFalse((p / "drive_c/windows/system32/aiss/amdvkffx64.dll").exists())
             self.assertTrue(reg_has_value((p / "system.reg").read_text(), REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
             self.assertEqual((p / "system.reg.aiss-bak").read_text(), REG_SAMPLE)
         self.assertTrue((self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll.aiss-orig").exists())
@@ -387,33 +388,44 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertEqual((sys32 / "libxess.dll").read_bytes(), b"MZ a game's own libxess")
         self.assertFalse((sys32 / "_nvngx.dll").exists())
 
-    def test_fsr4_dlls_private_subfolder_and_optional(self):
+    def test_fsr4_dll_private_subfolder_optional_and_legacy_removed(self):
         sys32 = self.pfx(self.steam, "1001") / "drive_c/windows/system32"
         aiss  = sys32 / "aiss"
-        # a bundle with both AMD DLLs (the build skips whichever it cannot find locally)
+        # a bundle with the AMD DLL (the build skips it when it cannot find it locally)
         withfsr = self.tmp / "bin_fsr4"
         withfsr.mkdir()
         for f in self.bin.iterdir():
             if f.name not in ("amdvkffx64.dll", "amdxcffx64.dll"):
                 os.symlink(f.resolve(), withfsr / f.name)
-        for amd in ("amdvkffx64.dll", "amdxcffx64.dll"):
-            if (self.bin / amd).is_file():
-                os.symlink((self.bin / amd).resolve(), withfsr / amd)
-            else:
-                (withfsr / amd).write_bytes(b"MZ stand-in for AMD " + amd.encode())
+        if (self.bin / "amdxcffx64.dll").is_file():
+            os.symlink((self.bin / "amdxcffx64.dll").resolve(), withfsr / "amdxcffx64.dll")
+        else:
+            (withfsr / "amdxcffx64.dll").write_bytes(b"MZ stand-in for AMD amdxcffx64.dll")
         # Proton's own amdxcffx64 sits in system32; ours must land in the private aiss subfolder, not shadow it
         self.put(sys32 / "amdxcffx64.dll", b"MZ proton builtin amdxcffx64 4.1.1")
         self.core = self.make_core(bin_dir=withfsr)
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
-        self.assertEqual(sha256_of(aiss / "amdvkffx64.dll"), sha256_of(withfsr / "amdvkffx64.dll"))
         self.assertEqual(sha256_of(aiss / "amdxcffx64.dll"), sha256_of(withfsr / "amdxcffx64.dll"))
         self.assertEqual((sys32 / "amdxcffx64.dll").read_bytes(), b"MZ proton builtin amdxcffx64 4.1.1")  # untouched
         self.assertTrue(self.core.bundle_info()["fsr4"])
+        # an earlier build also installed aiss/amdvkffx64.dll: removed on the next install (upgrade) ...
+        old = aiss / "amdvkffx64.dll"
+        old.write_bytes(b"MZ old amdvkffx64")
+        gs = self.core.state["games"]["1001"]
+        gs["fsr4_path"], gs["fsr4_hash"] = str(old), sha256_of(old)
+        self.assertEqual(self.core.install_game("1001")["status"], "installed")
+        self.assertFalse(old.exists())
+        self.assertNotIn("fsr4_path", self.core.state["games"]["1001"])
+        # ... and on uninstall
+        old.write_bytes(b"MZ old amdvkffx64")
+        gs = self.core.state["games"]["1001"]
+        gs["fsr4_path"], gs["fsr4_hash"] = str(old), sha256_of(old)
         self.core.uninstall_game("1001")
+        self.assertFalse(old.exists())
         self.assertFalse(aiss.exists())  # the private subfolder is removed on uninstall
         self.assertEqual((sys32 / "amdxcffx64.dll").read_bytes(), b"MZ proton builtin amdxcffx64 4.1.1")
         (sys32 / "amdxcffx64.dll").unlink()
-        # a bundle built without the AMD DLLs: not reported missing, nothing installed for them, games still "installed"
+        # a bundle built without the AMD DLL: not reported missing, nothing installed for it, games still "installed"
         nofsr = self.tmp / "bin_nofsr4"
         nofsr.mkdir()
         for f in self.bin.iterdir():
@@ -423,7 +435,7 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertEqual(self.core.bundle_missing(), [])
         self.assertFalse(self.core.bundle_info()["fsr4"])
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
-        self.assertFalse((sys32 / "aiss").exists())
+        self.assertFalse(aiss.exists())
         self.assertEqual(self.view("1001")["status"], "installed")
         self.core.uninstall_game("1001")
         self.assertFalse((sys32 / "_nvngx.dll").exists())
@@ -581,12 +593,12 @@ class FakeLibraryTests(unittest.TestCase):
             self.core.set_settings({"upscaler": 4, "fsr4_model": model})
             self.assertEqual(ctl()["_first"], f"{code} 1 2")
             self.assertEqual(ctl()["upscaler"], str(code))
-        # FSR 4 path, watermark, gpu timing and xess preset all go through the control file.
+        # watermark, gpu timing and xess preset all go through the control file; the removed fsr4_path is ignored
         self.core.set_settings({"fsr4_path": 2, "watermark": 1, "gpu_timing": 1, "xess_quality": 101})
-        self.assertEqual((ctl()["fsr4_path"], ctl()["watermark"], ctl()["gpu_timing"], ctl()["xess_quality"]),
-                         ("2", "1", "1", "101"))
-        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"fsr4_path": 3}, {"xess_quality": 99}, {"fast_math": 2},
-                    {"quality": 7}):
+        self.assertEqual((ctl()["watermark"], ctl()["gpu_timing"], ctl()["xess_quality"]), ("1", "1", "101"))
+        self.assertNotIn("fsr4_path", ctl())
+        self.assertNotIn("fsr4_path", self.core.state["settings"])
+        for bad in ({"upscaler": 5}, {"fsr4_model": 4}, {"xess_quality": 99}, {"fast_math": 2}, {"quality": 7}):
             with self.assertRaises(ValueError):
                 self.core.set_settings(bad)
         self.core.set_settings({"upscaler": 2})

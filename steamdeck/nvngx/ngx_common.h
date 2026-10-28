@@ -36,6 +36,10 @@ Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current, const Upscale
 // *fsr4Model) unless that one has failed to load, else kBackendNss.
 int SelectedBackend(int* fsr4Model);
 
+// Vulkan and D3D11 front ends: FSR 4 runs through the D3D12 interop path (NSS once that has failed).
+UpscalerCreateInfo NgxRemapInterop(const UpscalerCreateInfo& info);  // D3D11: FSR 4 through D3D12 interop (else NSS)
+UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& info);   // Vulkan: FSR 4 is unavailable -> NSS
+
 // "NSS quality 2", "XeSS", "FSR 4 Lite", ...
 const char* UpscalerName(const UpscalerCreateInfo& info);
 

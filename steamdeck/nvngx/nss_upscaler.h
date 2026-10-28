@@ -50,8 +50,21 @@ enum UpscalerBackend : int
 {
     kBackendNss  = 0,
     kBackendXess = 1,
-    kBackendFsr4 = 2,       // AMD FSR 4 on the Vulkan device (amdvkffx64.dll)
+    kBackendFsr4 = 2,       // AMD FSR 4 asked for (amdxcffx64.dll); each front end maps it to one of the two below
     kBackendFsr4Dx12 = 3,  // AMD FSR 4 natively on the game's D3D12 device (amdxcffx64.dll); only the D3D12 front end
+    kBackendFsr4Interop = 4,  // AMD FSR 4 via amdxcffx64.dll on an in-process D3D12 device (Vulkan / D3D11 games)
+};
+
+// Lets an upscaler split its work over several submissions on the front end's queue (only the D3D11 front end, which
+// submits its own command buffers): Begin() starts a command buffer, Submit() submits it, optionally waiting for and/or
+// signalling a timeline semaphore value.
+struct SplitSubmitter
+{
+    virtual VkCommandBuffer Begin() = 0;
+    virtual bool            Submit(VkSemaphore wait, uint64_t waitValue, VkSemaphore signal, uint64_t signalValue) = 0;
+
+protected:
+    ~SplitSubmitter() = default;
 };
 
 // AMD FSR 4 networks in amdvkffx64.dll. Auto lets the driver pick by GPU (Lite on Van Gogh).
@@ -90,6 +103,9 @@ public:
     virtual bool Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d) = 0;
     // Non-null only for the D3D12-native FSR 4 carrier: it runs on the game's D3D12 device, not the Vulkan one.
     virtual Fsr4Dx12* AsDx12() { return nullptr; }
+    // Split dispatch over several submissions (see SplitSubmitter); the D3D11 front end uses it when supported.
+    virtual bool SupportsSplit() const { return false; }
+    virtual bool DispatchSplit(SplitSubmitter&, const UpscalerDispatch&) { return false; }
 
     const UpscalerCreateInfo& Info() const { return m_info; }
     const VulkanDevice&       Device() const { return m_dev; }
@@ -100,13 +116,13 @@ protected:
 };
 
 // Creates the upscaler info.backend asks for; XeSS and FSR 4 fall back to NSS when their DLL is missing or fails.
+// FSR 4 here is the D3D12 interop path (Vulkan and D3D11 front ends); the D3D12 front end runs FSR 4 natively itself.
 std::unique_ptr<Upscaler> CreateUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info);
 // True once XeSS has failed to load or initialise in this process (it is not retried).
 bool XessUnavailable();
-// FSR 4 (fsr4_upscaler.cpp): nullptr when amdvkffx64.dll cannot be used or does not accept info.fsr4Model.
-std::unique_ptr<Upscaler> CreateFsr4Upscaler(const VulkanDevice& device, const UpscalerCreateInfo& info);
-// True once FSR 4 has failed for that model in this process (or for every model, when the DLL is unusable).
-bool Fsr4Unavailable(int model);
+// FSR 4 through amdxcffx64.dll on an in-process D3D12 device sharing memory with the game's VkDevice (fsr4_interop.cpp).
+std::unique_ptr<Upscaler> CreateFsr4InteropUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info);
+bool Fsr4InteropUnavailable(int model);
 
 class NssUpscaler : public Upscaler
 {

@@ -36,7 +36,6 @@ interface Game {
 interface Settings {
   upscaler: number;    // 0 NSS Quality, 1 NSS Balanced, 2 NSS Performance, 3 XeSS, 4 FSR 4
   fsr4_model: number;  // 0 Auto, 1 Lite, 2 INT8, 3 INT8 RDNA 2
-  fsr4_path: number;   // 0 Auto, 1 Vulkan DLL, 2 D3D12 native
   watermark: number;
   fast_math: number;
   xess_quality: number;
@@ -47,7 +46,7 @@ interface Settings {
 interface State {
   games: Game[];
   settings: Settings;
-  bundle: { missing: string[]; version: string; fsr4?: boolean; fsr4_dx12?: boolean };
+  bundle: { missing: string[]; version: string; fsr4?: boolean };
 }
 
 interface OpResult {
@@ -152,11 +151,6 @@ const FSR4_MODEL_OPTIONS = [
   { data: 1, label: "Lite" },
   { data: 2, label: "INT8" },
   { data: 3, label: "INT8 RDNA 2" },
-];
-const FSR4_PATH_OPTIONS = [
-  { data: 0, label: "Auto (native D3D12 where possible)" },
-  { data: 1, label: "Vulkan DLL" },
-  { data: 2, label: "D3D12 native" },
 ];
 const XESS_QUALITY_OPTIONS = [
   { data: 0, label: "Auto (from render scale)" },
@@ -311,7 +305,9 @@ function Content() {
             label="Upscaler"
             description={
               "Switches live in-game. NSS Quality: best NSS network. NSS Balanced / Performance: smaller networks, faster, more ghosting. XeSS: Intel XeSS (dynamic resolution)." +
-              (state.bundle.fsr4 ? " FSR 4: AMD's networks (pick the model and path below)." : "")
+              (state.bundle.fsr4
+                ? " FSR 4: AMD's networks through its D3D12 DLL (D3D12 and D3D11 games; Vulkan games use NSS)."
+                : "")
             }
             rgOptions={state.bundle.fsr4 ? [...UPSCALER_OPTIONS, FSR4_UPSCALER_OPTION] : UPSCALER_OPTIONS}
             selectedOption={s.upscaler >= 0 && s.upscaler <= (state.bundle.fsr4 ? 4 : 3) ? s.upscaler : 0}
@@ -329,18 +325,6 @@ function Content() {
                 selectedOption={s.fsr4_model}
                 disabled={!!busy}
                 onChange={(o) => changeSetting({ fsr4_model: o.data })}
-              />
-            </PanelSectionRow>
-            <PanelSectionRow>
-              <DropdownItem
-                label="FSR 4 path"
-                description="Native D3D12 (amdxcffx64.dll) is ~2x faster than the Vulkan DLL on D3D12 games; Vulkan and D3D11 games always use the Vulkan DLL."
-                rgOptions={
-                  state.bundle.fsr4_dx12 ? FSR4_PATH_OPTIONS : FSR4_PATH_OPTIONS.filter((o) => o.data !== 2)
-                }
-                selectedOption={s.fsr4_path}
-                disabled={!!busy}
-                onChange={(o) => changeSetting({ fsr4_path: o.data })}
               />
             </PanelSectionRow>
             <PanelSectionRow>

@@ -88,13 +88,35 @@ public:
         return m_cmd[m_slot];
     }
 
-    // Caller holds DXVK's submission queue lock.
-    VkResult Submit()
+    // Caller holds DXVK's submission queue lock. Optionally waits for / signals a timeline semaphore value.
+    VkResult Submit(VkSemaphore wait = VK_NULL_HANDLE, uint64_t waitValue = 0, VkSemaphore signal = VK_NULL_HANDLE,
+                    uint64_t signalValue = 0)
     {
         m_vkEndCommandBuffer(m_cmd[m_slot]);
-        VkSubmitInfo si       = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers    = &m_cmd[m_slot];
+        VkTimelineSemaphoreSubmitInfo ts   = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        VkSubmitInfo                  si   = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        const VkPipelineStageFlags    stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        si.commandBufferCount              = 1;
+        si.pCommandBuffers                 = &m_cmd[m_slot];
+        if (wait || signal)
+        {
+            si.pNext = &ts;
+            if (wait)
+            {
+                si.waitSemaphoreCount        = 1;
+                si.pWaitSemaphores           = &wait;
+                si.pWaitDstStageMask         = &stage;
+                ts.waitSemaphoreValueCount   = 1;
+                ts.pWaitSemaphoreValues      = &waitValue;
+            }
+            if (signal)
+            {
+                si.signalSemaphoreCount      = 1;
+                si.pSignalSemaphores         = &signal;
+                ts.signalSemaphoreValueCount = 1;
+                ts.pSignalSemaphoreValues    = &signalValue;
+            }
+        }
         return m_vkQueueSubmit(m_queue, 1, &si, m_fence[m_slot]);
     }
 
@@ -277,7 +299,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext*, 
         return NVSDK_NGX_Result_FAIL_NotInitialized;
 
     Registry().CollectGarbage();
-    auto upscaler = CreateUpscaler(g_vk, NgxCreateInfo(*NgxParams::From(params)));
+    auto upscaler = CreateUpscaler(g_vk, NgxRemapInterop(NgxCreateInfo(*NgxParams::From(params))));
     if (!upscaler)
         return NVSDK_NGX_Result_FAIL_PlatformError;
     *outHandle = NgxNewHandle(Registry().Add(std::move(upscaler)));
@@ -301,7 +323,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext*
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     Upscaler* upscaler = Registry().Get(handle->Id);
     if (upscaler)
-        upscaler = NgxApplyLiveSettings(handle->Id, upscaler);
+        upscaler = NgxApplyLiveSettings(handle->Id, upscaler, {}, NgxRemapInterop);
     if (!upscaler || !g_interop || !g_submitter)
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
 
@@ -319,6 +341,25 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext*
 
     // Everything the game recorded so far reaches the queue first; the upscale follows on the same queue.
     g_interop->FlushRenderingCommands();
+    if (upscaler->SupportsSplit())
+    {
+        // FSR 4 via D3D12 interop: copy-in submission signals a shared timeline value, the D3D12 queue upscales, the
+        // copy-out submission waits for it - all on the GPU.
+        struct Split : SplitSubmitter
+        {
+            VkCommandBuffer Begin() override { return g_submitter->Begin(); }
+            bool Submit(VkSemaphore wait, uint64_t wv, VkSemaphore signal, uint64_t sv) override
+            {
+                g_interop->LockSubmissionQueue();
+                const VkResult r = g_submitter->Submit(wait, wv, signal, sv);
+                g_interop->ReleaseSubmissionQueue();
+                if (r != VK_SUCCESS)
+                    LOGI("EvaluateFeature: vkQueueSubmit failed (%d)", r);
+                return r == VK_SUCCESS;
+            }
+        } split;
+        return upscaler->DispatchSplit(split, d) ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail;
+    }
     VkCommandBuffer cmd = g_submitter->Begin();
     const bool      ok  = NgxDispatch(upscaler, cmd, d);
     g_interop->LockSubmissionQueue();

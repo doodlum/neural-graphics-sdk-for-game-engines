@@ -1,13 +1,15 @@
 // Shared FSR 4 driver plumbing: see fsr4_common.h. The ABI facts (provider data block layout and sizes, the per-network
 // provider classes and that their device check is the third virtual function, the D3DKMT private-data offsets of family
 // and revision, the model families, MLSR-WATERMARK) were learnt from OptiScaler's FSR 4 notes, FSR4Injector's README,
-// and disassembling amdvkffx64.dll / amdxcffx64.dll; none of their code is used.
+// and disassembling AMD's FSR 4 driver DLLs; none of their code is used.
 // SPDX-License-Identifier: MIT
 #include "fsr4_common.h"
 
 #include "common.h"
 
 #include <atomic>
+#include <cctype>
+#include <string>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -158,8 +160,8 @@ HMODULE WINAPI SdkModuleLookup(LPCWSTR name)
 {
     if (name && !_wcsnicmp(name, L"amd_fidelityfx_", 15))
     {
-        // amdvkffx64 asks for amd_fidelityfx_*_vk.dll, amdxcffx64 for amd_fidelityfx_*_dx12.dll: answer each with its
-        // own DLL (same signing certificate; its file version then counts as the SDK version).
+        // amdxcffx64 asks for amd_fidelityfx_*_dx12.dll (the Vulkan driver DLL would ask for *_vk.dll): answer with the
+        // loaded DLL itself (same signing certificate; its file version then counts as the SDK version).
         for (const Redirects& r : g_redirects)
             if (r.sdkInfix && wcsstr(name, r.sdkInfix))
                 return r.module;
@@ -501,3 +503,38 @@ int Fsr4CreateWithModel(const Fsr4Driver& drv, int wanted, const Fsr4Gpu& gpu, v
          Fsr4ModelName(wanted), native.empty() ? "none" : native.c_str());
     return accepted;
 }
+
+// ---- model names (also used by the logs and the control-file / env parsing) ----------------------------------------
+const char* Fsr4ModelName(int model)
+{
+    switch (model)
+    {
+    case kFsr4Auto: return "auto";
+    case kFsr4Lite: return "Lite";
+    case kFsr4Int8: return "INT8";
+    case kFsr4Rdna2: return "INT8 RDNA 2";
+    case kFsr4Fp8: return "FP8";
+    default: return "?";
+    }
+}
+
+int Fsr4ModelFromName(const char* name)
+{
+    if (!name)
+        return -1;
+    std::string s(name);
+    for (char& c : s)
+        c = char(tolower(c));
+    if (s == "auto" || s.empty())
+        return kFsr4Auto;
+    if (s == "lite" || s == "int8lite" || s == "int8-lite")
+        return kFsr4Lite;
+    if (s == "int8")
+        return kFsr4Int8;
+    if (s == "rdna2" || s == "navi2" || s == "int8-rdna2" || s == "int8rdna2")
+        return kFsr4Rdna2;
+    if (s == "fp8")
+        return kFsr4Fp8;
+    return -1;
+}
+

@@ -75,25 +75,20 @@ private:
     std::unique_ptr<Fsr4Dx12> m_fsr4;
 };
 
-// The FSR 4 path for D3D12: native (amdxcffx64) by default. The live control-file value (fsr4_path: 0 auto, 1 vk,
-// 2 dx12) wins, else AISS_FSR4_PATH=vk|dx12|auto. "auto" and "dx12" both prefer native on D3D12.
-bool Fsr4PreferDx12()
-{
-    const int live = LiveFsr4Path();
-    if (live >= 0)
-        return live != 1;  // 1 = Vulkan DLL; 0 (auto) and 2 (dx12) prefer native on D3D12
-    const char* v = getenv("AISS_FSR4_PATH");
-    if (v && (!strcmp(v, "vk") || !strcmp(v, "vulkan")))
-        return false;
-    return true;
-}
-
-// Picks the native FSR 4 backend on D3D12 when the DLL can run there; otherwise leaves the Vulkan FSR 4 backend.
+// D3D12 games run FSR 4 natively on their own device (amdxcffx64); once that has failed, NSS.
 UpscalerCreateInfo RemapD3D12(const UpscalerCreateInfo& in)
 {
     UpscalerCreateInfo info = in;
-    if (info.backend == kBackendFsr4 && Fsr4PreferDx12() && !Fsr4Dx12Unavailable(info.fsr4Model))
-        info.backend = kBackendFsr4Dx12;
+    if (info.backend == kBackendFsr4)
+    {
+        if (Fsr4Dx12Unavailable(info.fsr4Model))
+        {
+            info.backend   = kBackendNss;
+            info.fsr4Model = kFsr4Auto;
+        }
+        else
+            info.backend = kBackendFsr4Dx12;
+    }
     return info;
 }
 
@@ -105,10 +100,11 @@ std::unique_ptr<Upscaler> CreateD3D12Upscaler(const UpscalerCreateInfo& info, ui
     {
         if (auto c = Dx12Carrier::Create(g_vk, info, g_device, outW, outH))
             return c;
-        LOGI("FSR 4 DX12 (%s) unavailable; trying the Vulkan path", Fsr4ModelName(info.fsr4Model));
-        UpscalerCreateInfo vk = info;
-        vk.backend            = kBackendFsr4;
-        return CreateUpscaler(g_vk, vk);
+        LOGI("FSR 4 DX12 (%s) unavailable; falling back to NSS", Fsr4ModelName(info.fsr4Model));
+        UpscalerCreateInfo nss = info;
+        nss.backend            = kBackendNss;
+        nss.fsr4Model          = kFsr4Auto;
+        return CreateUpscaler(g_vk, nss);
     }
     return CreateUpscaler(g_vk, info);
 }

@@ -258,7 +258,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_CreateFeature1(VkDevice, VkCommandB
         return NVSDK_NGX_Result_FAIL_NotInitialized;
 
     Registry().CollectGarbage();
-    auto upscaler = CreateUpscaler(g_vk, NgxCreateInfo(*NgxParams::From(params)));
+    auto upscaler = CreateUpscaler(g_vk, NgxRemapVulkan(NgxCreateInfo(*NgxParams::From(params))));
     if (!upscaler)
         return NVSDK_NGX_Result_FAIL_PlatformError;
     *outHandle = NgxNewHandle(Registry().Add(std::move(upscaler)));
@@ -290,7 +290,7 @@ NGX_EXPORT NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer cmd
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     Upscaler* upscaler = Registry().Get(handle->Id);
     if (upscaler)
-        upscaler = NgxApplyLiveSettings(handle->Id, upscaler);
+        upscaler = NgxApplyLiveSettings(handle->Id, upscaler, {}, NgxRemapVulkan);
     if (!upscaler)
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
 

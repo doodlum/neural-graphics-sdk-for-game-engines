@@ -46,8 +46,7 @@ add_library(nvngx SHARED
     xess_upscaler.cpp
     fsr4_common.cpp
     fsr4_dx12.cpp
-    fsr4_upscaler.cpp
-    spirv_half_images.cpp
+    fsr4_interop.cpp
     frame_dump.cpp
     gpu_timing.cpp
     "${SPV_INC}"

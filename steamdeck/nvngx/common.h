@@ -33,7 +33,7 @@ struct ProxyConfig
     bool  fastMath;         // FFX_ML_RESCALE_FLOAT set at launch: fp32 requantisation in the ML graph (not bit exact)
     bool  xess;             // AISS_UPSCALER=xess: Intel XeSS (libxess.dll next to the proxy) instead of NSS
     int   xessQuality;      // AISS_XESS_QUALITY: xess_quality_settings_t (100-105), 0 = from the render scale
-    int   fsr4Model;        // AISS_UPSCALER=fsr4: AMD FSR 4 (amdvkffx64.dll next to the proxy), Fsr4Model from
+    int   fsr4Model;        // AISS_UPSCALER=fsr4: AMD FSR 4 (amdxcffx64.dll in the aiss folder next to the proxy), Fsr4Model from
                             // AISS_FSR4_MODEL (auto, lite, int8, rdna2, fp8); -1 when FSR 4 is not asked for
     int   gpuTiming;        // AISS_GPU_TIMING=N: log the GPU time of the upscale, averaged over N evaluations
 };
@@ -57,7 +57,6 @@ int LiveFastMath();
 // asks the proxy to save the next few frames' inputs. -1 when absent.
 int LiveCaptureRequest();
 // Further control-file keys (key=value lines the plugin writes), each -1 when absent so the launch option / env wins.
-int LiveFsr4Path();     // 0 auto, 1 Vulkan DLL, 2 D3D12 native
 int LiveWatermark();    // 0 off, 1 on (AMD's FSR 4 banner)
 int LiveGpuTiming();    // 0 off, 1 on (log the GPU time of each upscale)
 int LiveXessQuality();  // xess_quality_settings_t, 0 = from the render scale

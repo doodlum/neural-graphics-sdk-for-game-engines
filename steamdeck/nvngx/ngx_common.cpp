@@ -3,6 +3,8 @@
 
 #include "common.h"
 
+bool Fsr4Dx12Unavailable(int model);  // fsr4_dx12.cpp (its header needs d3d12.h)
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -136,8 +138,14 @@ int SelectedBackend(int* fsr4Model)
         backend = kBackendXess;
     if (backend == kBackendXess && XessUnavailable())
         backend = kBackendNss;
-    if (backend == kBackendFsr4 && Fsr4Unavailable(model))
+    if (backend == kBackendFsr4 && Fsr4Dx12Unavailable(model))  // amdxcffx64 missing / not 4.1.2 / refuses the model
+    {
+        static bool logged = false;
+        if (!logged)
+            LOGI("FSR 4 (%s) unavailable (amdxcffx64.dll); using NSS", Fsr4ModelName(model));
+        logged  = true;
         backend = kBackendNss;
+    }
     if (fsr4Model)
         *fsr4Model = backend == kBackendFsr4 ? model : kFsr4Auto;
     return backend;
@@ -148,15 +156,49 @@ const char* UpscalerName(const UpscalerCreateInfo& i)
     static thread_local char text[64];
     if (i.backend == kBackendXess)
         snprintf(text, sizeof(text), "XeSS");
-    else if (i.backend == kBackendFsr4 || i.backend == kBackendFsr4Dx12)
+    else if (i.backend == kBackendFsr4 || i.backend == kBackendFsr4Dx12 || i.backend == kBackendFsr4Interop)
         snprintf(text, sizeof(text), "FSR 4 %s%s%s%s%s", Fsr4ModelName(i.fsr4Model),
                  i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? " (" : "",
                  i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? Fsr4ModelName(i.fsr4Active) : "",
                  i.fsr4Model == kFsr4Auto && i.fsr4Active > 0 ? ")" : "",
-                 i.backend == kBackendFsr4Dx12 ? " DX12" : "");
+                 i.backend == kBackendFsr4Dx12 ? " DX12" : i.backend == kBackendFsr4Interop ? " DX12 interop" : "");
     else
         snprintf(text, sizeof(text), "NSS quality %d%s", i.nssQuality, i.fastMath ? " fast maths" : "");
     return text;
+}
+
+UpscalerCreateInfo NgxRemapInterop(const UpscalerCreateInfo& in)
+{
+    // D3D11 games run FSR 4 through the D3D12 interop path; once it has failed, NSS.
+    UpscalerCreateInfo info = in;
+    if (info.backend == kBackendFsr4)
+    {
+        if (Fsr4InteropUnavailable(info.fsr4Model))
+        {
+            info.backend   = kBackendNss;
+            info.fsr4Model = kFsr4Auto;
+        }
+        else
+            info.backend = kBackendFsr4Interop;
+    }
+    return info;
+}
+
+UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& in)
+{
+    // FSR 4 runs only through amdxcffx64 (D3D12); Vulkan games cannot hand it frames (see fsr4_interop.cpp): NSS.
+    UpscalerCreateInfo info = in;
+    if (info.backend == kBackendFsr4)
+    {
+        static bool logged = false;
+        if (!logged)
+            LOGI("FSR 4 is not available for Vulkan games (NGX gives the proxy only the game's command buffer, and "
+                 "handing a frame to the D3D12 FSR 4 inside it stalls; see fsr4_interop.cpp); using NSS");
+        logged         = true;
+        info.backend   = kBackendNss;
+        info.fsr4Model = kFsr4Auto;
+    }
+    return info;
 }
 
 static bool SameLiveSettings(const UpscalerCreateInfo& a, const UpscalerCreateInfo& b)
@@ -165,7 +207,7 @@ static bool SameLiveSettings(const UpscalerCreateInfo& a, const UpscalerCreateIn
         return false;
     if (a.backend == kBackendXess)
         return true;
-    if (a.backend == kBackendFsr4 || a.backend == kBackendFsr4Dx12)
+    if (a.backend == kBackendFsr4 || a.backend == kBackendFsr4Dx12 || a.backend == kBackendFsr4Interop)
         return a.fsr4Model == b.fsr4Model;
     return a.nssQuality == b.nssQuality && a.fastMath == b.fastMath;
 }

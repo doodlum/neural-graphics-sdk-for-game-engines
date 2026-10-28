@@ -337,11 +337,11 @@ bool XessUnavailable()
 
 std::unique_ptr<Upscaler> CreateUpscaler(const VulkanDevice& device, const UpscalerCreateInfo& info)
 {
-    if (info.backend == kBackendFsr4)
+    if (info.backend == kBackendFsr4Interop || info.backend == kBackendFsr4)
     {
-        if (auto fsr4 = CreateFsr4Upscaler(device, info))
-            return fsr4;
-        LOGI("FSR 4 (%s) unavailable; falling back to NSS", Fsr4ModelName(info.fsr4Model));
+        if (auto interop = CreateFsr4InteropUpscaler(device, info))
+            return interop;
+        LOGI("FSR 4 (%s) through D3D12 interop unavailable; falling back to NSS", Fsr4ModelName(info.fsr4Model));
     }
     if (info.backend == kBackendXess)
     {
