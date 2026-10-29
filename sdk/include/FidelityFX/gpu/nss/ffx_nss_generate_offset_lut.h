@@ -176,63 +176,14 @@ void StoreLutRow(int32_t tile_x, int32_t tile_y, uint32_t packed_taps[kPackedTap
 }
 
 #if NSS_FILTER_MODE == 2
-// Dense (QUALITY) LUT in separable form. Whether a candidate tap is valid and its low-res offset depend on x and y
-// independently (LoadBaseLutSample / PackTap are per axis), and the candidate order is fixed. So instead of
-// T_W x T_H tiles of 9 packed taps (3 rgba32ui texels each), the LUT holds one texel per x tile (row 0) and one per
-// y tile (row 1):
-//   .x  int8 lr offsets for axis offsets d = -2..1 (byte d + 2)
-//   .y  int8 lr offsets for d = 2..3 (bytes 0..1), bits 16..21: validity of d = -2..3
-//   .zw 36-bit mask over the candidate ranks: bit r set when this axis' component of candidate r is valid
-// Rows 2..65 hold the selection table: texel (x_valid, 2 + y_valid) for the 6-bit validity patterns of the two axes
-// lists the selected taps (at most 9, candidate order) as 6-bit (x index | y index << 3) codes, taps 0..4 in .x and
-// 5..8 in .y bits 0..23, the tap count in .y bits 24..27. lut_idx >= T_W + T_H fills it.
-// The postprocess either ANDs the x and y rank masks and takes the first 9 set ranks, or (compute path) looks the
-// taps up in the selection table; both reproduce the packed taps of the per-tile LUT exactly (same arithmetic per
-// axis, integer combination only). lut_idx < T_W: x tile, then y tiles, then the table.
-void GenerateOffsetLutAxis(int32_t lut_idx)
+const int32_t kDenseKpnChannels  = 36;
+const int32_t kDenseAxisTableRow = 2 + 64;  // after rows 0/1 (tiles) and 2..65 (selection table)
+
+// Row 0/1 texel of x tile / y tile t (see GenerateOffsetLutAxis).
+uint32_t4 DenseAxisTexel(bool y_axis, int32_t t)
 {
     int32_t idx_mod_x = max(IndexModulo().x, int32_t(1));
     int32_t idx_mod_y = max(IndexModulo().y, int32_t(1));
-    if (lut_idx >= idx_mod_x + idx_mod_y)
-    {
-        int32_t e = lut_idx - (idx_mod_x + idx_mod_y);
-        if (e >= int32_t(4096))
-        {
-            return;
-        }
-        uint32_t x_valid = uint32_t(e & int32_t(63));
-        uint32_t y_valid = uint32_t(e >> int32_t(6));
-        uint32_t lo      = uint32_t(0);
-        uint32_t hi      = uint32_t(0);
-        int32_t  count   = int32_t(0);
-        for (int32_t r = int32_t(0); r < kCandidateCount && count < kPackedTapCount; ++r)
-        {
-            int32_t ix = kCandidateOffsetYx[r].y + int32_t(2);
-            int32_t iy = kCandidateOffsetYx[r].x + int32_t(2);
-            if (((x_valid >> uint32_t(ix)) & (y_valid >> uint32_t(iy)) & uint32_t(1)) != uint32_t(0))
-            {
-                uint32_t code = uint32_t(ix | (iy << int32_t(3)));
-                if (count < int32_t(5))
-                {
-                    lo |= code << uint32_t(6 * count);
-                }
-                else
-                {
-                    hi |= code << uint32_t(6 * (count - 5));
-                }
-                ++count;
-            }
-        }
-        imageStore(rw_offset_lut, int32_t2(int32_t(x_valid), int32_t(2) + int32_t(y_valid)), uint32_t4(lo, hi | (uint32_t(count) << uint32_t(24)), 0, 0));
-        return;
-    }
-    bool    y_axis    = lut_idx >= idx_mod_x;
-    int32_t t         = y_axis ? lut_idx - idx_mod_x : lut_idx;
-    if (y_axis && t >= idx_mod_y)
-    {
-        return;
-    }
-
     int32_t modulo    = y_axis ? idx_mod_y : idx_mod_x;
     int32_t in_modulo = y_axis ? ReducedInputModulo().y : ReducedInputModulo().x;
     float   scale     = y_axis ? Scale().y : Scale().x;
@@ -285,7 +236,121 @@ void GenerateOffsetLutAxis(int32_t lut_idx)
             }
         }
     }
-    imageStore(rw_offset_lut, int32_t2(t, y_axis ? 1 : 0), uint32_t4(offsets_lo, offsets_hi | (valid_bits << uint32_t(16)), rank_lo, rank_hi));
+    return uint32_t4(offsets_lo, offsets_hi | (valid_bits << uint32_t(16)), rank_lo, rank_hi);
+}
+
+void GenerateDenseAxisTable(int32_t e);
+
+// Dense (QUALITY) LUT in separable form. Whether a candidate tap is valid and its low-res offset depend on x and y
+// independently (LoadBaseLutSample / PackTap are per axis), and the candidate order is fixed. So instead of
+// T_W x T_H tiles of 9 packed taps (3 rgba32ui texels each), the LUT holds one texel per x tile (row 0) and one per
+// y tile (row 1):
+//   .x  int8 lr offsets for axis offsets d = -2..1 (byte d + 2)
+//   .y  int8 lr offsets for d = 2..3 (bytes 0..1), bits 16..21: validity of d = -2..3
+//   .zw 36-bit mask over the candidate ranks: bit r set when this axis' component of candidate r is valid
+// Rows 2..65 hold the selection table: texel (x_valid, 2 + y_valid) for the 6-bit validity patterns of the two axes
+// lists the selected taps (at most 9, candidate order) as 6-bit (x index | y index << 3) codes, taps 0..4 in .x and
+// 5..8 in .y bits 0..23, the tap count in .y bits 24..27. lut_idx >= T_W + T_H fills it.
+// The postprocess either ANDs the x and y rank masks and takes the first 9 set ranks, or (compute path) looks the
+// taps up in the selection table; both reproduce the packed taps of the per-tile LUT exactly (same arithmetic per
+// axis, integer combination only). lut_idx < T_W: x tile, then y tiles, then the table.
+void GenerateOffsetLutAxis(int32_t lut_idx)
+{
+    int32_t idx_mod_x = max(IndexModulo().x, int32_t(1));
+    int32_t idx_mod_y = max(IndexModulo().y, int32_t(1));
+    if (lut_idx >= idx_mod_x + idx_mod_y)
+    {
+        int32_t e = lut_idx - (idx_mod_x + idx_mod_y);
+        if (e >= int32_t(4096))
+        {
+            GenerateDenseAxisTable(e - int32_t(4096));
+            return;
+        }
+        uint32_t x_valid = uint32_t(e & int32_t(63));
+        uint32_t y_valid = uint32_t(e >> int32_t(6));
+        uint32_t lo      = uint32_t(0);
+        uint32_t hi      = uint32_t(0);
+        int32_t  count   = int32_t(0);
+        for (int32_t r = int32_t(0); r < kCandidateCount && count < kPackedTapCount; ++r)
+        {
+            int32_t ix = kCandidateOffsetYx[r].y + int32_t(2);
+            int32_t iy = kCandidateOffsetYx[r].x + int32_t(2);
+            if (((x_valid >> uint32_t(ix)) & (y_valid >> uint32_t(iy)) & uint32_t(1)) != uint32_t(0))
+            {
+                uint32_t code = uint32_t(ix | (iy << int32_t(3)));
+                if (count < int32_t(5))
+                {
+                    lo |= code << uint32_t(6 * count);
+                }
+                else
+                {
+                    hi |= code << uint32_t(6 * (count - 5));
+                }
+                ++count;
+            }
+        }
+        imageStore(rw_offset_lut, int32_t2(int32_t(x_valid), int32_t(2) + int32_t(y_valid)), uint32_t4(lo, hi | (uint32_t(count) << uint32_t(24)), 0, 0));
+        return;
+    }
+    bool    y_axis    = lut_idx >= idx_mod_x;
+    int32_t t         = y_axis ? lut_idx - idx_mod_x : lut_idx;
+    if (y_axis && t >= idx_mod_y)
+    {
+        return;
+    }
+    imageStore(rw_offset_lut, int32_t2(t, y_axis ? 1 : 0), DenseAxisTexel(y_axis, t));
+}
+
+// Per output column (rows kDenseAxisTableRow + 0..3, x = column) and per output row (rows kDenseAxisTableRow + 4..7,
+// x = row): the postprocess' per-line axis table (ffx_nss_postprocess.h, NSS_POSTPROCESS_AXIS_LDS), computed here once
+// per frame instead of by every workgroup. Same arithmetic as the postprocess used: PackedOffsetLutTile,
+// floor(px * InvScale), the line's tile texel (DenseAxisTexel, as stored in row 0/1), the clamp and KPN mapping
+// (KpnCoordForDenseFilter = min(lr >> 2, kpn_dim - 1), NSS_KPN_SCALE_QUARTER), component by component.
+// Texels 0..2: (lr, kpn byte offset) pairs for the axis offsets d = -2..3; texel 3 .x: the 6-bit validity.
+// The kpn byte offset is 36 * kpn_x + 6 * i for columns and 36 * kpn_w * kpn_y + i for rows.
+void GenerateDenseAxisTable(int32_t e)
+{
+    int32_t2 out_dims = cbNSS._OutputDims;
+    bool     y_axis   = e >= out_dims.x;
+    int32_t  p        = y_axis ? e - out_dims.x : e;
+    if (y_axis && p >= out_dims.y)
+    {
+        return;
+    }
+    int32_t2 modulo2 = max(IndexModulo(), int32_t2(1));
+    int32_t2 p2      = int32_t2(p);
+    int32_t2 tile2;
+    if (all(lessThan(out_dims, int32_t2(1 << 20))))
+    {
+        int32_t2 q = int32_t2(floor((float2(p2) + float2(0.5)) * (float2(1.0) / float2(modulo2))));
+        tile2      = p2 - q * modulo2;
+    }
+    else
+    {
+        tile2 = p2 % modulo2;
+    }
+    int32_t2  lr_base2 = int32_t2(floor(float2(p2) * InvScale()));
+    int32_t   tile     = y_axis ? tile2.y : tile2.x;
+    int32_t   lr_base  = y_axis ? lr_base2.y : lr_base2.x;
+    int32_t   cmax     = y_axis ? cbNSS._InputDims.y - int32_t(1) : cbNSS._InputDims.x - int32_t(1);
+    int32_t   kpn_dim  = y_axis ? KpnDims().y : KpnDims().x;
+    int32_t   kpn_mul  = y_axis ? KpnDims().x * kDenseKpnChannels : kDenseKpnChannels;
+    int32_t   ch_mul   = y_axis ? int32_t(1) : int32_t(6);
+    uint32_t4 axis     = DenseAxisTexel(y_axis, tile);
+    int32_t   row      = kDenseAxisTableRow + (y_axis ? int32_t(4) : int32_t(0));
+    uint32_t  entry[12];
+    for (int32_t i = 0; i < 6; ++i)
+    {
+        int32_t offset = bitfieldExtract(int32_t(i < int32_t(4) ? axis.x : axis.y), (i & int32_t(3)) * int32_t(8), int32_t(8));
+        int32_t lr     = clamp(lr_base + offset, int32_t(0), cmax);
+        int32_t kpn    = clamp(min(lr >> int32_t(2), kpn_dim - int32_t(1)), int32_t(0), kpn_dim - int32_t(1));
+        entry[2 * i]     = uint32_t(lr);
+        entry[2 * i + 1] = uint32_t(kpn * kpn_mul + i * ch_mul);
+    }
+    imageStore(rw_offset_lut, int32_t2(p, row + 0), uint32_t4(entry[0], entry[1], entry[2], entry[3]));
+    imageStore(rw_offset_lut, int32_t2(p, row + 1), uint32_t4(entry[4], entry[5], entry[6], entry[7]));
+    imageStore(rw_offset_lut, int32_t2(p, row + 2), uint32_t4(entry[8], entry[9], entry[10], entry[11]));
+    imageStore(rw_offset_lut, int32_t2(p, row + 3), uint32_t4((axis.y >> uint32_t(16)) & uint32_t(63), 0, 0, 0));
 }
 #endif  // NSS_FILTER_MODE == 2
 

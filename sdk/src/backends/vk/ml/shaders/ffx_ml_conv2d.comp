@@ -271,7 +271,8 @@ int OC_PARAM_STRIDE()
 
 #if ML_DOT4_TILED
 // The 256-entry TABLE is copied to shared memory once per workgroup (one SSBO load per output value otherwise), one
-// sign-extended entry per word, so a lookup is a single LDS read (the + 128 folds into its offset).
+// entry per word holding the entry's byte (0..255, the int8 value's two's complement byte), so a lookup is a single LDS
+// read and the result packs into the output word without masking (EpilogueByte).
 shared int sTable[256];
 #endif
 
@@ -279,7 +280,7 @@ int TableLookup(int v)
 {
     int index = v + 128;
 #if ML_DOT4_TILED
-    return sTable[index];
+    return bitfieldExtract(sTable[index], 0, 8);
 #else
     int word  = params[3 * OC_PARAM_STRIDE() + (index >> 2)];
     return bitfieldExtract(word, (index & 3) * 8, 8);
@@ -324,6 +325,7 @@ int EpilogueBiased(int acc, int oc)
         v = TableLookup(v);
     return v;
 }
+
 #endif
 
 #if ML_DOT4_TILED
@@ -339,6 +341,29 @@ int EpilogueFloat(int acc, int oc)
     if ((FLAGS & FLAG_TABLE) != 0)
         v = TableLookup(v);
     return v;
+}
+
+// The output value as its stored byte, biased: without a TABLE, u = v + 128 (0..255; the packed word is XORed with
+// 0x80808080 afterwards, since (v + 128) ^ 0x80 == v & 0xFF for v in [-128, 127]); with a TABLE, the table entry's byte.
+// With SCALE_HI_ONLY the + 128 folds into the rounding constant like the zero point: ((x + (zp << k)) >> k) + 128 ==
+// (x + ((zp + 128) << k)) >> k, then clamp to [0, 255] == clamp(v, -128, 127) + 128. The bytes are then packed with
+// shifts and ORs, without per-byte masks.
+uint EpilogueByte(int acc, int oc)
+{
+    if (SCALE_HI_ONLY == 0 || SCALE_FLOAT != 0)
+    {
+        const int v = SCALE_FLOAT != 0 ? EpilogueFloat(acc, oc) : Epilogue(acc, oc);
+        return (FLAGS & FLAG_TABLE) != 0 ? uint(v) & 0xFFu : uint(v + 128);
+    }
+    int pIndex     = ((FLAGS & FLAG_PER_CHANNEL) != 0) ? oc : 0;
+    int multiplier = params[OC_PARAM_STRIDE() + pIndex];
+    int shift      = params[2 * OC_PARAM_STRIDE() + pIndex];
+    int hi, lo;
+    imulExtended(acc - RESCALE_IN_ZP, multiplier, hi, lo);
+    int u = clamp((hi + ((1 << (shift - 33)) + ((RESCALE_OUT_ZP + 128) << (shift - 32)))) >> (shift - 32), 0, 255);
+    if ((FLAGS & FLAG_TABLE) != 0)
+        return uint(sTable[u]);
+    return uint(u);
 }
 #endif
 
@@ -553,7 +578,7 @@ void main()
     if ((FLAGS & FLAG_TABLE) != 0)
     {
         for (uint i = gl_LocalInvocationIndex; i < 256u; i += WG_SIZE * WG_Y * uint(KSPLIT))
-            sTable[i] = bitfieldExtract(params[3 * OC_PARAM_STRIDE() + int(i >> 2)], int(i & 3u) * 8, 8);
+            sTable[i] = int(bitfieldExtract(uint(params[3 * OC_PARAM_STRIDE() + int(i >> 2)]), int(i & 3u) * 8, 8));
         barrier();
     }
 
@@ -567,7 +592,7 @@ void main()
     const int wBlockBase = ocBlock * (KERNEL_H * KERNEL_W * IC_WORDS * OCB);
     const int s0Words    = S0_C / 4;
 
-    for (int ky = 0; ky < KERNEL_H; ++ky)
+    [[unroll]] for (int ky = 0; ky < KERNEL_H; ++ky)
     {
         const int  vy      = cy * STRIDE_Y - PAD_TOP + ky * DILATION_Y;
         const bool rowOk   = vy >= 0 && vy < IN_H;
@@ -585,14 +610,17 @@ void main()
             const int vxc = clamp(vx, 0, IN_W - 1);
             valid[j]      = rowOk && vx >= 0 && vx < IN_W;
             const int sx0 = S0_RESIZE != 0 ? NearestCoord(vxc, S0_SCALE_X_N, S0_SCALE_X_D, S0_OFFSET_X, S0_W) : vxc;
-            base0[j]      = ((sy0 * S0_W + sx0) * S0_STRIDE) >> 2;
+            // Strides are multiples of 4: ((sy * W + sx) * S) >> 2 == sy * (W * S / 4) + sx * (S / 4). Row and column
+            // are clamped, so each product has a known small range (24-bit multiplies or shifts instead of the
+            // quarter-rate 32-bit multiply of the sum).
+            base0[j]      = sy0 * (S0_W * (S0_STRIDE >> 2)) + sx0 * (S0_STRIDE >> 2);
             // Padding taps read the zero-point pixel instead of selecting the zero point per word (one select per column).
             if (S0_ZP_PIXEL != 0)
                 base0[j] = valid[j] ? base0[j] : ((S0_H * S0_W * S0_STRIDE) >> 2);
             if (NUM_SOURCES > 1)
             {
                 const int sx1 = S1_RESIZE != 0 ? NearestCoord(vxc, S1_SCALE_X_N, S1_SCALE_X_D, S1_OFFSET_X, S1_W) : vxc;
-                base1[j]      = ((sy1 * S1_W + sx1) * S1_STRIDE) >> 2;
+                base1[j]      = sy1 * (S1_W * (S1_STRIDE >> 2)) + sx1 * (S1_STRIDE >> 2);
                 if (S1_ZP_PIXEL != 0)
                     base1[j] = valid[j] ? base1[j] : ((S1_H * S1_W * S1_STRIDE) >> 2);
             }
@@ -612,7 +640,7 @@ void main()
             [[unroll]] for (int j = 0; j < COLS; ++j)
                 xn[j] = src0[base0[j] + min(kp, s0Words - 1)];
         }
-        for (int w = kp; w < s0Words; w += KSPLIT)
+        [[unroll]] for (int w = kp; w < s0Words; w += KSPLIT)
         {
             uint x[COLS];
             [[unroll]] for (int j = 0; j < COLS; ++j)
@@ -627,7 +655,7 @@ void main()
             const int w1 = s0Words + ((kp - s0Words) & (KSPLIT - 1));  // first word >= s0Words with w = kp (mod KSPLIT)
             [[unroll]] for (int j = 0; j < COLS; ++j)
                 xn[j] = src1[base1[j] + min(w1, s1End - 1) - s0Words];
-            for (int w = w1; w < s1End; w += KSPLIT)
+            [[unroll]] for (int w = w1; w < s1End; w += KSPLIT)
             {
                 uint x[COLS];
                 [[unroll]] for (int j = 0; j < COLS; ++j)
@@ -675,13 +703,18 @@ void main()
         const int ox  = ox0 + p;
         if ((OC_FULL == 0 && oc >= OUT_C) || ox >= OUT_W)
             continue;
-        ivec4 r = ivec4(0);
+        // Biased bytes (EpilogueByte); padded channels hold byte 0x80 (value 0) like before, after the XOR.
+        const uint pad = (FLAGS & FLAG_TABLE) != 0 ? 0u : 0x80u;
+        uvec4      u   = uvec4(pad);
         [[unroll]] for (int j = 0; j < 4; ++j)
         {
             if (OC_FULL != 0 || oc + j < OUT_C)
-                r[j] = SCALE_FLOAT != 0 ? EpilogueFloat(fin[q * 4 + j], oc + j) : EpilogueBiased(fin[q * 4 + j] + (biasInAcc ? 0 : params[oc + j]), oc + j);
+                u[j] = EpilogueByte(fin[q * 4 + j] + ((biasInAcc || SCALE_FLOAT != 0) ? 0 : params[oc + j]), oc + j);
         }
-        dst[((oy * OUT_W + ox) * OUT_STRIDE + oc) >> 2] = PackResult(r);
+        uint word = u.x | (u.y << 8) | (u.z << 16) | (u.w << 24);
+        if ((FLAGS & FLAG_TABLE) == 0)
+            word ^= 0x80808080u;
+        dst[((oy * OUT_W + ox) * OUT_STRIDE + oc) >> 2] = word;
     }
 }
 

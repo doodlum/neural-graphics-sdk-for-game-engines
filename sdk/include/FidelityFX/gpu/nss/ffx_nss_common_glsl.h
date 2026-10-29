@@ -140,6 +140,11 @@ layout(set = 0, binding = NSS_BIND_CB_NSS, std140) uniform cbNSS_t
 
     int32_t2 _ReducedInputModulo;  // 8 B reduced input denominator, xy order
     int32_t2 _LutOffset;           // 8 B jitter tile offset, xy order
+
+    // Uniform values the postprocess used to convert / multiply per lane (no scalar float ALU on RDNA2); the host
+    // computes them with the same single fp32 operations.
+    float2 _OutputDimsF;    // 8 B float(_OutputDims), exact
+    float2 _PaddedUvScale;  // 8 B float(preprocess dims) * _InputTensorSizeRcp (one fp32 multiply)
 }
 cbNSS;
 

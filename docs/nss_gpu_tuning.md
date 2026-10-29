@@ -442,6 +442,84 @@ Floors and ideas left:
   (not done, outside QUALITY).
 - Preprocess and depth scatter unchanged (at the memory floor, see round 2).
 
+### Full network (QUALITY), Steam Deck, round 4
+
+Items from an RDNA2 ISA audit of the round-3 build (ACO IR from `RADV_DEBUG=shaders,shaderstats`). Interleaved runs of
+`steamdeck` 0231fae (which already has the R11G11B10 round-to-nearest history store) and this round (us, 1500-frame
+medians, 4 alternating runs averaged, 1280x800 output; the third column pair is the in-game Forza Horizon 6 case,
+640x392 -> 1280x785, which runs the general-ratio postprocess because 785 is odd):
+
+| Pass | 640x400 before | 640x400 after | 853x533 before | 853x533 after | 640x392 -> 1280x785 before | after |
+| --- | --- | --- | --- | --- | --- | --- |
+| Depth scatter | 32 | 32 | 63 | 62 | 31 | 31 |
+| Preprocess | 246 | **237** | 436 | **421** | 240 | **234** |
+| ML graph (high) | 1344 | **1307** | 2369 | **2279** | 1339 | **1322** |
+| Dynamic offset LUT | - | - | 0.1 | 0.1 | 0.1 | 0.1 |
+| Postprocess | 587 | **576** | 850 | **744** | 830 | **728** |
+| Total | 2219 | **2157** (-2.8%) | 3725 | **3510** (-5.8%) | 2444 | **2319** (-5.1%) |
+
+BALANCED/PERFORMANCE (mid_low graph, sparse postprocess; 3 alternating runs): BALANCED 640x400 total 1195 -> 1169 us
+(graph 411 -> 402, postprocess 572 -> 557), BALANCED 742x464 1590 -> 1574, PERFORMANCE 640x400 1052 -> 1032 (graph
+406 -> 398, postprocess 437 -> 424), PERFORMANCE 742x464 1435 -> 1413.
+
+All bit exact: replay suite (quality 0/1/2, 13 configs) ALL IDENTICAL against a baseline saved from 0231fae; 49 more
+replay hashes identical (QUALITY at 640x400, 720x450, 742x464, 853x533, 960x600, 1000x700, 1066x666 -> 1280x800 and
+640x392, 853x523, 427x262 -> 1280x785, HDR off and on, 64 frames; BALANCED/PERFORMANCE at 640x400, 853x533, 1000x700
+and 640x392 -> 1280x785; odd and small sizes 321x201 -> 642x402, 641x401 -> 1282x802, 400x250 -> 800x500, 640x360 ->
+1280x720, 427x241 -> 640x360, 641x392 and 640x393 -> 1280x785 at all three qualities); `ffx_ml_runtime_test` EXACT on
+every path at 960x544, 864x544, 752x464, 640x400 and 128x128 (and the high model at 856x536; mid_low cannot run at that
+size, before or after); the in-app gate (`ngx_d3d11_test` replay of `ext_new`, frames 300-307 x 4 loops) still
+286589727ac82574175c033bfc6ff869, and the D3D12 harness on the 853x533 -> 1280x800 FH6-like dumps (mode-2
+postprocess through vkd3d-proton) gives the same md5 with the 0231fae and the round-4 `nvngx.dll`. The fp32
+requantisation experiment (`FFX_ML_RESCALE_FLOAT=1`) also gives the same hash as before.
+
+What worked (each A/B is the previous row's build vs this change, us):
+
+| Change | Effect |
+| --- | --- |
+| Mode-2 postprocess, per-tap KPN addressing: the KPN tensor is `[y][x][36]` int8, so a tap's byte address is `(36 * kpn_x + 6 * ix) + (36 * kpn_w * kpn_y + iy)`. The axis tables hold that x part and y part next to the LR coordinate as `int2` pairs (one 64-bit LDS read per axis), and the weight is one byte load through a second, 8-bit view of the KPN buffer (`KpnCoeffBytes`, binding 10; needs `storageBuffer8BitAccess`, which the ML path and the proxy's layer already enable). The 9 taps also accumulate without branches: a missing tap's colour is selected to 0 (alpha included), which adds +0 to sums that start at +0 and so can never be -0, i.e. the same bits as skipping it. That keeps the taps in one basic block; with the original per-tap `if`, NIR sinks the byte loads into the branches and the pass gets slower (below) | 853x533 postprocess 850 -> 819; static VALU 705 -> 674 |
+| ... dequantised KPN weights as a 256-entry LDS table indexed by the (unsigned) byte, filled by the 256 lanes of the workgroup with the same `max((q + 127) * s, EPS)` operations before the existing barrier: 4 VALU per tap -> 1 LDS read | 819 -> 793 |
+| Postprocess (all modes): the `MaxHalf()` (min with 65504) before `Tonemap4` / `SafeColour` removed: both clamp to [0, 65504] themselves, ACO already put the min after the clamp's `v_med3_f32`, and med3 returns min3 = 0 for a NaN input, so the 9 `v_min_f32` were dead for every input | 853x533 791 -> 781; exact-2x (mode 0) 587 -> 579 |
+| Mode-2 axis tables built by the dynamic LUT pass, once per frame per output column and row (rows 66..73 of the LUT image: 3 texels of (LR, KPN byte) pairs + 1 validity texel; `GenerateDenseAxisTable`, same arithmetic, the tile texel from the same `DenseAxisTexel` as rows 0/1). Each postprocess workgroup now copies 128 texels into LDS (one per lane) instead of its first wave running ~170 VALU, 6 quarter-rate multiplies and a dependent LUT fetch while the other three waited at the barrier | 781 -> 756; static VALU 644 -> 501 (LUT pass VALU 264 -> 634, still ~0.1 us) |
+| Host-side uniform floats: `float(OutputDims)` (Catmull history) and `PaddedUvScale` (`float(preprocess dims) * _InputTensorSizeRcp`, one fp32 multiply on the host as well) in two new `cbNSS` fields, so lanes no longer convert / multiply them (no scalar float ALU on RDNA2) | 853x533 750 -> 744, 640x400 581 -> 577 |
+| Graph: `[[unroll]]` on the input-word loops (layer 5's 16-word loop was a real loop, 96 dot4 per trip, `s_waitcnt lgkmcnt(0)` right after each trip's weight loads) | 853x533 graph 2388 -> 2347; 640x400 unchanged |
+| Graph: `[[unroll]]` on the kernel-row loop for every layer (bias folds into the first dot4, the 17 accumulator copies per row go, row offsets become constants). Code grows to 28 KB on layers 5/6 at 853x533, but every layer measured equal or faster in ML_PROFILE, layers 8 and 11 included | 853x533 2343 -> 2309, 640x400 1340 -> 1325 |
+| Graph: input word address as `sy * (W * S / 4) + sx * (S / 4)` instead of `((sy * W + sx) * S) >> 2` (clamped row and column: 24-bit multiplies / shifts instead of the quarter-rate `v_mul_lo_u32` of the sum; layer 0 had 10) | 853x533 2312 -> 2294, 640x400 1322 -> 1313 |
+| Graph epilogue: the output byte computed biased, `clamp((hi + r + ((zp + 128) << k)) >> k, 0, 255)` (the + 128 folds into the per-channel constant), packed with shifts/ORs and one XOR with 0x80808080 (`(v + 128) ^ 0x80 == v & 0xFF`); TABLE layers keep the table entry's unsigned byte in LDS and need no XOR. Replaces the 5-instruction SDWA byte pack | 853x533 2298 -> 2276, 640x400 1313 -> 1303 |
+| Preprocess: the 4 previous-depth fetches of the depth-clip block issued together with clamped coordinates (each value used only when its tap is on screen, where the clamp changes nothing), instead of one dependent fetch inside each tap's branch | 853x533 437 -> 420, 640x400 245 -> 237 |
+
+What did not work (measured, reverted):
+
+- KPN byte loads with the original per-tap `if (tap_valid)` accumulation: NIR sinks 8-bit SSBO loads (unlike the 32-bit
+  ones) into the 9 branches, so each tap waits for its own load: 850 -> 945 us. With 32-bit word loads and the byte
+  address (`data[b >> 2]`, `bitfieldExtract(w, (b & 3) << 3, 8)`): 816 us, about the same as the byte loads without
+  branches, but the LDS weight table needs the byte as an index, which the branch-free form gives for free.
+- Mode-2 history and temporal-feedback fetches issued before the filter (`FetchPostprocessHistory` first): 755 -> 775
+  us. Without branches the filter and history are one basic block already and ACO schedules them; the hoist only
+  lengthens live ranges.
+- Graph output address written as `(oy * W + ox) * (S / 4) + (oc >> 2)`: +78..+86 us on the graph, because the
+  per-word stores of a pixel are no longer merged into `buffer_store_dwordx4`. The input-address part of the change is
+  kept (row above).
+- Not tried: the alternative to the LDS weight table (KPN stored as `q + 128` by layer 9, P-E in the audit), since the
+  table gives the same and keeps the graph-to-postprocess contract; a 16-channel block for layer 5 only (the word-loop
+  unroll already recovered layer 5).
+
+The 640x392 -> 1280x785 case (exact 2x on x, 785 / 392 on y) still runs the general-ratio postprocess: 728 us against
+576 us for exact 2x at 640x400. An exact faster path for "2x on x only" would have to reproduce mode 2's taps and
+accumulation order. At an x ratio of 2, the two pixels of an aligned pair (`2g - (off & 1) + {0, 1}`) use the same 3 LR
+columns, so their colours and squares could be shared, but their x validity patterns differ (offsets {-1, 1, 3} vs
+{-2, 0, 2}), so each pixel adds the shared colours in its own candidate-rank order (from the selection table) with its own
+KPN channels. Only the 9 colour fetches, 27 squares and the axis reads (~35 of ~500 VALU per pixel) could be shared,
+against a dynamic per-pixel reorder of 9 shared colours. Estimated at no more than ~30 us, and not built. Mode 0 cannot
+be used: its taps and order differ, so the output would change.
+
+Floors and ideas left:
+
+- Mode-2 postprocess: 497 static VALU per pixel (705 before). The per-tap work is now 2 `bfe`, 2 address adds, one
+  byte add, one byte load, one LDS read, 4 selects and the 10 accumulate ops; the history/clamp/tonemap part (~250 VALU)
+  must stay as written.
+- Graph: the remaining exact lever is still the epilogue's quarter-rate `v_mul_hi_i32`.
+
 ### Non-exact experiment (QUALITY, Steam Deck): what dropping bit exactness buys
 
 Everything here is opt-in and off by default (the replay suite stays ALL IDENTICAL and `ffx_ml_runtime_test` EXACT

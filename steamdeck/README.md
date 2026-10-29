@@ -60,6 +60,12 @@ NVIDIA. The ML runtime still picks its kernels from the real hardware (Vulkan dr
   reset frames are unchanged, and it costs +32 µs at 853x533 → 1280x800. It is not specific to this proxy: the same
   lines appear on D3D11, D3D12 and with the scalar ML path.
 - **Dynamic resolution:** see Limitations (the subrect is resampled to the context's render size).
+- **RDNA2 ISA round 4 (bit exact):** postprocess per-tap KPN addressing through an 8-bit view of the KPN buffer,
+  axis tables built once per frame in the LUT pass, a dequantised-weight LDS table; batched previous-depth fetches in
+  the preprocess; unrolled word and kernel-row loops and cheaper addressing / int8 packing in the graph. Quality,
+  in-frame: 640x400 2219 → 2157 µs, 853x533 3725 → 3510 µs, Forza Horizon 6's 640x392 → 1280x785 2444 → 2319 µs
+  (details in `docs/nss_gpu_tuning.md`). The postprocess now uses `storageBuffer8BitAccess`; RADV accepts it on any
+  device, and the layer (`AISS_LAYER=1`) enables it explicitly.
 
 ## Performance (Steam Deck, RDNA2)
 

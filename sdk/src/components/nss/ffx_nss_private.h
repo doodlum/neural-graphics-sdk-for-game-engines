@@ -127,6 +127,9 @@ typedef struct NssConstants
 
     FfxUInt32x2 _ReducedInputModulo;  ///< Reduced output/input denominator per axis, used by dynamic LUT generation.
     FfxUInt32x2 _LutOffset;           ///< Jittered offset inside the modulo tile. .x = offset.x, .y = offset.y
+
+    FfxFloat32x2 _OutputDimsF;    ///< float(_OutputDims) (exact), so the postprocess does not convert it per lane
+    FfxFloat32x2 _PaddedUvScale;  ///< float(preprocess dims) * _InputTensorSizeRcp, one fp32 multiply (as the shader did)
 } NssConstants;
 
 struct FfxPipelineState;

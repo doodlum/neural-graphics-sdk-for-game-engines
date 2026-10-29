@@ -57,7 +57,7 @@ int32_t2 PreprocessDims()
 // where the inv_temporal_dims is input tensor size
 float2 PaddedUvScale()
 {
-    return float2(PreprocessDims()) * cbNSS._InputTensorSizeRcp;
+    return cbNSS._PaddedUvScale;  // float2(PreprocessDims()) * cbNSS._InputTensorSizeRcp, computed on the host
 }
 
 // Note: the reset variable in reference implementation is a bit confusing
@@ -516,7 +516,7 @@ half4 LoadWarpedHistoryPost(float2 uv)
 half4 LoadWarpedHistoryCatmullPost(float2 uv)
 {
     // Catmull-Rom 5-tap cross filter
-    float2 scaledUV  = uv * float2(OutputDims());
+    float2 scaledUV  = uv * cbNSS._OutputDimsF;  // float2(OutputDims()), converted on the host
     float2 baseFloor = floor(scaledUV - 0.5) + 0.5;
 
     half2 f  = half2(scaledUV - baseFloor);
@@ -683,56 +683,69 @@ const uint32_t kDenseRankInfo[36] = uint32_t[36](
     0x441Cu, 0x5211u, 0x2520u, 0x510Bu, 0x5317u, 0x151Fu, 0x3521u, 0x5005u, 0x541Du, 0x051Eu, 0x4522u, 0x5523u);
 
 #if NSS_POSTPROCESS_AXIS_LDS && !NSS_SUPPORT_TENSOR
-// Compute path: every tap coordinate is (column part, row part). A workgroup maps the 6 candidate offsets of each of
-// its columns and rows to clamped LR coordinates and KPN word offsets once, with the same functions the per-pixel path
-// uses, and the pixels read them back (2 LDS words per tap instead of ~30 VALU of clamping and KPN mapping).
+// Compute path: every tap coordinate is (column part, row part). The 6 candidate offsets of each output column and row
+// are mapped to clamped LR coordinates and KPN byte offsets once per frame by the LUT pass, with the same arithmetic
+// the per-pixel path uses; a workgroup copies its 16 columns and 16 rows into LDS and the pixels read them back (one
+// 64-bit LDS read per axis and tap instead of ~30 VALU of clamping and KPN mapping).
 const int32_t kAxisLdsW = int32_t(FFX_NSS_THREAD_GROUP_WIDTH);
 const int32_t kAxisLdsH = int32_t(FFX_NSS_THREAD_GROUP_HEIGHT);
-// Columns first, then rows: x entries at [c * 6 + i], y entries at [kAxisLdsW * 6 + r * 6 + i].
-shared int32_t  s_axis_lr[(kAxisLdsW + kAxisLdsH) * 6];
-shared int32_t  s_axis_kpn[(kAxisLdsW + kAxisLdsH) * 6];   // x: kpn_x * words per KPN pixel, y: kpn_y * kpn_w * words
-shared uint32_t s_axis_valid[kAxisLdsW + kAxisLdsH];        // 6-bit validity of the column's / row's offsets
-#define s_axis_lr_x(I)    s_axis_lr[(I)]
-#define s_axis_lr_y(I)    s_axis_lr[kAxisLdsW * 6 + (I)]
-#define s_axis_kpn_x(I)   s_axis_kpn[(I)]
-#define s_axis_kpn_y(I)   s_axis_kpn[kAxisLdsW * 6 + (I)]
+// Columns first, then rows: x entries at [c * 6 + i], y entries at [kAxisLdsW * 6 + r * 6 + i]. Each entry is a pair
+// (clamped LR coordinate, KPN byte offset), read with one 64-bit LDS load. The KPN tensor is [y][x][36] int8, so the byte
+// address of channel 6 * ix + iy at KPN pixel (x, y) splits exactly into an x part and a y part:
+//   36 * (y * kpn_w + x) + 6 * ix + iy = (36 * x + 6 * ix) + (36 * kpn_w * y + iy)
+shared int32_t2 s_axis[(kAxisLdsW + kAxisLdsH) * 6];
+shared uint32_t s_axis_valid[kAxisLdsW + kAxisLdsH];  // 6-bit validity of the column's / row's offsets
+#define s_axis_x(I)       s_axis[(I)]
+#define s_axis_y(I)       s_axis[kAxisLdsW * 6 + (I)]
 #define s_axis_valid_x(I) s_axis_valid[(I)]
 #define s_axis_valid_y(I) s_axis_valid[kAxisLdsW + (I)]
 
-// One lane per column (lanes 0..W-1) or row (W..W+H-1), all in the first wave: the tile, LR base and LUT texel are
-// computed once per axis line and the 6 offsets in a loop (one lane per entry spread the per-line work over 6 lanes and
-// 3 waves, ~45 VALU per pixel of the workgroup). Every value uses the same per-axis arithmetic as before
-// (PackedOffsetLutTile, floor(px * InvScale), KpnCoordForDenseFilter), component by component.
+// The KPN tensor as bytes (same buffer, second binding): one byte load per tap, read unsigned (the two's complement
+// byte u of the int8 value q) and used as an index into s_kpn_weight.
+layout(set = 0, binding = NSS_BIND_KPN_TENSOR_BYTES, std430) readonly buffer KpnCoeffBytes
+{
+    uint8_t data[];
+}
+r_coefficients_kpn_bytes;
+// Dequantised KPN weight for every byte value: s_kpn_weight[u] = SampleKpnWeight's max(Dequantize(q), EPS) for
+// q = int8(u), filled by the workgroup (one entry per lane) with the same operations.
+shared half s_kpn_weight[256];
+#if FFX_NSS_THREAD_GROUP_WIDTH * FFX_NSS_THREAD_GROUP_HEIGHT < 256
+#error "PrepareDenseFilterAxes fills s_kpn_weight with one lane per entry"
+#endif
+
+// The per-line tables come from the dynamic LUT pass (GenerateDenseAxisTable in ffx_nss_generate_offset_lut.h): for
+// every output column and row, 3 texels of (LR coordinate, KPN byte offset) pairs for the 6 axis offsets and one texel
+// with their 6-bit validity, computed once per frame with the arithmetic this pass used to run per workgroup (the
+// first wave mapped its 16 columns and 16 rows while the others waited at the barrier). Here 128 lanes copy one texel
+// each into LDS.
+const int32_t kDenseAxisTableRow = 2 + 64;
 void PrepareDenseFilterAxes()
 {
     int32_t li = int32_t(gl_LocalInvocationIndex);
-    if (li < kAxisLdsW + kAxisLdsH)
+    if (li < int32_t(256))  // the 16x16 workgroup has exactly 256 lanes
     {
-        bool      y_axis     = li >= kAxisLdsW;
-        int32_t   e          = y_axis ? li - kAxisLdsW : li;
-        int32_t2  wg_origin  = int32_t2(gl_WorkGroupID.xy) * int32_t2(kAxisLdsW, kAxisLdsH);
-        int32_t2  colour_max = InputDims() - int32_t2(1);
-        int32_t2  kpn_max    = KpnDims() - int32_t2(1);
-        int32_t2  idx_mod_xy = PackedOffsetLutModulo();
-        int32_t   p          = y_axis ? wg_origin.y + e : wg_origin.x + e;
-        int32_t2  p2         = int32_t2(p);
-        int32_t2  tile2      = PackedOffsetLutTile(p2, idx_mod_xy);
-        int32_t2  lr_base2   = int32_t2(floor(float2(p2) * InvScale()));
-        int32_t   tile       = y_axis ? tile2.y : tile2.x;
-        int32_t   lr_base    = y_axis ? lr_base2.y : lr_base2.x;
-        int32_t   cmax       = y_axis ? colour_max.y : colour_max.x;
-        int32_t   kpn_mul    = y_axis ? KpnDims().x * (kKpnChannels / 4) : (kKpnChannels / 4);
-        uint32_t4 axis       = texelFetch(_OffsetLutUint4Tex, int32_t2(tile, y_axis ? 1 : 0), 0);
-        int32_t   base       = li * 6;  // == kAxisLdsW * 6 + e * 6 for rows
-        for (int32_t i = 0; i < 6; ++i)
+        int32_t q        = bitfieldExtract(li, int32_t(0), int32_t(8));
+        s_kpn_weight[li] = half(max(float(Dequantize(half(q), kKpnQuant)), float(EPS)));
+    }
+    if (li < (kAxisLdsW + kAxisLdsH) * int32_t(4))
+    {
+        int32_t   line   = li >> int32_t(2);
+        int32_t   j      = li & int32_t(3);
+        bool      y_axis = line >= kAxisLdsW;
+        int32_t   e      = y_axis ? line - kAxisLdsW : line;
+        int32_t   p      = y_axis ? int32_t(gl_WorkGroupID.y) * kAxisLdsH + e : int32_t(gl_WorkGroupID.x) * kAxisLdsW + e;
+        p                = min(p, (y_axis ? OutputDims().y : OutputDims().x) - int32_t(1));  // lines past the edge are unused
+        uint32_t4 t      = texelFetch(_OffsetLutUint4Tex, int32_t2(p, kDenseAxisTableRow + (y_axis ? int32_t(4) : int32_t(0)) + j), 0);
+        if (j < int32_t(3))
         {
-            int32_t  offset    = bitfieldExtract(int32_t(i < int32_t(4) ? axis.x : axis.y), (i & int32_t(3)) * int32_t(8), int32_t(8));
-            int32_t  lr        = clamp(lr_base + offset, int32_t(0), cmax);
-            int32_t2 kpn2      = KpnCoordForDenseFilter(int32_t2(lr), kpn_max);
-            s_axis_lr[base + i]  = lr;
-            s_axis_kpn[base + i] = (y_axis ? kpn2.y : kpn2.x) * kpn_mul;
+            s_axis[line * 6 + j * 2]     = int32_t2(t.xy);
+            s_axis[line * 6 + j * 2 + 1] = int32_t2(t.zw);
         }
-        s_axis_valid[li] = (axis.y >> uint32_t(16)) & uint32_t(63);
+        else
+        {
+            s_axis_valid[line] = t.x;
+        }
     }
     barrier();
 }
@@ -753,23 +766,22 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     int32_t   row6   = row * 6;
 
     int32_t2 lr_tap[9];
-    int32_t  kpn_word[9];
-    int32_t  channel[9];
+    int32_t  kpn_byte[9];
     bool     tap_valid[9];
     bool     tap_center[9];
     for (int32_t k = int32_t(0); k < int32_t(9); ++k)
     {
-        uint32_t code = bitfieldExtract(k < int32_t(5) ? sel.x : sel.y, (k < int32_t(5) ? k : k - int32_t(5)) * int32_t(6), int32_t(6));
-        int32_t  ix   = int32_t(code & uint32_t(7));
-        int32_t  iy   = int32_t(code >> uint32_t(3));
-        int32_t  xi   = col6 + ix;
-        int32_t  yi   = row6 + iy;
+        uint32_t word = k < int32_t(5) ? sel.x : sel.y;
+        int32_t  pos  = (k < int32_t(5) ? k : k - int32_t(5)) * int32_t(6);
+        int32_t  ix   = int32_t(bitfieldExtract(word, pos, int32_t(3)));
+        int32_t  iy   = int32_t(bitfieldExtract(word, pos + int32_t(3), int32_t(3)));
+        int32_t2 ax   = s_axis_x(col6 + ix);
+        int32_t2 ay   = s_axis_y(row6 + iy);
         tap_valid[k]  = k < count;
-        channel[k]    = ix * int32_t(6) + iy;  // kCandidateLinear
-        lr_tap[k]     = int32_t2(s_axis_lr_x(xi), s_axis_lr_y(yi));
-        // (kpn_y * kpn_w + kpn_x) * words + channel / 4, as in ReadKpnParamsFromBase.
-        kpn_word[k]   = s_axis_kpn_y(yi) + s_axis_kpn_x(xi) + (channel[k] >> 2);
-        tap_center[k] = code == uint32_t(2 | (2 << 3));  // offset (0, 0) is candidate rank 0
+        lr_tap[k]     = int32_t2(ax.x, ay.x);
+        // 36 * (kpn_y * kpn_w + kpn_x) + channel, channel = 6 * ix + iy (kCandidateLinear), as in ReadKpnParamsFromBase.
+        kpn_byte[k]   = ax.y + ay.y;
+        tap_center[k] = bitfieldExtract(word, pos, int32_t(6)) == uint32_t(2 | (2 << 3));  // offset (0, 0) is candidate rank 0
     }
     // Ranks are listed in increasing order and offset (0, 0) is rank 0, so only the first selected tap can be the centre
     // (the select below then gives the same center_sample as testing every tap, with 1 compare instead of 9).
@@ -779,18 +791,19 @@ void FilterColour(int32_t2 output_px, out half4 m1, out half4 m2, out half4 cent
     for (int32_t k = int32_t(0); k < int32_t(9); ++k)
     {
         tap_col[k]    = LoadColourTap4(lr_tap[k]);
-        int32_t q     = ReadKpnWordChannel(kpn_word[k], channel[k]);
-        tap_weight[k] = half(max(float(Dequantize(half(q), kKpnQuant)), float(EPS)));  // SampleKpnWeight
+        tap_weight[k] = s_kpn_weight[uint32_t(r_coefficients_kpn_bytes.data[kpn_byte[k]])];  // SampleKpnWeight
     }
 
     center_sample = (tap_valid[0] && tap_center[0]) ? tap_col[0] : half4(0.HF);
+    // A missing tap (k >= count) adds +0 to every sum instead of being skipped: its colour is selected to 0 (alpha
+    // included) before the multiplies, so its terms are 0 * w = +0 (w > 0) and acc + (+0) = acc for every acc here
+    // (the sums start at +0 and can never become -0 under round-to-nearest, NaN and Inf stay as they are). Same bits as
+    // the branch, but the taps stay in one basic block (the byte loads are not sunk into per-tap branches).
     for (int32_t k = int32_t(0); k < int32_t(9); ++k)
     {
-        if (tap_valid[k])
-        {
-            accum_m1 += tap_col[k] * tap_weight[k];
-            accum_m2 += (tap_col[k] * tap_col[k]) * tap_weight[k];
-        }
+        half4 c = tap_valid[k] ? tap_col[k] : half4(0.HF);
+        accum_m1 += c * tap_weight[k];
+        accum_m2 += (c * c) * tap_weight[k];
     }
 
     NormalizeFilterMoments(accum_m1, accum_m2, m1, m2);
@@ -1200,7 +1213,9 @@ void ClampHistoryToStats(half4 m1, half4 m2, half4 warped_history, half theta, h
 half3 ClampToInvertibleRange(half3 accumulated, half inv_exposure)
 {
     half3 clamped = clamp(accumulated, half3(0.HF), half3(1.HF - EPS));
-    return SafeColour(MaxHalf(InverseTonemap(clamped) * half3(inv_exposure)));
+    // SafeColour clamps to [0, MAX_FP16] itself; the MaxHalf (min with 65504) that used to precede it was a no-op (see
+    // PostprocessPixelFiltered).
+    return SafeColour(InverseTonemap(clamped) * half3(inv_exposure));
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +1341,10 @@ void PostprocessPixelFiltered(int32_t2 output_px, half2 motion, half4 m1, half4 
     //-------------------------------------------------------------------------
     // 5) Tonemapped accumulation
     //-------------------------------------------------------------------------
-    half4 rectified_tm4 = Tonemap4(MaxHalf(rectified * half4(exposure)));
+    // Tonemap4 (and SafeColour) clamp to [0, MAX_FP16 = 65504] first, so a preceding MaxHalf (min with 65504) changes
+    // nothing for any input: finite and +-Inf trivially; for NaN the clamp is one v_med3_f32, which returns
+    // min3(...) = 0 when an input is NaN, and the extra v_min_f32 the MaxHalf compiled to came after it. Dropped.
+    half4 rectified_tm4 = Tonemap4(rectified * half4(exposure));
     half4 accumulated4;
 #if !FFX_HALF
     if (no_center)
@@ -1341,7 +1359,7 @@ void PostprocessPixelFiltered(int32_t2 output_px, half2 motion, half4 m1, half4 
 #endif
     {
         half  learnt_masked_alpha = alpha * center_sample.a * reset;
-        half4 colour_to_accum_tm4 = Tonemap4(MaxHalf(center_sample * half4(exposure)));
+        half4 colour_to_accum_tm4 = Tonemap4(center_sample * half4(exposure));
         accumulated4              = mix(rectified_tm4, colour_to_accum_tm4, half4(learnt_masked_alpha));
     }
 

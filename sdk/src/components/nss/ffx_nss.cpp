@@ -101,6 +101,7 @@ static const ResourceBinding uavTextureBindingTable[] = {
 static const ResourceBinding srvBufferBindingTable[] = {
     // Aliased tensors
     {FFX_NSS_RESOURCE_IDENTIFIER_KPN_TENSOR, "KpnCoeffBuffer"},
+    {FFX_NSS_RESOURCE_IDENTIFIER_KPN_TENSOR, "KpnCoeffBytes"},  // postprocess (dense dynamic-LUT filter): the same buffer as int8
 };
 
 static const ResourceBinding uavBufferBindingTable[] = {
@@ -766,8 +767,11 @@ static FfxErrorCode nssCreate(FfxNssContext_Private* context, const FfxNssContex
             // Dense (QUALITY) filter: separable LUT, one texel per x tile (row 0) and per y tile (row 1); see
             // GenerateOffsetLutAxis in ffx_nss_generate_offset_lut.h.
             // Rows 2..65: the 64x64 tap selection table (indexed by the 6-bit validity of both axes).
+            // Rows 66..73: per output column (66..69) and per output row (70..73) tap tables of the compute postprocess
+            // (GenerateDenseAxisTable), so the width also covers the output size.
             context->offsetLutSize.width  = FFX_MAXIMUM(FFX_MAXIMUM(context->reducedFractionHrSize.width, context->reducedFractionHrSize.height), 64u);
-            context->offsetLutSize.height = 2 + 64;
+            context->offsetLutSize.width  = FFX_MAXIMUM(context->offsetLutSize.width, FFX_MAXIMUM(displaySize.width, displaySize.height));
+            context->offsetLutSize.height = 2 + 64 + 8;
         }
         else
         {
@@ -1250,6 +1254,21 @@ static void setupConstantBuffer(FfxNssContext_Private* context, const FfxNssDisp
     constants._LutOffset[1]          = jitterTileOffset[1];
     constants._NotHistoryReset       = noHistoryReset;
 
+    // Exact integer -> float conversions (dimensions < 2^24) and a single fp32 multiply each (no contraction is possible
+    // for a lone product), i.e. the values the postprocess computed per lane before. Preprocess dims are the input
+    // dims, halved for the half-res preprocess (BALANCE/PERFORMANCE, NSS_PREPROCESS_HALF_RES_INPUT).
+    {
+        const bool     halfResPreprocess = context->contextDescription.qualityMode != FFX_NSS_SHADER_QUALITY_MODE_QUALITY;
+        const uint32_t preW              = halfResPreprocess ? constants._InputDims[0] / 2 : constants._InputDims[0];
+        const uint32_t preH              = halfResPreprocess ? constants._InputDims[1] / 2 : constants._InputDims[1];
+        constants._OutputDimsF[0]        = static_cast<float>(constants._OutputDims[0]);
+        constants._OutputDimsF[1]        = static_cast<float>(constants._OutputDims[1]);
+        volatile float preWf             = static_cast<float>(preW);
+        volatile float preHf             = static_cast<float>(preH);
+        constants._PaddedUvScale[0]      = preWf * constants._InputTensorSizeRcp[0];
+        constants._PaddedUvScale[1]      = preHf * constants._InputTensorSizeRcp[1];
+    }
+
     // initialize constantBuffers data
     FFX_ASSERT(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(&context->contextDescription.backendInterface,
                                                                                           &context->constants,
@@ -1723,7 +1742,8 @@ static FfxErrorCode nssDispatch(FfxNssContext_Private* context, const FfxNssDisp
     {
         // Dense (QUALITY) LUT is separable: one thread per x tile plus one per y tile.
         const bool     separable    = offsetLutGroupsPerTile(context->pipelineFlags) == 3;
-        const uint32_t tileCount    = separable ? context->reducedFractionHrSize.width + context->reducedFractionHrSize.height + 4096u
+        const uint32_t tileCount    = separable ? context->reducedFractionHrSize.width + context->reducedFractionHrSize.height + 4096u +
+                                                      params->upscaleSize.width + params->upscaleSize.height
                                                 : context->reducedFractionHrSize.width * context->reducedFractionHrSize.height;
         const uint32_t dispatchLutX = FFX_DIVIDE_ROUNDING_UP(tileCount, 64u);
         scheduleDispatch(context, params, &context->pipelineNssGenerateOffsetLut, dispatchLutX, 1, "GenerateOffsetLut");

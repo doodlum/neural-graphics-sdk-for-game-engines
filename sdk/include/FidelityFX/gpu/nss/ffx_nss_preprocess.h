@@ -370,7 +370,15 @@ float ComputeDepthClipInt(float2 uv, float depth_current, float2 render_size, fl
     float fDepth     = 0.0;
     float fWeightSum = 0.0;
 
-#define NSS_DEPTH_CLIP_BLOCK(SAMPLE_POS, SAMPLE_WEIGHT)                                                \
+    // The four previous depths are fetched together up front (clamped coordinates; a value is only used when its tap is
+    // on screen, where the clamp changes nothing), instead of one dependent fetch inside each tap's branch.
+    int32_t2 depth_tm1_max = depth_tm1_size - int32_t2(1);
+    float    prev_raw00    = float(texelFetch(_DepthTm1Tex, clamp(sample_base + int32_t2(0, 0), int32_t2(0), depth_tm1_max), 0).r);
+    float    prev_raw10    = float(texelFetch(_DepthTm1Tex, clamp(sample_base + int32_t2(1, 0), int32_t2(0), depth_tm1_max), 0).r);
+    float    prev_raw01    = float(texelFetch(_DepthTm1Tex, clamp(sample_base + int32_t2(0, 1), int32_t2(0), depth_tm1_max), 0).r);
+    float    prev_raw11    = float(texelFetch(_DepthTm1Tex, clamp(sample_base + int32_t2(1, 1), int32_t2(0), depth_tm1_max), 0).r);
+
+#define NSS_DEPTH_CLIP_BLOCK(SAMPLE_POS, SAMPLE_WEIGHT, PREV_RAW)                                      \
     {                                                                                                  \
         int32_t2 sample_pos = (SAMPLE_POS);                                                            \
         float    weight     = (SAMPLE_WEIGHT);                                                         \
@@ -378,7 +386,7 @@ float ComputeDepthClipInt(float2 uv, float depth_current, float2 render_size, fl
         fWeightSum += onscreen ? 0.0 : weight;                                                         \
         if (onscreen && weight > bilinear_weight_threshold)                                            \
         {                                                                                              \
-            float prev_depth      = float(texelFetch(_DepthTm1Tex, sample_pos, 0).r) * kInvDepthScale; \
+            float prev_depth      = (PREV_RAW) * kInvDepthScale;                                       \
             float prev_view_depth = GetViewSpaceDepth(prev_depth, device_to_view);                     \
             float depth_diff      = current_view_depth - prev_view_depth;                              \
             if (depth_diff > 0.0)                                                                      \
@@ -392,10 +400,10 @@ float ComputeDepthClipInt(float2 uv, float depth_current, float2 render_size, fl
         }                                                                                              \
     }
 
-    NSS_DEPTH_CLIP_BLOCK(sample_base + int32_t2(0, 0), w00)
-    NSS_DEPTH_CLIP_BLOCK(sample_base + int32_t2(1, 0), w10)
-    NSS_DEPTH_CLIP_BLOCK(sample_base + int32_t2(0, 1), w01)
-    NSS_DEPTH_CLIP_BLOCK(sample_base + int32_t2(1, 1), w11)
+    NSS_DEPTH_CLIP_BLOCK(sample_base + int32_t2(0, 0), w00, prev_raw00)
+    NSS_DEPTH_CLIP_BLOCK(sample_base + int32_t2(1, 0), w10, prev_raw10)
+    NSS_DEPTH_CLIP_BLOCK(sample_base + int32_t2(0, 1), w01, prev_raw01)
+    NSS_DEPTH_CLIP_BLOCK(sample_base + int32_t2(1, 1), w11, prev_raw11)
 
 #undef NSS_DEPTH_CLIP_BLOCK
 

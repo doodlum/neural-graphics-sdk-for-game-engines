@@ -7,6 +7,7 @@
 #if NSS_SUPPORT_TENSOR
 #extension GL_ARM_tensors : require
 #endif
+#extension GL_EXT_shader_8bit_storage : require
 
 #if FFX_HALF
 #extension GL_EXT_shader_8bit_storage : require
@@ -35,6 +36,7 @@
 #define NSS_BIND_UAV_HISTORY_UPSCALED_COLOR             8   // FFX_NSS_RESOURCE_IDENTIFIER_HISTORY_UPSCALED_COLOR
 
 #define NSS_BIND_CB_NSS                                 9
+#define NSS_BIND_KPN_TENSOR_BYTES                       10   // FFX_NSS_RESOURCE_IDENTIFIER_KPN_TENSOR, as int8 (dense dynamic-LUT filter)
 
 #define NSS_POSTPROCESS 1
 
