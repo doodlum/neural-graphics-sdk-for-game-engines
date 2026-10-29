@@ -401,11 +401,12 @@ AMD's SDK Vulkan DLL also carries FSR 3.1 (3.1.6), the non-neural upscaler. The 
 (control-file upscaler 9, `AISS_UPSCALER=fsr3`), on every API through the same native path as FSR 4. It needs no
 network, so none of the FSR 4 device-check or shader work applies to it.
 
-Its settings are tuned so its output comes as close as FSR 3.1 can to FSR 4 INT8's. Reference: INT8's output on the
-replay harness (8 captured game frames ×4, auto exposure on and off); measure: tonemapped PSNR against it. One
-parameter at a time, then jointly:
+It runs with AMD's default settings. The settings below bring its output as close as FSR 3.1 can to FSR 4 INT8's, and
+can be set with the `AISS_FSR3_*` launch options (e.g. `AISS_FSR3_ACCUMULATION=0.05 AISS_FSR3_SHADING=32`). Reference:
+INT8's output on the replay harness (8 captured game frames ×4, auto exposure on and off); measure: tonemapped PSNR
+against it. One parameter at a time, then jointly:
 
-| Setting | AMD default | Tuned | Effect alone (dB vs INT8) |
+| Setting | AMD default (used) | Closest to INT8 | Effect alone (dB vs INT8) |
 | --- | --- | --- | --- |
 | accumulation added per frame | 0.333 | **0.05** | 0.15 → 54.2 (0 collapses to 54.3) |
 | shading change scale | 1.0 | **32** | 4 → 54.2 |
@@ -415,7 +416,7 @@ parameter at a time, then jointly:
 Together: **53.9 → 56.1 dB** from INT8 (FSR 4 Lite is 60.7 dB from INT8). Default FSR 3.1 is much steadier than the
 networks frame to frame and correspondingly softer; tuned, it renews more detail and sits between them (mean 8-bit
 change at static edges of the Streamline sample: default 0.08, tuned 0.15, Lite 0.16, INT8 0.21). Cost: 1.79 ms at 2x
-(640x392 → 1280x785, Vulkan). Each setting can still be overridden with `AISS_FSR3_*` (options table).
+(640x392 → 1280x785, Vulkan).
 
 ### Motion vector dilation (FSR 4 and FSR 3.1)
 
@@ -494,7 +495,7 @@ Use the Decky plugin for this. By hand:
 | `AISS_FSR4_DX12_VER=0xVER` | FSR 4 D3D12: chain an upscaler version desc with this value (default: none; the 4.1.2 DLL rejects it) |
 | `AISS_EQUAL_COST=0/1` | Equal-cost render scale (default 0, not offered by the plugin): each upscaler gets the render size at which game + upscale costs the same GPU time as NSS Quality at the DLSS mode's ratio (see *Equal-cost render scale*); 0 = the standard DLSS ratios for every upscaler. The control file's `equal_cost=` overrides it |
 | `AISS_UPSCALER=fsr3` | AMD FSR 3.1 (3.1.6, from the SDK Vulkan DLL) at launch; control-file upscaler 9 |
-| `AISS_FSR3_SHARPNESS`, `AISS_FSR3_VELOCITY`, `AISS_FSR3_REACTIVENESS`, `AISS_FSR3_SHADING`, `AISS_FSR3_ACCUMULATION`, `AISS_FSR3_MIN_DISOCCLUSION` | Override FSR 3.1's tuned settings (see *FSR 3.1*; sharpness < 0 = off) |
+| `AISS_FSR3_SHARPNESS`, `AISS_FSR3_VELOCITY`, `AISS_FSR3_REACTIVENESS`, `AISS_FSR3_SHADING`, `AISS_FSR3_ACCUMULATION`, `AISS_FSR3_MIN_DISOCCLUSION` | Override FSR 3.1's settings (AMD's defaults; see *FSR 3.1* for the values closest to FSR 4 INT8; sharpness < 0 = off) |
 | `AISS_FSR_DILATE_MV=1` | Dilate motion vectors by nearest depth ahead of FSR 4 / FSR 3.1 (plugin toggle "Dilate motion vectors", control key `dilate_mv`, switches live) |
 | `AISS_RATIO=r` | Force one render-scale divisor for every DLSS mode (testing); turns equal cost off |
 | `AISS_XESS_QUALITY=100..105` | XeSS preset (default 100, Ultra Performance: the widest input range) |

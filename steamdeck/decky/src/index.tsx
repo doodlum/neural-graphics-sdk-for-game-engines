@@ -311,7 +311,7 @@ function Content() {
             description={
               "Switches live in-game. NSS: Arm's neural upscaler. XeSS: Intel XeSS (dynamic resolution)." +
               (state.bundle.fsr4 ? " FSR 4: AMD's neural upscaler (D3D12, D3D11 and Vulkan games)." : "") +
-              (state.bundle.fsr3 ? " FSR 3.1: AMD's non-neural upscaler, tuned to look as close to FSR 4 INT8 as it can." : "")
+              (state.bundle.fsr3 ? " FSR 3.1: AMD's non-neural upscaler (cheaper)." : "")
             }
             rgOptions={[
               ...UPSCALER_OPTIONS,

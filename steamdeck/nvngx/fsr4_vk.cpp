@@ -589,10 +589,9 @@ FfxApiResource Resource(const UpscalerImage& img, bool output)
                                state);
 }
 
-// FSR 3.1 settings (the SDK DLL's FSR 3.1.6, AISS_UPSCALER=fsr3 / control code 9). Defaults chosen so its output comes
-// closest to FSR 4 INT8's on the replay harness: 53.9 -> 56.1 dB tonemapped PSNR against INT8, frame-to-frame change at
-// static edges 0.08 -> 0.15 (INT8 0.21, Lite 0.16). Only accumulation and shading change moved it; sharpening only took
-// it further away (README, "FSR 3.1"). Each can be overridden for tuning:
+// FSR 3.1 settings (the SDK DLL's FSR 3.1.6, AISS_UPSCALER=fsr3 / control code 9): AMD's defaults. The values that bring
+// its output closest to FSR 4 INT8's (accumulation 0.05, shading change 32: 53.9 -> 56.1 dB against INT8) are in the
+// README ("FSR 3.1"). Each can be overridden:
 // AISS_FSR3_SHARPNESS (< 0 = sharpening off), AISS_FSR3_VELOCITY, AISS_FSR3_REACTIVENESS, AISS_FSR3_SHADING,
 // AISS_FSR3_ACCUMULATION, AISS_FSR3_MIN_DISOCCLUSION (the SDK's configure keys of the same names).
 struct Fsr3Tuning
@@ -600,8 +599,8 @@ struct Fsr3Tuning
     float sharpness        = -1.0f;
     float velocity         = 1.0f;
     float reactiveness     = 1.0f;
-    float shading          = 32.0f;   // AMD default 1.0
-    float accumulation     = 0.05f;   // AMD default 0.333
+    float shading          = 1.0f;
+    float accumulation     = 0.333f;
     float minDisocclusion  = -0.333f;
 };
 
