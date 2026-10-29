@@ -318,6 +318,14 @@ the context is created with `FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION` and every di
 `renderSize` (`ngx_d3d11_test --dyn` passes for Lite, INT8 and INT8 RDNA 2 through interop). FP8 is refused (it needs
 RDNA 4).
 
+Black frames with auto exposure: FSR 4's auto exposure averages the frame's luminance, so a single Inf or NaN colour
+pixel (an overflowed highlight) makes the exposure non-finite and the whole output black, with the history poisoned,
+until a reset; in games this shows as black flashes (seen in Star Wars Galactic Racer, which sets DLSS AutoExposure;
+reproduced with a replay dump with 0.1% Inf colour pixels, with or without the shader packs). When auto exposure is on,
+the SDK Vulkan path first copies the colour to an owned RGBA16F image with Inf clamped to ±65504 and NaN set to 0
+(`color_sanitize.comp`). Finite input gives bit-identical output; the pass costs about 85 µs at 853x533 → 1280x800.
+FSR 3.1 and NSS are unaffected (the proxy's NSS auto exposure already skips non-finite pixels).
+
 ### D3D12 interop for D3D11 games
 
 - The proxy creates a D3D12 device in-process (vkd3d-proton) on the game's adapter (LUID from

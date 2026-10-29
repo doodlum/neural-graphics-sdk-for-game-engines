@@ -824,6 +824,19 @@ private:
                 d.motionVectors = m_dilator->Record(cmd, in.depth, in.motionVectors, in.renderWidth, in.renderHeight,
                                                     m_info.depthInverted);
         }
+        // FSR 4's auto exposure turns one Inf / NaN colour pixel into a black frame (and black history): clean the
+        // colour first. FSR 3.1's auto exposure is unaffected.
+        if (m_autoExposure && !m_fsr3 && !m_sanitizerFailed)
+        {
+            if (!m_sanitizer)
+            {
+                m_sanitizer = MvDilator::Create(m_dev, m_info.renderWidth, m_info.renderHeight, MvDilator::Pass::SanitizeColor);
+                m_sanitizerFailed = !m_sanitizer;
+                LOGI("FSR 4 Vulkan: colour clean-up for auto exposure %s", m_sanitizer ? "on" : "unavailable");
+            }
+            if (m_sanitizer)
+                d.color = m_sanitizer->Record(cmd, in.color, in.color, in.renderWidth, in.renderHeight, false);
+        }
         ffxDispatchDescUpscale up  = {};
         up.header.type             = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
         up.commandList             = cmd;
@@ -867,6 +880,8 @@ private:
     bool                     m_fsr3    = false;  // FSR 3.1 from the same DLL (no network, no shader replacement)
     std::unique_ptr<MvDilator> m_dilator;
     bool                       m_dilatorFailed = false;
+    std::unique_ptr<MvDilator> m_sanitizer;  // colour clean-up (MvDilator::Pass::SanitizeColor)
+    bool                       m_sanitizerFailed = false;
     VkDeviceContext m_dc            = {};
     ffxContext      m_ctx           = nullptr;
     uint64_t        m_dispatchCount = 0;

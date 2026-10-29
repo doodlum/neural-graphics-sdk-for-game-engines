@@ -1,4 +1,4 @@
-// Motion vector dilation ahead of FSR (see mv_dilate.h, mv_dilate.comp).
+// Input passes ahead of FSR: motion vector dilation and colour clean-up (see mv_dilate.h).
 // SPDX-License-Identifier: MIT
 #include "mv_dilate.h"
 
@@ -10,6 +10,9 @@ namespace
 {
 const uint32_t kDilateSpirv[] = {
 #include "mv_dilate.spv.inc"
+};
+const uint32_t kSanitizeSpirv[] = {
+#include "color_sanitize.spv.inc"
 };
 
 bool IsDepthFormat(VkFormat f)
@@ -32,10 +35,11 @@ struct MvDilator::Fn
 #undef FN
 };
 
-std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t maxWidth, uint32_t maxHeight)
+std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t maxWidth, uint32_t maxHeight, Pass pass)
 {
     std::unique_ptr<MvDilator> d(new MvDilator());
-    d->m_dev = dev;
+    d->m_dev    = dev;
+    d->m_format = pass == Pass::SanitizeColor ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32_SFLOAT;
     d->m_fn.reset(new Fn());
     Fn& fn = *d->m_fn;
 #define LOAD(name) fn.name = reinterpret_cast<PFN_##name>(dev.gdpa(dev.device, #name));
@@ -80,8 +84,8 @@ std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t m
     if (fn.vkCreatePipelineLayout(device, &pl, nullptr, &d->m_pipeLayout) != VK_SUCCESS)
         return nullptr;
     VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize                 = sizeof(kDilateSpirv);
-    smci.pCode                    = kDilateSpirv;
+    smci.codeSize                 = pass == Pass::SanitizeColor ? sizeof(kSanitizeSpirv) : sizeof(kDilateSpirv);
+    smci.pCode                    = pass == Pass::SanitizeColor ? kSanitizeSpirv : kDilateSpirv;
     VkShaderModule module         = VK_NULL_HANDLE;
     if (fn.vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS)
         return nullptr;
@@ -112,10 +116,10 @@ std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t m
     if (fn.vkAllocateDescriptorSets(device, &dsai, d->m_sets) != VK_SUCCESS)
         return nullptr;
 
-    // The output: RG32F at the maximum render size, device local, sampled by FSR and written as storage here.
+    // The output (RG32F / RGBA16F) at the maximum render size, device local, sampled by FSR and written as storage here.
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType         = VK_IMAGE_TYPE_2D;
-    ici.format            = VK_FORMAT_R32G32_SFLOAT;
+    ici.format            = d->m_format;
     ici.extent            = {maxWidth, maxHeight, 1};
     ici.mipLevels = ici.arrayLayers = 1;
     ici.samples                     = VK_SAMPLE_COUNT_1_BIT;
@@ -143,7 +147,7 @@ std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t m
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image                 = d->m_image;
     vci.viewType              = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format                = VK_FORMAT_R32G32_SFLOAT;
+    vci.format                = d->m_format;
     vci.subresourceRange      = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (fn.vkCreateImageView(device, &vci, nullptr, &d->m_view) != VK_SUCCESS)
         return nullptr;
@@ -204,7 +208,7 @@ UpscalerImage MvDilator::Record(VkCommandBuffer cmd, const UpscalerImage& depth,
                                                                    : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT),
                                      0, 1, 0, 1};
         if (fn.vkCreateImageView(dv, &vci, nullptr, &views[i]) != VK_SUCCESS)
-            return motion;  // pass the game's motion vectors through
+            return motion;  // pass the game's input through
     }
     VkDescriptorImageInfo infos[3] = {{VK_NULL_HANDLE, views[0], depth.layout},
                                       {VK_NULL_HANDLE, views[1], motion.layout},
@@ -248,7 +252,7 @@ UpscalerImage MvDilator::Record(VkCommandBuffer cmd, const UpscalerImage& depth,
 
     UpscalerImage out;
     out.image  = m_image;
-    out.format = VK_FORMAT_R32G32_SFLOAT;
+    out.format = m_format;
     out.width  = m_width;
     out.height = m_height;
     out.layout = VK_IMAGE_LAYOUT_GENERAL;

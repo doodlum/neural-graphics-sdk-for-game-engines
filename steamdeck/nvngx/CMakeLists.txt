@@ -21,6 +21,12 @@ add_custom_command(
     COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -mfmt=num -o "${DILATE_SPV_INC}" "${CMAKE_CURRENT_SOURCE_DIR}/mv_dilate.comp"
     DEPENDS mv_dilate.comp
     COMMENT "Compiling mv_dilate.comp")
+set(SANITIZE_SPV_INC "${CMAKE_CURRENT_BINARY_DIR}/color_sanitize.spv.inc")
+add_custom_command(
+    OUTPUT "${SANITIZE_SPV_INC}"
+    COMMAND "${GLSLC}" -O --target-env=vulkan1.1 -mfmt=num -o "${SANITIZE_SPV_INC}" "${CMAKE_CURRENT_SOURCE_DIR}/color_sanitize.comp"
+    DEPENDS color_sanitize.comp
+    COMMENT "Compiling color_sanitize.comp")
 set(EXPOSURE_SPV_INC "${CMAKE_CURRENT_BINARY_DIR}/exposure.spv.inc")
 add_custom_command(
     OUTPUT "${EXPOSURE_SPV_INC}"
@@ -60,6 +66,7 @@ add_library(nvngx SHARED
     mv_dilate.cpp
     "${SPV_INC}"
     "${DILATE_SPV_INC}"
+    "${SANITIZE_SPV_INC}"
     "${EXPOSURE_SPV_INC}"
     ${REGION_COPY_INCS})
 

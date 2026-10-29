@@ -1,0 +1,27 @@
+#version 450
+// Colour clean-up ahead of FSR 4 with auto exposure: FSR 4's auto exposure averages the whole frame's luminance, so a
+// single Inf or NaN colour pixel (an overflowed highlight; R11G11B10 and fp16 targets produce them) makes the exposure
+// non-finite and the whole output black until the next reset. Inf is clamped to the largest fp16 value, NaN becomes 0;
+// every finite value passes through unchanged (fp16 storage keeps FSR's own input precision).
+// SPDX-License-Identifier: MIT
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 1) uniform sampler2D u_color;
+layout(binding = 2, rgba16f) uniform writeonly image2D u_out;
+
+layout(push_constant) uniform Push
+{
+    ivec2 size;  // render size
+    ivec2 pad;
+} pc;
+
+void main()
+{
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size)))
+        return;
+    vec4 c = texelFetch(u_color, p, 0);
+    c      = mix(clamp(c, vec4(-65504.0), vec4(65504.0)), vec4(0.0), isnan(c));
+    imageStore(u_out, p, c);
+}
