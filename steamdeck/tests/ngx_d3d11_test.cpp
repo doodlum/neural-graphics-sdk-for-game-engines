@@ -4,7 +4,7 @@
 //   --pad N       colour and motion vector textures N pixels wider and taller than the render size (as some games
 //                 allocate them), with junk outside the render region; the output must match the unpadded run
 //   --dyn         dynamic resolution: the render subrect changes every 8 frames (textures stay at the maximum); the
-//                 output is checked against the scene at the final size (XeSS only: NSS needs a fixed render size)
+//                 output is checked against the scene at the final size (NSS resamples the subrect to its context size)
 //   --save FILE   write the output (RGBA16F) to FILE
 //   --cmp FILE    compare the output with one written by --save
 //   --log FILE    print to FILE instead of stdout (Proton does not always pass a console through)

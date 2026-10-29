@@ -178,12 +178,14 @@ private:
     static constexpr uint32_t kOwnedPerKind  = 4;  // retired entries beyond this many per kind are destroyed
     std::vector<OwnedImage> m_owned;
     bool                    m_loggedCopy[2] = {};  // colour / motion copy state last logged
+    bool                    m_loggedResample = false;  // dynamic-resolution resampling state last logged
     VkFormat          CopyFormat(VkFormat game, VkFormat fallback) const;
     const OwnedImage* AcquireOwned(uint32_t kind, VkFormat format, uint32_t width, uint32_t height);
     void              DestroyOwned(const OwnedImage& img);
     void              RecordCopy(VkCommandBuffer cmd, uint32_t setIndex, VkPipeline pipeline, VkImage src, VkFormat srcFormat,
                                  VkImageAspectFlags aspect, VkImageLayout srcLayout, VkImageView dst, uint32_t width,
-                                 uint32_t height, int32_t offsetX, int32_t offsetY);
+                                 uint32_t height, int32_t offsetX, int32_t offsetY, uint32_t srcWidth,
+                                 uint32_t srcHeight, bool linear);
     VkSampler             m_sampler     = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_setLayout   = VK_NULL_HANDLE;
     VkPipelineLayout      m_pipeLayout  = VK_NULL_HANDLE;

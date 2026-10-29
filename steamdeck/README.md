@@ -47,6 +47,20 @@ Each API runs NSS on the game's own Vulkan device, with no copies:
 Spoofing the GPU as NVIDIA is left to Proton: `PROTON_FORCE_NVAPI=1` enables dxvk-nvapi and reports the AMD GPU as
 NVIDIA. The ML runtime still picks its kernels from the real hardware (Vulkan driver ID / device name).
 
+### NSS fixes on top of Arm's shaders
+
+- **Dark vertical lines (Quality mode, panning):** NSS stores its history in R11G11B10_FLOAT, and RADV's conversion on
+  store rounds toward zero. With motion of a whole number of pixels the Catmull-Rom history fetch weights become
+  0/1/0, so each frame re-stores the same texel and the truncation compounds; at 1.5x three output columns share two
+  input samples and the rarely refreshed phase class sinks to the history clamp's lower bound, giving a dark column
+  every third pixel. Quality is hit hardest because it trusts history longest (alpha about 0.09). The fix
+  (`ffx_nss_postprocess.h`, `StorePrevUpscaledColor`) rounds the history to the nearest R11G11B10 value (ties to even,
+  denormals and the largest finite value handled) before the store. On a synthetic FH6-like pan (Quality): pixels more
+  than 5% too dark 25.1% → 0.06%, PSNR vs ground truth 32.2 → 34.5 dB; every scene and quality mode tested improves,
+  reset frames are unchanged, and it costs +32 µs at 853x533 → 1280x800. It is not specific to this proxy: the same
+  lines appear on D3D11, D3D12 and with the scalar ML path.
+- **Dynamic resolution:** see Limitations (the subrect is resampled to the context's render size).
+
 ## Performance (Steam Deck, RDNA2)
 
 The int8 `dot4` path has an RDNA2-specific register-tiled kernel, and the pre/post-process shaders were reworked
@@ -533,5 +547,14 @@ Building that one file without optimisation keeps the original source unchanged.
 
 - DLSS Super Resolution only. Ray Reconstruction and Frame Generation report "not supported", and games fall back.
 - Colour/output subrect offsets are ignored, and display-resolution motion vectors are not supported (both logged).
-- No dynamic resolution with NSS: it requires every dispatch's render size to equal the size the context was created with, so a smaller render subrect fails the dispatch. XeSS and FSR 4 support it.
+- NSS dynamic resolution is a resample, not native: NSS needs every dispatch at the render size its context was
+  created with, so a smaller DLSS render subrect is resampled up to that size (colour bilinear, depth and motion vectors
+  nearest; jitter and motion vectors rescaled to the context's pixels) and fed to the same context, history intact.
+  Frames below the creation size are therefore a little softer than a context created at that size would give. XeSS,
+  FSR 4 and FSR 3.1 take the subrect natively.
+- No Ray Reconstruction-style denoising: Arm's Neural Super Sampling and Denoising (NSSD) has been announced but its
+  model, weights and code are not public (Arm's published models are NSS and neural frame-rate upscaling only), so
+  there is nothing to port. Qualcomm's Adreno Neural Fusion ships only as a binary Android arm64 library whose licence
+  forbids reverse engineering and limits it to Qualcomm hardware, and its weights exist only inside that binary, so it
+  cannot be ported either.
 - Online games with anti-cheat may object to the extra DLLs; don't use it there.

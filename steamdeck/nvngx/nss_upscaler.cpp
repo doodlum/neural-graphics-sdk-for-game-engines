@@ -337,7 +337,7 @@ bool NssUpscaler::CreateDepthCopy()
     dslci.pBindings                       = bindings;
     fn.vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &m_setLayout);
 
-    VkPushConstantRange pcr       = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPushConstantRange pcr       = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
     VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount             = 1;
     pl.pSetLayouts                = &m_setLayout;
@@ -477,7 +477,8 @@ void NssUpscaler::DestroyOwned(const OwnedImage& img)
 
 void NssUpscaler::RecordCopy(VkCommandBuffer cmd, uint32_t setIndex, VkPipeline pipeline, VkImage src, VkFormat srcFormat,
                              VkImageAspectFlags aspect, VkImageLayout srcLayout, VkImageView dst, uint32_t width,
-                             uint32_t height, int32_t offsetX, int32_t offsetY)
+                             uint32_t height, int32_t offsetX, int32_t offsetY, uint32_t srcWidth, uint32_t srcHeight,
+                             bool linear)
 {
     auto& fn = *m_fn;
     // The view from kRing dispatches ago is no longer in flight.
@@ -500,7 +501,8 @@ void NssUpscaler::RecordCopy(VkCommandBuffer cmd, uint32_t setIndex, VkPipeline 
     writes[1].pImageInfo            = &dstInfo;
     fn.vkUpdateDescriptorSets(m_dev.device, 2, writes, 0, nullptr);
 
-    const int32_t push[4] = {int32_t(width), int32_t(height), offsetX, offsetY};
+    const int32_t push[8] = {int32_t(width),    int32_t(height),    offsetX,         offsetY,
+                             int32_t(srcWidth), int32_t(srcHeight), linear ? 1 : 0, 0};
     fn.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     fn.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipeLayout, 0, 1, &m_sets[setIndex], 0, nullptr);
     fn.vkCmdPushConstants(cmd, m_pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
@@ -752,8 +754,14 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     auto& fn = *m_fn;
     const uint32_t slot = static_cast<uint32_t>(m_dispatchCount++ % kRing);
 
-    const uint32_t renderW = std::min(d.renderWidth, m_info.renderWidth);
-    const uint32_t renderH = std::min(d.renderHeight, m_info.renderHeight);
+    // NSS needs every dispatch at the context's render size (its scatter, data graph and offset LUT are sized from it).
+    // Dynamic resolution: a smaller render subrect is resampled up to that size by the input copies below, and the
+    // jitter and motion vectors are rescaled to its pixels, so one context (and its history) serves every subrect.
+    const uint32_t renderW = m_info.renderWidth;
+    const uint32_t renderH = m_info.renderHeight;
+    const uint32_t srcW    = std::min(d.renderWidth, renderW);
+    const uint32_t srcH    = std::min(d.renderHeight, renderH);
+    const bool     resample = srcW != renderW || srcH != renderH;
 
     // Make the game's writes to the inputs visible to compute.
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -783,8 +791,8 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     }
 
     // ---- owned copies, exactly renderW x renderH (see OwnedImage) ----
-    const bool copyColor  = d.color.width != renderW || d.color.height != renderH;
-    const bool copyMotion = d.motionVectors.width != renderW || d.motionVectors.height != renderH;
+    const bool copyColor  = resample || d.color.width != renderW || d.color.height != renderH;
+    const bool copyMotion = resample || d.motionVectors.width != renderW || d.motionVectors.height != renderH;
     OwnedImage depthImg, colorImg, motionImg;
     if (const OwnedImage* o = AcquireOwned(kOwnedDepth, VK_FORMAT_R32_SFLOAT, renderW, renderH))
         depthImg = *o;
@@ -804,13 +812,14 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
         else
             return false;
     }
-    if (copyColor != m_loggedCopy[0] || copyMotion != m_loggedCopy[1])
+    if (copyColor != m_loggedCopy[0] || copyMotion != m_loggedCopy[1] || resample != m_loggedResample)
     {
-        LOGI("NSS inputs at render %ux%u: colour %ux%u%s, motion vectors %ux%u%s", renderW, renderH, d.color.width,
-             d.color.height, copyColor ? " (copied to the render size)" : "", d.motionVectors.width, d.motionVectors.height,
-             copyMotion ? " (copied to the render size)" : "");
-        m_loggedCopy[0] = copyColor;
-        m_loggedCopy[1] = copyMotion;
+        LOGI("NSS inputs at render %ux%u%s: colour %ux%u%s, motion vectors %ux%u%s", srcW, srcH,
+             resample ? " (resampled to the context's render size)" : "", d.color.width, d.color.height,
+             copyColor ? " (copied)" : "", d.motionVectors.width, d.motionVectors.height, copyMotion ? " (copied)" : "");
+        m_loggedCopy[0]  = copyColor;
+        m_loggedCopy[1]  = copyMotion;
+        m_loggedResample = resample;
     }
 
     VkImageMemoryBarrier toStorage = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -841,7 +850,7 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
 
     const uint32_t setBase = slot * kOwnedKinds;
     RecordCopy(cmd, setBase + kOwnedDepth, m_pipeline, d.depth.image, viewFormat, aspect, depthLayout, depthImg.view, renderW,
-               renderH, d.depthOffsetX, d.depthOffsetY);
+               renderH, d.depthOffsetX, d.depthOffsetY, srcW, srcH, false);
 
     VkImageMemoryBarrier toRead = toStorage;
     toRead.srcAccessMask        = VK_ACCESS_SHADER_WRITE_BIT;
@@ -886,14 +895,14 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
             {
                 fprintf(meta, "%03d dispatch %llu render %ux%u display %ux%u jitter %.4f,%.4f mv scale %.3f,%.3f reset %d "
                               "quality %d hdr %d inverted %d game exposure %.3f formats colour %d mv %d depth %d\n",
-                        captureIndex, (unsigned long long)f, renderW, renderH, m_info.displayWidth, m_info.displayHeight,
+                        captureIndex, (unsigned long long)f, srcW, srcH, m_info.displayWidth, m_info.displayHeight,
                         d.jitterX, d.jitterY, d.mvScaleX, d.mvScaleY, d.reset, m_info.nssQuality, m_info.hdr,
                         m_info.depthInverted, d.exposure, d.color.format, d.motionVectors.format, d.depth.format);
                 fclose(meta);
             }
         }
         LOGI("dump %llu: render %ux%u jitter %.4f,%.4f mv scale %.3f,%.3f reset %d dt %.2f, formats colour %d mv %d depth %d (%ux%u, %ux%u, %ux%u)",
-             (unsigned long long)f, renderW, renderH, d.jitterX, d.jitterY, d.mvScaleX, d.mvScaleY, d.reset, d.frameTimeMs,
+             (unsigned long long)f, srcW, srcH, d.jitterX, d.jitterY, d.mvScaleX, d.mvScaleY, d.reset, d.frameTimeMs,
              d.color.format, d.motionVectors.format, d.depth.format, d.color.width, d.color.height, d.motionVectors.width,
              d.motionVectors.height, d.depth.width, d.depth.height);
     }
@@ -901,7 +910,7 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     // ---- auto exposure (before the colour is moved to GENERAL for NSS) ----
     float exposure = d.exposure;
     if (m_aePipeline && Config().exposure <= 0.0f)
-        exposure = AutoExposure(cmd, d.color, renderW, renderH);
+        exposure = AutoExposure(cmd, d.color, srcW, srcH);
 
     // ---- NSS ----
     LayoutFix fix;
@@ -931,7 +940,8 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
         uint32_t             copiedCount = 0;
         auto copy = [&](const UpscalerImage& src, const OwnedImage& dst, uint32_t kind) {
             RecordCopy(cmd, setBase + kind, m_copyPipelines[CopyPipeline(dst.format)], src.image, src.format,
-                       VK_IMAGE_ASPECT_COLOR_BIT, readLayout(src), dst.view, renderW, renderH, 0, 0);
+                       VK_IMAGE_ASPECT_COLOR_BIT, readLayout(src), dst.view, renderW, renderH, 0, 0, srcW, srcH,
+                       kind == kOwnedColor);
             VkImageMemoryBarrier b = toRead;
             b.image                = dst.image;
             copied[copiedCount++]  = b;
@@ -951,8 +961,11 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     nss.motionVectors = copyMotion ? ownedInput(motionImg) : WrapImage(d.motionVectors, 0, motionState);
 
     // NSS's jitter is the negative of the DLSS pixel offset on both axes.
-    nss.jitterOffset           = {-d.jitterX * Config().jitterSign[0], -d.jitterY * Config().jitterSign[1]};
-    nss.motionVectorScale      = {d.mvScaleX * Config().mvSign[0], d.mvScaleY * Config().mvSign[1]};
+    // Both are in render pixels of the game's subrect; a resampled subrect's pixels are rx x ry context pixels.
+    const float rx             = float(renderW) / float(srcW);
+    const float ry             = float(renderH) / float(srcH);
+    nss.jitterOffset           = {-d.jitterX * Config().jitterSign[0] * rx, -d.jitterY * Config().jitterSign[1] * ry};
+    nss.motionVectorScale      = {d.mvScaleX * Config().mvSign[0] * rx, d.mvScaleY * Config().mvSign[1] * ry};
     nss.renderSize             = {renderW, renderH};
     nss.upscaleSize            = {m_info.displayWidth, m_info.displayHeight};
     nss.cameraNear             = Config().cameraNear;

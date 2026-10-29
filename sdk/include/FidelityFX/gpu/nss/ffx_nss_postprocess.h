@@ -1225,6 +1225,28 @@ half3 SimulateR11G11B10PrecisionPost(half3 rgb)
     return half3((1.0 + rgb_mant) * exp2(rgb_exp));
 }
 
+// Rounds a non-negative colour to the nearest R11G11B10_FLOAT value (ties to even), so that storing it to the R11G11B10
+// history is exact whatever rounding the hardware's format conversion uses. AMD GPUs (RADV, e.g. the Steam Deck's Van
+// Gogh) convert to the 11/10-bit floats by truncation; the history is re-read and re-stored every frame, so with
+// integer-pixel motion (the Catmull-Rom history fetch then returns one texel unchanged) the truncation compounds frame
+// after frame into dark pixels wherever no fresh centre sample is blended in, i.e. dark columns in flat bright areas.
+// On hardware that already rounds to nearest this is a no-op (the result is the value that hardware would store).
+half3 RoundToR11G11B10Nearest(half3 rgb)
+{
+    // Works on the fp32 value (the colour is fp32 in the non-FFX_HALF permutations), so the result is the single
+    // correctly rounded R11G11B10 value. Normal range: round the fp32 mantissa to 6/6/5 bits, ties to even (a carry
+    // moves to the next exponent). Below 2^-14 the formats are denormal with a fixed step of 2^-20 / 2^-20 / 2^-19.
+    const uint32_t3 shift     = uint32_t3(17u, 17u, 18u);
+    const float3    step      = float3(9.5367431640625e-07, 9.5367431640625e-07, 1.9073486328125e-06);
+    const float3    max_value = float3(65024.0, 65024.0, 64512.0);  // largest finite values, (2 - 2^-m) * 2^15
+    float3          x         = max(float3(rgb), float3(0.0));
+    uint32_t3       bits      = floatBitsToUint(x);
+    bits += ((uint32_t3(1u) << (shift - uint32_t3(1u))) - uint32_t3(1u)) + ((bits >> shift) & uint32_t3(1u));
+    bits &= ~((uint32_t3(1u) << shift) - uint32_t3(1u));
+    float3 r = mix(uintBitsToFloat(bits), roundEven(x * (1.0 / step)) * step, lessThan(x, float3(6.103515625e-05)));
+    return half3(min(r, max_value));
+}
+
 void WriteUpsampledColour(int32_t2 pixel, half3 colour)
 {
     half3 to_write = SafeColour(colour);
@@ -1246,6 +1268,8 @@ void StorePrevUpscaledColor(int32_t2 iPxPos, half3 colour)
     half3 to_write = SafeColour(colour);
 #ifdef SIMULATE_R11G11B10_BEFORE_WRITE
     to_write = SimulateR11G11B10PrecisionPost(to_write);
+#else
+    to_write = RoundToR11G11B10Nearest(to_write);
 #endif
 #if defined(NSS_BIND_UAV_HISTORY_UPSCALED_COLOR)
     imageStore(rw_prev_upscaled_color, iPxPos, half4(to_write, 1.0));
