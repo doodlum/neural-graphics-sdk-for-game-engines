@@ -31,9 +31,19 @@
 //                 that frame the harness writes "code 0 0" to the file and waits for the proxy to re-read it (codes as
 //                 the plugin's: 0-2 NSS quality/balanced/performance, 9 FSR 3.1, ...). E.g. "9@0,1@40,0@80" is FH6's
 //                 session (FSR 3 -> NSS Balanced -> NSS Quality)
+// Measurement:
+//   --gputime     GPU time of each upscale (a timestamp pair around it on the same command list), reported as mean /
+//                 median / min / max over the frames after the first quarter (at most 20 skipped)
+//   --ffx         the DLL is an AMD FidelityFX API upscaler for D3D12 (ffxCreateContext / ffxDispatch, e.g. an
+//                 amd_fidelityfx_upscaler_dx12.dll) instead of an NGX DLL; --flags maps onto its create flags, with
+//                 the proxy's camera defaults (near 0.1, far 100000, 60 degrees)
 // SPDX-License-Identifier: MIT
 #include <d3d12.h>
 #include <windows.h>
+
+#include "amd_ffx/ffx_api.h"
+#include "amd_ffx/ffx_api_dx12.h"
+#include "amd_ffx/ffx_upscale.h"
 
 #include <algorithm>
 #include <cmath>
@@ -164,7 +174,7 @@ int main(int argc, char** argv)
     const char* replayDir = nullptr;
     int         first = 0, count = 8, loops = 1, createFlags = 11, perf = 0;
     bool        crop = false, color16 = false, anySize = false, sync = false, depth32f = false, subrect = false,
-                gamework = false, outR11 = false;
+                gamework = false, outR11 = false, gpuTime = false, ffx = false;
     unsigned    outTexW = 0, outTexH = 0;
     unsigned    depthPadW = 0, depthPadH = 0, depthBaseX = 0, depthBaseY = 0;
     UINT64      placed = UINT64(-1);
@@ -191,6 +201,8 @@ int main(int argc, char** argv)
         else if (a == "--typeless") g_typeless = true;
         else if (a == "--subrect") subrect = true;
         else if (a == "--gamework") gamework = true;
+        else if (a == "--gputime") gpuTime = true;
+        else if (a == "--ffx") ffx = true;
         else if (a == "--depthpad" && more) sscanf(argv[++i], "%u,%u", &depthPadW, &depthPadH);
         else if (a == "--outsize" && more) sscanf(argv[++i], "%u,%u", &outTexW, &outTexH);
         else if (a == "--depthbase" && more) sscanf(argv[++i], "%u,%u", &depthBaseX, &depthBaseY);
@@ -240,10 +252,23 @@ int main(int argc, char** argv)
 
     HMODULE ngx = LoadLibraryA(dll);
     if (!ngx) { printf("FAIL: cannot load %s\n", dll); return 1; }
+    PfnFfxCreateContext ffxCreate = nullptr;
+    PfnFfxDispatch      ffxRun = nullptr;
+    PfnFfxDestroyContext ffxDestroy = nullptr;
+    if (ffx)
+    {
+        ffxCreate  = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(ngx, "ffxCreateContext"));
+        ffxRun     = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(ngx, "ffxDispatch"));
+        ffxDestroy = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(ngx, "ffxDestroyContext"));
+        if (!ffxCreate || !ffxRun || !ffxDestroy) { printf("FAIL: %s is not an FFX API DLL\n", dll); return 1; }
+    }
+    else
+    {
 #define LOAD(name) name = reinterpret_cast<PFN_##name>(GetProcAddress(ngx, #name)); if (!name) { printf("FAIL: missing %s\n", #name); return 1; }
     LOAD(NVSDK_NGX_D3D12_Init) LOAD(NVSDK_NGX_D3D12_GetCapabilityParameters) LOAD(NVSDK_NGX_D3D12_AllocateParameters)
     LOAD(NVSDK_NGX_D3D12_CreateFeature) LOAD(NVSDK_NGX_D3D12_EvaluateFeature) LOAD(NVSDK_NGX_D3D12_ReleaseFeature)
     LOAD(NVSDK_NGX_D3D12_DestroyParameters) LOAD(NVSDK_NGX_D3D12_Shutdown1)
+    }
 
     ID3D12Device* dev = nullptr;
     CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev)));
@@ -271,7 +296,7 @@ int main(int argc, char** argv)
         return fenceValue;
     };
 
-    if (NVSDK_NGX_D3D12_Init(0x1234, L".", dev, nullptr, 0x14) != kSuccess) { printf("FAIL: Init\n"); return 1; }
+    if (!ffx && NVSDK_NGX_D3D12_Init(0x1234, L".", dev, nullptr, 0x14) != kSuccess) { printf("FAIL: Init\n"); return 1; }
 
     // ---- dumped inputs ----
     struct Frame { Raw color, mv, depth; float jx = 0, jy = 0, sx = 1, sy = 1; };
@@ -332,6 +357,7 @@ int main(int argc, char** argv)
            depth32f ? "R32_FLOAT" : "R32_TYPELESS+DSV", outW, outH);
 
     // ---- capability query, as games do before creating the feature ----
+    if (!ffx)
     {
         Params* caps = nullptr;
         int available = 0;
@@ -458,8 +484,33 @@ int main(int argc, char** argv)
     for (ID3D12Resource* b : uploads) b->Release();
     uploads.clear();
 
-    // ---- feature ----
+    // ---- feature (NGX) or context (FFX) ----
     Params* p = nullptr;
+    Handle* feature = nullptr;
+    ffxContext fx = nullptr;
+    // DLSS create flags as FFX upscale flags: HDR (1), low-res MVs (2, else display-res), inverted depth (8), auto
+    // exposure (64)
+    const bool ffxDepthInv = createFlags & 8;
+    if (ffx)
+    {
+        struct { ffxCreateContextDescHeader header; ID3D12Device* device; } backend = {};
+        backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+        backend.device      = dev;
+        ffxCreateContextDescUpscale create = {};
+        create.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+        create.header.pNext = &backend.header;
+        create.flags = FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION | ((createFlags & 1) ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0) |
+                       ((createFlags & 2) ? 0 : FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) |
+                       (ffxDepthInv ? FFX_UPSCALE_ENABLE_DEPTH_INVERTED : 0) |
+                       ((createFlags & 64) ? FFX_UPSCALE_ENABLE_AUTO_EXPOSURE : 0);
+        create.maxRenderSize  = {rw, rh};
+        create.maxUpscaleSize = {outW, outH};
+        const ffxReturnCode_t rc = ffxCreate(&fx, &create.header, nullptr);
+        if (rc != FFX_API_RETURN_OK) { printf("FAIL: ffxCreateContext = %u\n", rc); return 1; }
+        printf("FFX context %ux%u -> %ux%u, flags 0x%x\n", rw, rh, outW, outH, create.flags);
+    }
+    else
+    {
     NVSDK_NGX_D3D12_AllocateParameters(&p);
     p->Set("Width", rw);
     p->Set("Height", rh);
@@ -470,10 +521,22 @@ int main(int argc, char** argv)
     p->Set("DLSS.Enable.Output.Subrects", 0);
     alloc[0]->Reset();
     list->Reset(alloc[0], nullptr);
-    Handle* feature = nullptr;
     if (NVSDK_NGX_D3D12_CreateFeature(list, 1, p, &feature) != kSuccess) { printf("FAIL: CreateFeature\n"); return 1; }
     allocFence[0] = submit();
     waitFor(allocFence[0]);
+    }
+
+    // GPU time per upscale: a timestamp pair around each, resolved into a readback buffer read at the end
+    const int evals = count * loops;
+    ID3D12QueryHeap* tsHeap = nullptr;
+    ID3D12Resource* tsBuf = nullptr;
+    if (gpuTime)
+    {
+        D3D12_QUERY_HEAP_DESC qh = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, UINT(evals * 2), 0};
+        CHECK(dev->CreateQueryHeap(&qh, IID_PPV_ARGS(&tsHeap)));
+        tsBuf = makeBuffer(UINT64(evals) * 2 * sizeof(uint64_t), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!tsBuf) { printf("FAIL: timestamp buffer\n"); return 1; }
+    }
 
     ID3D12DescriptorHeap* uavHeap = nullptr;
     if (gamework)
@@ -506,6 +569,8 @@ int main(int argc, char** argv)
             list->ClearUnorderedAccessViewFloat(uavHeap->GetGPUDescriptorHandleForHeapStart(), cpuHeap->GetCPUDescriptorHandleForHeapStart(), scratch, v, 0, nullptr);
         }
         const Frame& f = frames[i % count];
+        if (!ffx)
+        {
         p->Set("Color", static_cast<void*>(textures[(i % count) * 3 + 0]));
         p->Set("MotionVectors", static_cast<void*>(textures[(i % count) * 3 + 1]));
         p->Set("Depth", static_cast<void*>(textures[(i % count) * 3 + 2]));
@@ -523,12 +588,63 @@ int main(int argc, char** argv)
         }
         p->Set("DLSS.Input.Depth.Subrect.Base.X", depthBaseX);
         p->Set("DLSS.Input.Depth.Subrect.Base.Y", depthBaseY);
-        if (NVSDK_NGX_D3D12_EvaluateFeature(list, feature, p, nullptr) != kSuccess) { printf("FAIL: EvaluateFeature %d\n", i); return 1; }
+        }
+        if (gpuTime) list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, UINT(i * 2));
+        if (ffx)
+        {
+            ffxDispatchDescUpscale up = {};
+            up.header.type   = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+            up.commandList   = list;
+            up.color         = ffxApiGetResourceDX12(textures[(i % count) * 3 + 0], FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            up.motionVectors = ffxApiGetResourceDX12(textures[(i % count) * 3 + 1], FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            up.depth         = ffxApiGetResourceDX12(textures[(i % count) * 3 + 2], FFX_API_RESOURCE_STATE_COMPUTE_READ);
+            up.output        = ffxApiGetResourceDX12(output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            up.jitterOffset      = {f.jx, f.jy};
+            up.motionVectorScale = {f.sx, f.sy};
+            up.renderSize  = {rw, rh};
+            up.upscaleSize = {outW, outH};
+            up.frameTimeDelta = 16.6f;
+            up.preExposure    = 1.0f;
+            up.reset          = i == 0;
+            up.cameraNear = ffxDepthInv ? 100000.0f : 0.1f;
+            up.cameraFar  = ffxDepthInv ? 0.1f : 100000.0f;
+            up.cameraFovAngleVertical  = 60.0f * 3.14159265f / 180.0f;
+            up.viewSpaceToMetersFactor = 1.0f;
+            const ffxReturnCode_t rc = ffxRun(&fx, &up.header);
+            if (rc != FFX_API_RETURN_OK) { printf("FAIL: ffxDispatch %d = %u\n", i, rc); return 1; }
+        }
+        else if (NVSDK_NGX_D3D12_EvaluateFeature(list, feature, p, nullptr) != kSuccess) { printf("FAIL: EvaluateFeature %d\n", i); return 1; }
+        if (gpuTime)
+        {
+            list->EndQuery(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, UINT(i * 2 + 1));
+            list->ResolveQueryData(tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, UINT(i * 2), 2, tsBuf, UINT64(i) * 2 * sizeof(uint64_t));
+        }
         allocFence[k] = submit();
         if (sync) waitFor(allocFence[k]);
     }
     waitFor(fenceValue);
     printf("%d evaluations in %lu ms\n", count * loops, GetTickCount() - t0);
+    if (gpuTime)
+    {
+        UINT64 freq = 1;
+        queue->GetTimestampFrequency(&freq);
+        const uint64_t* ts = nullptr;
+        CHECK(tsBuf->Map(0, nullptr, (void**)&ts));
+        const int skip = std::min(20, evals / 4);
+        std::vector<double> us;
+        for (int i = skip; i < evals; ++i)
+            us.push_back(double(ts[i * 2 + 1] - ts[i * 2]) * 1e6 / double(freq));
+        tsBuf->Unmap(0, nullptr);
+        if (!us.empty())
+        {
+            double sum = 0;
+            for (double v : us) sum += v;
+            std::vector<double> sorted = us;
+            std::sort(sorted.begin(), sorted.end());
+            printf("harness GPU time per upscale: mean %.1f us, median %.1f, min %.1f, max %.1f over %zu evaluations\n",
+                   sum / us.size(), sorted[sorted.size() / 2], sorted.front(), sorted.back(), us.size());
+        }
+    }
 
     // ---- read back ----
     const unsigned obpp = outR11 ? 4 : 8;
@@ -579,9 +695,14 @@ int main(int argc, char** argv)
     if (saveFile)
         if (FILE* f = fopen(saveFile, "wb")) { fwrite(out.data(), 2, out.size(), f); fclose(f); printf("saved %s\n", saveFile); }
 
-    NVSDK_NGX_D3D12_ReleaseFeature(feature);
-    NVSDK_NGX_D3D12_DestroyParameters(p);
-    NVSDK_NGX_D3D12_Shutdown1(dev);
+    if (ffx)
+        ffxDestroy(&fx, nullptr);
+    else
+    {
+        NVSDK_NGX_D3D12_ReleaseFeature(feature);
+        NVSDK_NGX_D3D12_DestroyParameters(p);
+        NVSDK_NGX_D3D12_Shutdown1(dev);
+    }
     printf("PASS\n");
     return 0;
 }
