@@ -239,8 +239,7 @@ the original SPIR-V, so a replacement only ever applies to the exact module it w
 - `fsr4_shaders.bin`: the Deck's set. Bit-exact rewrites of AMD's passes (wave-uniform weights loaded into SGPRs,
   LDS sharing, unrolled loops, integer requantisation and output tails, cheaper packing and addressing) plus small
   precision changes: the prepass convolution accumulates exact f16 products in f32, the history reprojection uses one
-  bilinear fetch instead of a 9-tap Catmull-Rom, requantisation rounds half up (only exact ties differ, by one step),
-  and the postpass's upscaling filter uses 5 of the network's 9 taps (the centre and its 4 neighbours).
+  bilinear fetch instead of a 9-tap Catmull-Rom, and requantisation rounds half up (only exact ties differ, by one step).
   The set also takes over two jobs, declared in an options entry in the pack: its colour readers clean Inf / NaN
   colour themselves (so the proxy skips its clean-up pass below), and its prepass and pass 2 zero the tensor border
   rings that four small DLL dispatches otherwise clear (so the proxy does not record those dispatches). Older proxies
@@ -252,17 +251,17 @@ the original SPIR-V, so a replacement only ever applies to the exact module it w
   first pack.
 
 Against AMD's own shaders, replaying 8 captured game frames ×4 through the D3D11 path for all 16 combinations of HDR,
-motion-vector resolution, depth direction and auto exposure, the output stays within 65.6–67.1 dB (tonemapped PSNR;
-the differences sit on geometry edges, a faint 2-pixel grid in amplified diffs, and are not visible side by side at
-1:1). Frame-to-frame flicker on static content is 0.094–0.096 against AMD's own 0.084–0.090 run-to-run spread, and
-static edges are 0.35% sharper. Without the 5-tap filter the set stays within 69.1–72.7 dB, at 0.08 ms more. Method, per-pass numbers, everything tried and the remaining
-limits: [`docs/fsr4_deck_tuning.md`](../docs/fsr4_deck_tuning.md).
+motion-vector resolution, depth direction and auto exposure, the output stays within 69.1–72.7 dB (tonemapped PSNR;
+the largest differences are single pixels in a dithered shadow edge, invisible at 1:1), and frame-to-frame flicker on
+static content stays inside AMD's own run-to-run spread. In captured camera pans of 4–16 px per frame the output stays
+within 54.5–55.4 dB of AMD's in 8-bit display space, with 0.003–0.009% of pixels off by more than 8/255. Method,
+per-pass numbers, everything tried and the remaining limits: [`docs/fsr4_deck_tuning.md`](../docs/fsr4_deck_tuning.md).
 
 | FSR 4 Lite, 2x | AMD's shaders | Replacement shaders |
 | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.05 ms |
-| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 1.89 ms |
-| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.23 ms |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.13 ms |
+| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 1.96 ms |
+| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.30 ms |
 
 For comparison, the D3D12 interop that Vulkan games used before cost 4.6 ms plus about 2.8 ms of cross-queue idle
 per frame, and AMD's D3D12 DLL natively 2.8 ms.
