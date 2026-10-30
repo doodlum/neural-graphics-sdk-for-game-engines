@@ -27,6 +27,15 @@ PFN_vkGetInstanceProcAddr LoaderGipa()
     return vulkan ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(vulkan, "vkGetInstanceProcAddr")) : nullptr;
 }
 
+}  // namespace
+
+uint32_t VkMlFeatures(VkInstance instance, VkPhysicalDevice pd, PFN_vkGetInstanceProcAddr gipa)
+{
+    return ffxQueryMlDeviceFeaturesVK(instance, pd, gipa, nullptr, nullptr);
+}
+
+namespace
+{
 NVSDK_NGX_Result InitDevice(VkInstance instance, VkPhysicalDevice pd, VkDevice device, PFN_vkGetInstanceProcAddr gipa,
                             PFN_vkGetDeviceProcAddr gdpa)
 {

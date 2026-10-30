@@ -63,7 +63,9 @@ for pair in "$FSR4_VK_DIR/amd_fidelityfx_upscaler_vk.dll:amd_fidelityfx_upscaler
     fi
 done
 echo "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$REPO" diff --quiet 2>/dev/null || echo -dirty) built $(date -u +%Y-%m-%dT%H:%MZ)" > "$HERE/bin/VERSION"
-(cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_aiss_ngx.so VkLayer_aiss_ngx.json libxess.dll \
+# The FFX forwarder (stands in for a game's amd_fidelityfx_vk.dll), bundled under its own name.
+install -m 0755 "$LOADER_DIR/ffx/amd_fidelityfx_vk.dll" "$HERE/bin/aiss_ffx_vk.dll"
+(cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_aiss_ngx.so VkLayer_aiss_ngx.json libxess.dll aiss_ffx_vk.dll \
     libxess-LICENSE.txt $FSR4_SUM > SHA256SUMS)
 
 if [ "${SKIP_FRONTEND:-0}" != 1 ]; then

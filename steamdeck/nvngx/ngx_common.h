@@ -42,6 +42,9 @@ UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& info);   // Vulkan: 
 UpscalerCreateInfo NgxRemapD3D11(const UpscalerCreateInfo& info);    // D3D11: FSR 4 native on DXVK's device, else interop
 UpscalerCreateInfo NgxRemapD3D11(const UpscalerCreateInfo& in);
 
+// FFX_API_VK_ML_FEATURE_* the GPU has (ngx_vulkan.cpp, which has the SDK's Vulkan header): what the AISS layer enables.
+uint32_t VkMlFeatures(VkInstance instance, VkPhysicalDevice pd, PFN_vkGetInstanceProcAddr gipa);
+
 // "NSS quality 2", "XeSS", "FSR 4 Lite", ...
 const char* UpscalerName(const UpscalerCreateInfo& info);
 

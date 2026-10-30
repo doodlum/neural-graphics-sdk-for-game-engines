@@ -253,7 +253,7 @@ class FakeLibraryTests(unittest.TestCase):
         g = self.game(self.steam, "1003", "Conflict Game", "ConflictGame", prefix=True)
         self.put(g / "Conflict.exe")
         self.put(g / "nvngx_dlss.dll", dlss)
-        self.put(g / "dxgi.dll", b"MZ OptiScaler")
+        self.put(g / "dxgi.dll", b"MZ ReShade")  # another mod that takes dxgi.dll (OptiScaler is removed instead)
         # 1004: on the second library, never launched (no prefix)
         g = self.game(self.lib2, "1004", "Fresh Game", "FreshGame", prefix=False)
         self.put(g / "bin/x64/Fresh.exe")
@@ -476,6 +476,85 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertFalse(self.core.state["games"]["1003"]["enabled"])
         lo = self.core.launch_options("1003", "-foo", True)
         self.assertFalse(lo["ok"])
+
+    def test_optiscaler_removed_and_originals_restored(self):
+        # DOOM: The Dark Ages as Decky Framegen and HelixSR left it: OptiScaler as winmm.dll, the game's dbghelp.dll
+        # backed up as .b (our shim takes that name), Framegen's support DLLs (one with a backed-up original), and
+        # HelixSR's FSR drop-in with the DLL it replaced kept as .original.dll.
+        g = self.steam / "steamapps/common/DoomLike"
+        (g / "winmm.dll").write_bytes(b"MZ OptiScaler injector")
+        (g / "OptiScaler.ini").write_text("[Spoofing]\n")
+        (g / "FRAMEGEN_PATCH").write_text('{"dll_name": "winmm.dll"}')
+        (g / "D3D12_Optiscaler").mkdir()
+        (g / "D3D12_Optiscaler/D3D12Core.dll").write_bytes(b"MZ")
+        (g / "plugins").mkdir()
+        (g / "plugins/OptiPatcher.asi").write_bytes(b"MZ")
+        (g / "plugins/game_plugin.dll").write_bytes(b"MZ game")
+        (g / "fakenvapi.dll").write_bytes(b"MZ")
+        (g / "libxess.dll").write_bytes(b"MZ framegen copy")
+        (g / "amd_fidelityfx_vk.dll").write_bytes(b"MZ framegen copy")
+        (g / "amd_fidelityfx_vk.dll.b").write_bytes(b"MZ game original")
+        (g / "dbghelp.dll.b").write_bytes(b"MZ game dbghelp")
+        (g / "amd_fidelityfx_upscaler_dx12.dll").write_bytes(b"MZ HLX FSR 4")
+        (g / "amd_fidelityfx_upscaler_dx12.original.dll").write_bytes(b"MZ framegen copy")
+        (g / "helixsr-install.json").write_text('{"helixsr": "2.0.0", "files": ["amd_fidelityfx_upscaler_dx12.dll"]}')
+        other = self.steam / "steamapps/common/SLGame/libxess.dll"  # a game's own XeSS, no OptiScaler there
+        other.write_bytes(b"MZ game xess")
+        self.assertEqual(self.view("1006")["status"], "not_installed")
+        r = self.core.install_game("1006")
+        self.assertTrue(r["ok"], r)
+        for name in ("winmm.dll", "OptiScaler.ini", "FRAMEGEN_PATCH", "D3D12_Optiscaler", "plugins/OptiPatcher.asi",
+                     "fakenvapi.dll", "libxess.dll", "amd_fidelityfx_upscaler_dx12.dll",
+                     "amd_fidelityfx_upscaler_dx12.original.dll", "helixsr-install.json", "amd_fidelityfx_vk.dll.b"):
+            self.assertFalse((g / name).exists(), name)
+        self.assertEqual((g / "amd_fidelityfx_vk.dll").read_bytes(), b"MZ game original")
+        archived = list((g / ".aiss-optiscaler-removed").iterdir())  # moved aside, not deleted
+        self.assertEqual(len(archived), 1)
+        self.assertEqual((archived[0] / "winmm.dll").read_bytes(), b"MZ OptiScaler injector")
+        self.assertEqual((archived[0] / "libxess.dll").read_bytes(), b"MZ framegen copy")
+        self.assertTrue((archived[0] / "D3D12_Optiscaler/D3D12Core.dll").is_file())
+        self.assertEqual((archived[0] / "amd_fidelityfx_vk.dll").read_bytes(), b"MZ framegen copy")
+        self.assertEqual((archived[0] / "amd_fidelityfx_upscaler_dx12.dll").read_bytes(), b"MZ HLX FSR 4")
+        self.assertEqual((archived[0] / "amd_fidelityfx_upscaler_dx12.dll.1").read_bytes(), b"MZ framegen copy")
+        self.assertEqual((g / "plugins/game_plugin.dll").read_bytes(), b"MZ game")
+        self.assertEqual((g / "dbghelp.dll").read_bytes(), (self.bin / "dbghelp.dll").read_bytes())  # our shim
+        self.assertEqual((g / "dbghelp.dll.b").read_bytes(), b"MZ game dbghelp")
+        self.assertEqual(other.read_bytes(), b"MZ game xess")
+        self.assertEqual(self.view("1006")["status"], "installed")
+        # a later OptiScaler install is removed again by the periodic repair, but not while the game runs
+        (g / "dxgi.dll").write_bytes(b"MZ OptiScaler again")
+        self.core.is_running = lambda appid: True
+        self.core.verify_all()
+        self.assertTrue((g / "dxgi.dll").exists())
+        self.core.is_running = lambda appid: False
+        self.core.verify_all()
+        self.assertFalse((g / "dxgi.dll").exists())
+
+    def test_ffx_forwarder_install_update_uninstall(self):
+        fwd = REPO / "build_win_loader/ffx/amd_fidelityfx_vk.dll"
+        if not fwd.is_file():
+            self.skipTest("forwarder not built")
+        b = self.tmp / "bin_ffx"
+        b.mkdir()
+        for f in self.bin.iterdir():
+            os.symlink(f.resolve(), b / f.name)
+        shutil.copy(fwd, b / "aiss_ffx_vk.dll")
+        self.core = self.make_core(bin_dir=b)
+        ffx = self.steam / "steamapps/common/DoomLike/amd-ffx"
+        self.put(ffx / "amd_fidelityfx_vk.dll", b"MZ AMD ffx")
+        r = self.core.install_game("1006")
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((ffx / "amd_fidelityfx_vk.dll").read_bytes(), fwd.read_bytes())
+        self.assertEqual((ffx / "amd_fidelityfx_vk.aiss-orig.dll").read_bytes(), b"MZ AMD ffx")
+        self.assertEqual(self.view("1006")["status"], "installed")
+        # a game update brings a new AMD DLL under the forwarder's name: it becomes the kept original
+        (ffx / "amd_fidelityfx_vk.dll").write_bytes(b"MZ AMD ffx v2")
+        self.core.verify_all()
+        self.assertEqual((ffx / "amd_fidelityfx_vk.dll").read_bytes(), fwd.read_bytes())
+        self.assertEqual((ffx / "amd_fidelityfx_vk.aiss-orig.dll").read_bytes(), b"MZ AMD ffx v2")
+        self.core.uninstall_game("1006")
+        self.assertEqual((ffx / "amd_fidelityfx_vk.dll").read_bytes(), b"MZ AMD ffx v2")
+        self.assertFalse((ffx / "amd_fidelityfx_vk.aiss-orig.dll").exists())
 
     def test_prefix_created_later(self):
         r = self.core.install_game("1004")

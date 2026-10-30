@@ -51,9 +51,10 @@ BIN_FILES = {
     "fsr4_vk_license": "amd_fidelityfx-LICENSE.md",  # the FSR SDK licence, shipped with it
     "fsr4_shaders": "fsr4_shaders.bin",     # replacement FSR 4 Lite shader modules for the Vulkan path (not in the repo)
     "fsr4_shaders_dot2": "fsr4_shaders_dot2.bin",  # their v_dot2 variants, used when the device has the VALVE extension
+    "ffx_vk": "aiss_ffx_vk.dll",            # FFX forwarder: takes the place of a game's amd_fidelityfx_vk.dll
 }
 # Bundle files the plugin works without (the build skips them when they are not available locally).
-OPTIONAL_BIN = ("fsr4_dx12", "fsr4_vk", "fsr4_vk_license", "fsr4_shaders", "fsr4_shaders_dot2")
+OPTIONAL_BIN = ("fsr4_dx12", "fsr4_vk", "fsr4_vk_license", "fsr4_shaders", "fsr4_shaders_dot2", "ffx_vk")
 CORE_DEST_NAME = "_nvngx.dll"
 XESS_DEST_NAME = "libxess.dll"
 # AMD's FSR 4 DLLs go in a private subfolder so Proton's own amdxcffx64.dll in system32 cannot shadow them.
@@ -74,6 +75,11 @@ REG_BACKUP_SUFFIX = ".aiss-bak"
 # manifest (e.g. one copied by hand during development) so it can be replaced instead of being reported as a conflict.
 SHIM_MARKER = "AISS_SIGNED_DLL".encode("utf-16-le")
 CORE_MARKER = b"AISS_RATIO"
+FFX_MARKER = b"AISS_FfxForwarderVersion"
+# A game's FSR (AMD FidelityFX API, Vulkan): the forwarder takes the DLL's name and sends upscaling to the proxy;
+# AMD's DLL stays next to it under FFX_VK_ORIG for everything else (and is put back on uninstall).
+FFX_VK_NAME = "amd_fidelityfx_vk.dll"
+FFX_VK_ORIG = "amd_fidelityfx_vk.aiss-orig.dll"
 
 SIG_OVERRIDE_VALUE = "{41FCC608-8496-4DEF-B43E-7D9BD675A6FF}"
 REG_KEY_PATH = "Software\\NVIDIA Corporation\\Global"  # relative to HKLM, as Wine stores it in system.reg
@@ -431,6 +437,110 @@ def pe_imports(path: str) -> set[str]:
         return set()
 
 
+# ---- other upscaler mods ---------------------------------------------------------------------------------------------
+# OptiScaler (installed by hand, by Decky Framegen, or as HelixSR Scaler) hooks the same DLSS calls, GPU queries and
+# Vulkan/DXGI objects as the proxy, so the two cannot share a game: the plugin moves it out of the games it manages
+# (into OPTI_ARCHIVE in the game folder: a rename on the same disk, never loaded from there, and reversible) and puts
+# back the game files OptiScaler's installers backed up. Files OptiScaler shares its name with (XeSS, FidelityFX,
+# AMD driver DLLs) are removed only when they are provably the installer's: a backed-up original exists (restored),
+# or Decky Framegen's FRAMEGEN_PATCH marker shows it installed into a folder that had none (it backs originals up).
+OPTI_MARKER = b"OptiScaler"
+OPTI_INJECTORS = ("dxgi.dll", "winmm.dll", "version.dll", "dbghelp.dll", "wininet.dll", "winhttp.dll", "d3d12.dll",
+                  "OptiScaler.dll", "OptiScaler.asi")
+OPTI_FILES = ("OptiScaler.ini", "OptiScaler.log", "FRAMEGEN_PATCH", "fgmod-uninstaller.sh",
+              "dlssg_to_fsr3_amd_is_better.dll", "dlssg_to_fsr3_amd_is_better-3.0.dll", "dlssg_to_fsr3.ini",
+              "dlssg_to_fsr3.log", "fakenvapi.dll", "fakenvapi.ini", "fakenvapi.log", "nvngx.ini", "nvngx-wrapper.dll",
+              "dlss-enabler.dll", "dlss-enabler-upscaler.dll", "dlss-enabler.log", "helixsr.ini", "helixsr-install.json",
+              "HelixSR-Scaler-remove.sh", "HLX_FSR.log")
+OPTI_DIRS = ("D3D12_Optiscaler", "OptiScaler", "HelixSR")  # OptiScaler's D3D12 runtime; HelixSR Scaler's folders
+OPTI_PLUGINS = ("OptiPatcher.asi",)
+OPTI_SUPPORT = ("libxess.dll", "libxess_dx11.dll", "libxess_fg.dll", "libxell.dll", "amd_fidelityfx_dx12.dll",
+                "amd_fidelityfx_framegeneration_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_vk.dll",
+                "amdxcffx64.dll", "amdxc64.dll", "d3dcompiler_47.dll")
+OPTI_BACKUP = ".b"  # Decky Framegen's suffix for the game files it replaced
+OPTI_ARCHIVE = ".aiss-optiscaler-removed"  # per game folder, one timestamped subfolder per removal
+
+
+def _is_optiscaler(path: Path) -> bool:
+    return path.is_file() and not file_contains(path, SHIM_MARKER) and file_contains(path, OPTI_MARKER)
+
+
+def remove_optiscaler(folders, log) -> list[str]:
+    """Moves an OptiScaler install out of the given game folders (into <folder>/OPTI_ARCHIVE/<time>/) and restores
+    the files its installers backed up; returns what was done. Nothing happens in a folder without OptiScaler (its
+    ini, an OptiScaler injector DLL or Decky Framegen's marker)."""
+    done: list[str] = []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive: Path | None = None
+
+    def unlink(p: Path) -> None:
+        try:
+            dst = archive / p.relative_to(folder)
+            n = 1
+            while dst.exists():  # the same name archived twice (a restored original archived in turn)
+                dst = archive / f"{p.relative_to(folder)}.{n}"
+                n += 1
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(p, dst)
+            done.append(f"moved {p} to {archive}")
+        except OSError as e:
+            log.warning(f"cannot move {p} aside: {e}")
+
+    def restore(backup: Path, dst: Path) -> None:
+        if dst.exists():
+            unlink(dst)  # what the installer put there goes to the archive too
+        try:
+            os.replace(backup, dst)
+            done.append(f"restored {dst}")
+        except OSError as e:
+            log.warning(f"cannot restore {dst}: {e}")
+
+    for folder in dict.fromkeys(Path(f) for f in folders if f):
+        if not folder.is_dir():
+            continue
+        injectors = [folder / n for n in OPTI_INJECTORS if _is_optiscaler(folder / n)]
+        framegen = (folder / "FRAMEGEN_PATCH").is_file()
+        if not injectors and not framegen and not (folder / "OptiScaler.ini").is_file():
+            continue
+        archive = folder / OPTI_ARCHIVE / stamp
+        for p in injectors:
+            unlink(p)
+            backup = p.with_name(p.name + OPTI_BACKUP)
+            if backup.is_file() and not p.exists():
+                restore(backup, p)
+        # HelixSR's FSR drop-in replaced the game's FidelityFX DLLs, keeping them as <name>.original.dll
+        hlx = folder / "helixsr-install.json"
+        if hlx.is_file():
+            try:
+                for name in json.loads(hlx.read_text()).get("files", []):
+                    original = folder / (Path(name).stem + ".original" + Path(name).suffix)
+                    if original.is_file():
+                        restore(original, folder / name)
+            except (OSError, ValueError) as e:
+                log.warning(f"cannot read {hlx}: {e}")
+        for name in OPTI_FILES + OPTI_DIRS:
+            if (folder / name).exists():
+                unlink(folder / name)
+        plugins = folder / "plugins"
+        for name in OPTI_PLUGINS:
+            if (plugins / name).is_file():
+                unlink(plugins / name)
+        try:
+            if plugins.is_dir() and not any(plugins.iterdir()):
+                plugins.rmdir()
+        except OSError:
+            pass
+        for name in OPTI_SUPPORT:
+            p, backup = folder / name, folder / (name + OPTI_BACKUP)
+            if backup.is_file():
+                restore(backup, p)
+            elif framegen and p.is_file():
+                unlink(p)
+    for line in done:
+        log.info(f"OptiScaler: {line}")
+    return done
+
+
 PROXY_LOG = "aiss_nvngx.log"  # written by the proxy next to the running exe, rewritten on every launch
 
 
@@ -785,7 +895,7 @@ class AissCore:
     @staticmethod
     def walk_game(root: Path) -> dict:
         """Depth-limited walk collecting DLSS / Streamline DLLs and executables (paths relative to root)."""
-        found = {"dlss": [], "sl": [], "exes": []}
+        found = {"dlss": [], "sl": [], "exes": [], "ffx": []}
         entries = 0
         stack = [(str(root), 0)]
         while stack:
@@ -813,6 +923,8 @@ class AissCore:
                         found["dlss"].append(e.path)
                     elif low == SL_INTERPOSER:
                         found["sl"].append(e.path)
+                    elif low in (FFX_VK_NAME, FFX_VK_ORIG):
+                        found["ffx"].append(e.path)
                     elif low.endswith(".exe"):
                         found["exes"].append(e.path)
         return found
@@ -852,10 +964,12 @@ class AissCore:
         if cached and cached[0] == key and not force:
             return cached[1]
         root = app["install_path"]
-        info = {"has_dlss": False, "exe": None, "exe_dir": None, "sl_dirs": [], "shim": None, "targets": []}
+        info = {"has_dlss": False, "exe": None, "exe_dir": None, "sl_dirs": [], "shim": None, "targets": [],
+                 "ffx_dirs": []}
         if os.path.isdir(root):
             found = self.walk_game(Path(root))
             info["has_dlss"] = bool(found["dlss"])
+            info["ffx_dirs"] = sorted({os.path.dirname(p) for p in found["ffx"]})
             if info["has_dlss"]:
                 exes = found["exes"]
                 if exes:
@@ -1155,6 +1269,42 @@ class AissCore:
             gs.pop(k, None)
         return True
 
+    def _ffx_state(self, info: dict) -> list[tuple[Path, Path, str]]:
+        """(the game's amd_fidelityfx_vk.dll path, AMD's original kept beside it, its classification)."""
+        out = []
+        for d in info.get("ffx_dirs") or []:
+            p = Path(d) / FFX_VK_NAME
+            out.append((p, Path(d) / FFX_VK_ORIG, self._classify(p, "ffx_vk", None, FFX_MARKER)))
+        return out
+
+    def _install_ffx(self, gs: dict, info: dict) -> None:
+        if not self.bundle_path("ffx_vk").is_file():
+            return
+        files = gs.setdefault("ffx_files", {})
+        for p, orig, c in self._ffx_state(info):
+            if c == "foreign":
+                os.replace(p, orig)  # AMD's DLL (first install, or a game update brought a new one): keep it beside
+            elif c == "missing" and not orig.is_file():
+                continue
+            if c != "current":
+                atomic_copy(self.bundle_path("ffx_vk"), p)
+            files[str(p)] = self.bundle_hash("ffx_vk")
+
+    def _remove_ffx(self, gs: dict) -> list[str]:
+        warnings = []
+        for path in list((gs.get("ffx_files") or {})):
+            p = Path(path)
+            orig = p.with_name(FFX_VK_ORIG)
+            c = self._classify(p, "ffx_vk", None, FFX_MARKER)
+            if c in ("current", "ours"):
+                p.unlink()
+            elif c == "foreign":
+                warnings.append(f"{p} is no longer ours; left in place")
+            if orig.is_file() and not p.exists():
+                os.replace(orig, p)
+            gs["ffx_files"].pop(path, None)
+        return warnings
+
     def install_game(self, appid: str, force_rescan: bool = True) -> dict:
         appid = str(appid)
         app = self._app(appid)
@@ -1168,6 +1318,10 @@ class AissCore:
             return {"ok": False, "status": "error", "message": f"{DLSS_DLL} not found in the game folder"}
         gs = self._game_state(appid)
         files = gs.setdefault("files", {})
+        if not self.is_running(appid):
+            removed = remove_optiscaler(self._mod_folders(info), self.log)
+            if removed:
+                gs["optiscaler_removed"] = len(removed)
 
         # A game update may have switched the shim (Streamline added/removed): drop the old one first.
         if gs.get("shim") and gs["shim"] != info["shim"]:
@@ -1187,6 +1341,7 @@ class AissCore:
             if self._classify(d, info["shim"], files.get(str(d)), SHIM_MARKER) != "current":
                 atomic_copy(shim_src, d)
             files[str(d)] = self.bundle_hash(info["shim"])
+        self._install_ffx(gs, info)
         gs.update(enabled=True, name=app["name"], shim=info["shim"], targets=info["targets"],
                   install_path=app["install_path"])
 
@@ -1230,6 +1385,7 @@ class AissCore:
         if not gs:
             return {"ok": True, "status": STATUS_NOT_INSTALLED, "message": ""}
         warnings = self._remove_shims(gs)
+        warnings += self._remove_ffx(gs)
         warnings += self._remove_core(gs)
         if not self._remove_registry(appid, gs):
             gs["reg_remove_pending"] = True
@@ -1241,7 +1397,25 @@ class AissCore:
         self.save_state()
         return {"ok": True, "status": STATUS_NOT_INSTALLED, "message": gs["message"]}
 
+    @staticmethod
+    def _mod_folders(info: dict) -> list[str]:
+        """Where other upscaler mods put their files: next to the game's exe and next to its Streamline DLLs."""
+        return [f for f in [info.get("exe_dir"), *(info.get("targets") or [])] if f]
+
+    def _has_optiscaler(self, info: dict) -> bool:
+        for f in self._mod_folders(info):
+            d = Path(f)
+            if (d / "OptiScaler.ini").is_file() or (d / "FRAMEGEN_PATCH").is_file() or \
+                    any(_is_optiscaler(d / n) for n in OPTI_INJECTORS):
+                return True
+        return False
+
     def _needs_repair(self, app: dict, info: dict, gs: dict) -> bool:
+        if self._has_optiscaler(info):
+            return True
+        if self.bundle_path("ffx_vk").is_file() and \
+                any(c == "foreign" or (c != "current" and orig.is_file()) for _, orig, c in self._ffx_state(info)):
+            return True
         if gs.get("shim") != info["shim"] or sorted(gs.get("targets") or []) != sorted(info["targets"]):
             return True
         for t in info["targets"]:

@@ -59,6 +59,7 @@ add_library(nvngx SHARED
     ngx_d3d11.cpp
     ngx_d3d12.cpp
     ngx_vulkan.cpp
+    ffx_vulkan.cpp
     ngx_misc.cpp
     xess_upscaler.cpp
     fsr4_common.cpp
@@ -94,4 +95,7 @@ target_link_libraries(nvngx PRIVATE
     dxguid
     version)
 # Only the NGX entry points are exported (they carry __declspec(dllexport)).
-target_link_options(nvngx PRIVATE -Wl,--exclude-all-symbols -s)
+if(NOT DEFINED AISS_STRIP)
+    set(AISS_STRIP -s)
+endif()
+target_link_options(nvngx PRIVATE -Wl,--exclude-all-symbols ${AISS_STRIP})

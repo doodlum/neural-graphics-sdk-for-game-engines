@@ -25,3 +25,11 @@ foreach(list ${SHIM_LISTS})
     target_compile_definitions(shim_${name} PRIVATE WIN32_LEAN_AND_MEAN UNICODE _UNICODE SHIM_TARGET=L"${name}.dll")
     target_link_options(shim_${name} PRIVATE -s)
 endforeach()
+
+# FFX forwarder (ffx_forwarder.cpp): stands in for a game's amd_fidelityfx_vk.dll and sends its FSR upscaling to the proxy.
+add_library(ffxfwd_vk SHARED ffx_forwarder.cpp)
+set_target_properties(ffxfwd_vk PROPERTIES PREFIX "" OUTPUT_NAME amd_fidelityfx_vk RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/ffx")
+target_compile_features(ffxfwd_vk PRIVATE cxx_std_17)
+target_compile_options(ffxfwd_vk PRIVATE -O2 -Wall)
+target_compile_definitions(ffxfwd_vk PRIVATE WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+target_link_options(ffxfwd_vk PRIVATE -s -static-libgcc -static-libstdc++)

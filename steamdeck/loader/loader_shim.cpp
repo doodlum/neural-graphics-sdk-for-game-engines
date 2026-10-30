@@ -9,6 +9,9 @@
 #include <windows.h>
 #include <winternl.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <string>
 
@@ -126,7 +129,82 @@ static HANDLE WINAPI HookCreateFileW(LPCWSTR name, DWORD access, DWORD share, LP
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Import table patching (no code patching): every module's CreateFileW import is pointed at the hook.
+// AISS_SL_LOG=<folder> (diagnostics): Streamline's own log, which production games leave off. The game's slInit is
+// looked up with GetProcAddress; the hook hands out a wrapper that sets sl::Preferences' log level to verbose and its
+// log folder before calling it. Preferences (Streamline's public sl.h): BaseStructure {next, 16-byte type,
+// size_t version} = 32 bytes, then bool showConsole, LogLevel logLevel (0 off, 1 default, 2 verbose) at 36,
+// const wchar_t** pathsToPlugins at 40, uint32_t numPathsToPlugins at 48, const wchar_t* pathToLogsAndData at 56.
+// ---------------------------------------------------------------------------------------------------------------------
+using PFN_GetProcAddress = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+using PFN_slInit         = int(__cdecl*)(void* pref, uint64_t sdkVersion);
+static PFN_GetProcAddress g_realGetProcAddress = nullptr, g_kernel32GetProcAddress = nullptr;
+static PFN_slInit         g_realSlInit         = nullptr;
+static wchar_t            g_slLogDir[MAX_PATH] = {};
+
+static int __cdecl HookSlInit(void* pref, uint64_t sdkVersion)
+{
+    auto* b = static_cast<uint8_t*>(pref);
+    uint64_t version = 0;
+    uint32_t level   = 0;
+    if (b)
+    {
+        memcpy(&version, b + 24, sizeof(version));
+        memcpy(&level, b + 36, sizeof(level));
+    }
+    char line[160];
+    snprintf(line, sizeof(line), "aiss-shim: slInit(preferences version %llu, log level %u, sdk 0x%llx)\n",
+             (unsigned long long)version, level, (unsigned long long)sdkVersion);
+    OutputDebugStringA(line);
+    fputs(line, stderr);
+    if (b && version >= 1 && version < 64 && level < 3)
+    {
+        const uint32_t verbose = 2;
+        const wchar_t* dir     = g_slLogDir;
+        memcpy(b + 36, &verbose, sizeof(verbose));
+        memcpy(b + 56, &dir, sizeof(dir));
+    }
+    return g_realSlInit(pref, sdkVersion);
+}
+
+static FARPROC WINAPI HookGetProcAddress(HMODULE module, LPCSTR name)
+{
+    FARPROC fn = g_realGetProcAddress(module, name);
+    if (fn && reinterpret_cast<ULONG_PTR>(name) > 0xFFFF && !strcmp(name, "slInit"))
+    {
+        g_realSlInit = reinterpret_cast<PFN_slInit>(fn);
+        fputs("aiss-shim: GetProcAddress(slInit) wrapped\n", stderr);
+        return reinterpret_cast<FARPROC>(&HookSlInit);
+    }
+    return fn;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Vulkan instances for the proxy's FFX front end: AMD's FidelityFX API hands over a VkPhysicalDevice but not its
+// VkInstance, which XeSS and the SDK's Vulkan backend need. vkEnumeratePhysicalDevices records each physical device's
+// instance in the process environment as AISS_VK_PHYSDEV=<pd>=<instance>;... (most recent first, a few entries).
+// ---------------------------------------------------------------------------------------------------------------------
+using PFN_EnumPhysDevs = int32_t(__stdcall*)(void* instance, uint32_t* count, void** devices);
+static PFN_EnumPhysDevs g_realEnumPhysDevs = nullptr;
+
+static int32_t __stdcall HookEnumPhysDevs(void* instance, uint32_t* count, void** devices)
+{
+    const int32_t res = g_realEnumPhysDevs(instance, count, devices);
+    if ((res == 0 || res == 5) && devices && count)  // VK_SUCCESS, VK_INCOMPLETE
+    {
+        char list[1024] = {}, old[1024] = {};
+        GetEnvironmentVariableA("AISS_VK_PHYSDEV", old, sizeof(old));
+        size_t n = 0;
+        for (uint32_t i = 0; i < *count && n < 512; ++i)
+            n += snprintf(list + n, sizeof(list) - n, "%p=%p;", devices[i], instance);
+        snprintf(list + n, sizeof(list) - n, "%.*s", int(sizeof(list) - n - 1 > 400 ? 400 : sizeof(list) - n - 1), old);
+        SetEnvironmentVariableA("AISS_VK_PHYSDEV", list);
+    }
+    return res;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Import table patching (no code patching): every module's CreateFileW import is pointed at the hook (and GetProcAddress
+// with AISS_SL_LOG, and vkEnumeratePhysicalDevices).
 // ---------------------------------------------------------------------------------------------------------------------
 static void PatchModule(HMODULE module)
 {
@@ -145,12 +223,21 @@ static void PatchModule(HMODULE module)
         for (auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imp->FirstThunk); thunk->u1.Function; ++thunk)
         {
             void* target = reinterpret_cast<void*>(thunk->u1.Function);
-            if (target != reinterpret_cast<void*>(g_realCreateFileW) && target != reinterpret_cast<void*>(g_kernel32CreateFileW))
+            void* hook   = nullptr;
+            if (target == reinterpret_cast<void*>(g_realCreateFileW) || target == reinterpret_cast<void*>(g_kernel32CreateFileW))
+                hook = reinterpret_cast<void*>(&HookCreateFileW);
+            else if (g_realEnumPhysDevs && target == reinterpret_cast<void*>(g_realEnumPhysDevs))
+                hook = reinterpret_cast<void*>(&HookEnumPhysDevs);
+            else if (g_slLogDir[0] && g_realGetProcAddress &&
+                     (target == reinterpret_cast<void*>(g_realGetProcAddress) ||
+                      target == reinterpret_cast<void*>(g_kernel32GetProcAddress)))
+                hook = reinterpret_cast<void*>(&HookGetProcAddress);
+            if (!hook)
                 continue;
             DWORD old;
             if (VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &old))
             {
-                thunk->u1.Function = reinterpret_cast<ULONG_PTR>(&HookCreateFileW);
+                thunk->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
                 VirtualProtect(&thunk->u1.Function, sizeof(void*), old, &old);
             }
         }
@@ -183,8 +270,18 @@ using PFN_LdrRegisterDllNotification = NTSTATUS(NTAPI*)(ULONG, PFN_DllNotificati
 static VOID CALLBACK OnDllNotification(ULONG reason, const DllNotificationData* data, void*)
 {
     constexpr ULONG kLoaded = 1;
-    if (reason == kLoaded && data)
-        PatchModule(reinterpret_cast<HMODULE>(data->DllBase));
+    if (reason != kLoaded || !data)
+        return;
+    if (!g_realEnumPhysDevs && data->BaseDllName && data->BaseDllName->Buffer &&
+        !_wcsnicmp(data->BaseDllName->Buffer, L"vulkan-1.dll", data->BaseDllName->Length / sizeof(wchar_t)))
+    {
+        // vulkan-1.dll came after the shim: hook its vkEnumeratePhysicalDevices in everything loaded so far
+        g_realEnumPhysDevs = reinterpret_cast<PFN_EnumPhysDevs>(GetProcAddress(reinterpret_cast<HMODULE>(data->DllBase),
+                                                                               "vkEnumeratePhysicalDevices"));
+        PatchLoadedModules();
+        return;
+    }
+    PatchModule(reinterpret_cast<HMODULE>(data->DllBase));
 }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
@@ -196,6 +293,13 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
     g_kernel32CreateFileW = reinterpret_cast<PFN_CreateFileW>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileW"));
     if (!g_realCreateFileW)
         return TRUE;
+    if (GetEnvironmentVariableW(L"AISS_SL_LOG", g_slLogDir, MAX_PATH))
+    {
+        g_realGetProcAddress     = reinterpret_cast<PFN_GetProcAddress>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "GetProcAddress"));
+        g_kernel32GetProcAddress = reinterpret_cast<PFN_GetProcAddress>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcAddress"));
+    }
+    if (HMODULE vulkan = GetModuleHandleW(L"vulkan-1.dll"))
+        g_realEnumPhysDevs = reinterpret_cast<PFN_EnumPhysDevs>(GetProcAddress(vulkan, "vkEnumeratePhysicalDevices"));
     PatchLoadedModules();
     auto reg = reinterpret_cast<PFN_LdrRegisterDllNotification>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification"));
