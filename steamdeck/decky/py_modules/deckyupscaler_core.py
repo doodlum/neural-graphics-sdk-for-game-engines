@@ -196,12 +196,21 @@ class Logger:
 # Small helpers
 # --------------------------------------------------------------------------------------------------------------------
 
+_HASH_MEMO: dict[tuple[str, int, int], str] = {}
+
+
 def sha256_file(path: Path) -> str:
+    """SHA-256 of a file, memoised by (path, size, mtime) so status checks of large DLLs stay cheap."""
+    st = os.stat(path)
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    if key in _HASH_MEMO:
+        return _HASH_MEMO[key]
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    return h.hexdigest()
+    _HASH_MEMO[key] = h.hexdigest()
+    return _HASH_MEMO[key]
 
 
 def file_contains(path: Path, marker: bytes | tuple[bytes, ...], limit: int = 64 << 20) -> bool:
@@ -835,6 +844,8 @@ class UpscalerCore:
         self._scan_cache: dict[str, tuple[str, dict]] = {}
         self._imported = False
         self.state = self._load_state()
+        # per-game analysis survives restarts (keyed by install path, LastUpdated and buildid like the memory cache)
+        self._scan_cache.update({a: (v[0], v[1]) for a, v in (self.state.get("scan_cache") or {}).items()})
         if self._imported:
             self.log.info(f"imported the state of {LEGACY_PLUGIN} ({len(self.state['games'])} game(s))")
             try:
@@ -1098,6 +1109,7 @@ class UpscalerCore:
                     info["shim"] = "dxgi"
                     info["targets"] = [info["exe_dir"]]
         self._scan_cache[app["appid"]] = (key, info)
+        self.state.setdefault("scan_cache", {})[app["appid"]] = [key, info]
         return info
 
     def find_prefix(self, appid: str, library: str | None = None) -> Path | None:
@@ -1646,6 +1658,24 @@ class UpscalerCore:
             gs.pop("launch", None)
         self.save_state()
         return {"ok": True, "options": new, "changed": new != (current or "")}
+
+    LIVE_STATUS_MAX_AGE = 3.0  # seconds: the proxy rewrites the status about once a second while it upscales
+
+    def live_status(self) -> dict | None:
+        """What the proxy reports from the running game (<control>.status): upscaler, sizes, GPU time per upscale.
+        None when no game has upscaled in the last few seconds."""
+        path = self.control_path.with_name(self.control_path.name + ".status")
+        try:
+            status = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        age = time.time() - float(status.get("time", 0))
+        if age > self.LIVE_STATUS_MAX_AGE or age < -60:
+            return None
+        appid = str(status.get("appid") or "")
+        name = next((a["name"] for a in self.installed_apps() if a["appid"] == appid), None) if appid else None
+        status["name"] = name or status.get("exe") or "a game"
+        return status
 
     def _launcher(self, appid: str) -> tuple[str, str] | None:
         """(launcher, game exe) when the game starts through a launcher in LAUNCHERS next to its exe."""

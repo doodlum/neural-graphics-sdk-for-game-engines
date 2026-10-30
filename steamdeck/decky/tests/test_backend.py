@@ -14,6 +14,7 @@ import shutil
 import sys
 import struct
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -512,7 +513,9 @@ class FakeLibraryTests(unittest.TestCase):
                      "fakenvapi.dll", "libxess.dll", "amd_fidelityfx_upscaler_dx12.dll",
                      "amd_fidelityfx_upscaler_dx12.original.dll", "helixsr-install.json", "amd_fidelityfx_vk.dll.b"):
             self.assertFalse((g / name).exists(), name)
-        self.assertEqual((g / "amd_fidelityfx_vk.dll").read_bytes(), b"MZ game original")
+        # the restored original; with the FFX forwarder bundled it is kept beside the forwarder
+        kept = g / "amd_fidelityfx_vk.deckyupscaler-orig.dll"
+        self.assertEqual((kept if kept.exists() else g / "amd_fidelityfx_vk.dll").read_bytes(), b"MZ game original")
         archived = list((g / ".deckyupscaler-optiscaler-removed").iterdir())  # moved aside, not deleted
         self.assertEqual(len(archived), 1)
         self.assertEqual((archived[0] / "winmm.dll").read_bytes(), b"MZ OptiScaler injector")
@@ -575,6 +578,20 @@ class FakeLibraryTests(unittest.TestCase):
         # games without a launcher get no wrapper
         self.assertTrue(self.core.install_game("1002")["ok"])
         self.assertNotIn("bash -c", self.core.launch_options("1002", "", True)["options"])
+
+    def test_live_status(self):
+        status = self.core.control_path.with_name(self.core.control_path.name + ".status")
+        status.parent.mkdir(parents=True, exist_ok=True)
+        self.assertIsNone(self.core.live_status())
+        status.write_text(json.dumps({"time": time.time(), "appid": "1006", "exe": "DoomLike.exe", "upscaler": "XeSS",
+                                      "render": [453, 255], "output": [1280, 720], "gpu_us": 2310.0, "fps": 58.0}))
+        live = self.core.live_status()
+        self.assertEqual(live["name"], "DOOM Like")
+        self.assertEqual(live["upscaler"], "XeSS")
+        status.write_text(json.dumps({"time": time.time() - 10, "appid": "1006"}))  # the game stopped upscaling
+        self.assertIsNone(self.core.live_status())
+        status.write_text("{broken")
+        self.assertIsNone(self.core.live_status())
 
     def test_prefix_created_later(self):
         r = self.core.install_game("1004")

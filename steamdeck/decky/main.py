@@ -63,6 +63,7 @@ class Plugin:
             try:
                 if not _legacy_plugin_installed():
                     await self._run(self._core().verify_all)
+                Plugin._games = await self._run(self._core().scan, False)  # the panel opens on this
             except Exception as e:
                 decky.logger.error(f"verify failed: {e}")
             await asyncio.sleep(VERIFY_INTERVAL_S)
@@ -84,9 +85,14 @@ class Plugin:
 
     # ---- frontend API --------------------------------------------------------------------------------------------
 
+    _games = None  # the last scan: served as is when the panel opens (refreshed by the verify loop and every change)
+
     async def get_state(self, rescan: bool = False) -> dict:
         core = self._core()
-        games = await self._run(core.scan, bool(rescan))
+        if rescan or Plugin._games is None:
+            Plugin._games = await self._run(core.scan, bool(rescan))
+            await self._run(core.save_state)
+        games = Plugin._games
         return {
             "games": games,
             "settings": core.state["settings"],
@@ -95,16 +101,23 @@ class Plugin:
             "legacy_plugin": _legacy_plugin_installed(),
         }
 
+    async def get_status(self) -> dict | None:
+        return await self._run(self._core().live_status)
+
     async def enable_game(self, appid: str) -> dict:
+        Plugin._games = None  # changes the game list's state: rescanned on the next get_state
         return await self._run(self._core().install_game, str(appid))
 
     async def disable_game(self, appid: str) -> dict:
+        Plugin._games = None  # changes the game list's state: rescanned on the next get_state
         return await self._run(self._core().uninstall_game, str(appid))
 
     async def verify_now(self) -> list:
+        Plugin._games = None  # changes the game list's state: rescanned on the next get_state
         return await self._run(self._core().verify_all)
 
     async def compute_launch_options(self, appid: str, current: str, enable: bool) -> dict:
+        Plugin._games = None  # changes the game list's state: rescanned on the next get_state
         return await self._run(self._core().launch_options, str(appid), current or "", bool(enable))
 
     async def set_settings(self, settings: dict) -> dict:
@@ -121,6 +134,7 @@ class Plugin:
 
     async def game_stopped(self, appid: str) -> list:
         """Called by the frontend when a game exits: the prefix may now exist, deferred registry edits can run."""
+        Plugin._games = None  # changes the game list's state: rescanned on the next get_state
         if _legacy_plugin_installed():
             return []
         return await self._run(self._core().verify_all)

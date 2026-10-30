@@ -1,12 +1,16 @@
-// DU_GPU_TIMING=N: GPU timestamps around every upscale, read back without waiting (a few frames later) and logged
-// as an average over N evaluations. Off by default.
+// GPU timestamps around every upscale, read back without waiting (a few frames later). They feed the live status the
+// plugin shows (<control file>.status, written about once a second: the active upscaler, sizes and GPU time), and with
+// DU_GPU_TIMING=N (or the control file's gpu_timing) an average over N evaluations is also logged.
 // SPDX-License-Identifier: MIT
 #include "ngx_common.h"
 
 #include "common.h"
+#include "cost_model.h"
 
 #include <windows.h>
 
+#include <atomic>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -32,7 +36,54 @@ struct Timer
     int                         lastBackend = -1;
     std::string                 lastName;
     uint64_t                    reportedAt  = 0;  // GetTickCount64 of the last report
+    double                      smoothUs    = 0;  // exponential average for the live status
 };
+
+// The live status (one game at a time; the plugin ignores it once it is a few seconds old).
+struct Status
+{
+    std::string upscaler;
+    unsigned    renderW = 0, renderH = 0, outW = 0, outH = 0;
+    uint64_t    evaluations = 0, evalsAtWrite = 0, writtenAt = 0;
+};
+Status            g_status;
+std::atomic<int>  g_frontEnd{0};  // 0 DLSS (NGX), 1 FSR (FidelityFX API)
+
+void WriteStatus(double gpuUs)
+{
+    const std::string& control = ControlFilePath();
+    const uint64_t     now     = GetTickCount64();
+    if (control.empty() || (g_status.writtenAt && now - g_status.writtenAt < 1000))
+        return;
+    const double fps = g_status.writtenAt ? (g_status.evaluations - g_status.evalsAtWrite) * 1000.0 /
+                                                double(now - g_status.writtenAt)
+                                          : 0.0;
+    g_status.writtenAt    = now;
+    g_status.evalsAtWrite = g_status.evaluations;
+    char exe[MAX_PATH] = {}, appid[32] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    const char* slash = strrchr(exe, '\\');
+    GetEnvironmentVariableA("SteamAppId", appid, sizeof(appid));
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    const double unixTime = (double((uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) - 116444736000000000.0) / 1e7;
+    static const char* const kApi[] = {"", "D3D11", "D3D12", "Vulkan"};
+    const int api = int(CostGetApi());
+    char json[640];
+    snprintf(json, sizeof(json),
+             "{\"time\": %.1f, \"appid\": \"%s\", \"exe\": \"%s\", \"api\": \"%s\", \"input\": \"%s\", "
+             "\"upscaler\": \"%s\", \"render\": [%u, %u], \"output\": [%u, %u], \"gpu_us\": %.1f, \"fps\": %.1f}\n",
+             unixTime, appid, slash ? slash + 1 : exe, api >= 0 && api < 4 ? kApi[api] : "",
+             g_frontEnd ? "FSR" : "DLSS", g_status.upscaler.c_str(), g_status.renderW, g_status.renderH, g_status.outW,
+             g_status.outH, gpuUs, fps);
+    const std::string tmp = control + ".status.tmp", dst = control + ".status";
+    if (FILE* f = fopen(tmp.c_str(), "w"))
+    {
+        fputs(json, f);
+        fclose(f);
+        MoveFileExA(tmp.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+}
 
 std::mutex g_timerMutex;
 Timer      g_timer;
@@ -56,7 +107,8 @@ bool Setup(const VulkanDevice& dev)
     qci.queryCount            = Timer::kSlots * 2;
     if (createPool(dev.device, &qci, nullptr, &g_timer.pool) != VK_SUCCESS)
         g_timer.pool = VK_NULL_HANDLE;
-    LOGI("GPU timing on: upscale time averaged over %d evaluations", GpuTimingFrames());
+    if (GpuTimingFrames() > 0)
+        LOGI("GPU timing on: upscale time averaged over %d evaluations", GpuTimingFrames());
     return g_timer.pool != VK_NULL_HANDLE;
 }
 
@@ -79,6 +131,9 @@ void Collect(uint32_t slot)
         t.reportedAt  = 0;
     }
     const double us = double(r[2] - r[0]) * t.period / 1000.0;
+    t.smoothUs      = t.smoothUs > 0 ? t.smoothUs * 0.95 + us * 0.05 : us;
+    if (GpuTimingFrames() <= 0)
+        return;
     t.sum += us;
     t.minUs = us < t.minUs ? us : t.minUs;
     t.maxUs = us > t.maxUs ? us : t.maxUs;
@@ -95,21 +150,26 @@ void Collect(uint32_t slot)
 }
 }  // namespace
 
+void NgxSetFrontEnd(bool fsr)
+{
+    g_frontEnd = fsr ? 1 : 0;
+}
+
 bool NgxDispatch(Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerDispatch& d)
 {
-    if (GpuTimingFrames() <= 0)
-    {
-        const bool ok = upscaler->Dispatch(cmd, d);
-        NgxDumpFrame(upscaler, cmd, d.output);
-        return ok;
-    }
     std::lock_guard<std::mutex> lock(g_timerMutex);
+    g_status.upscaler = UpscalerName(upscaler->Info());
+    g_status.renderW = d.renderWidth, g_status.renderH = d.renderHeight;
+    g_status.outW = upscaler->Info().displayWidth, g_status.outH = upscaler->Info().displayHeight;
+    ++g_status.evaluations;
     if (!Setup(upscaler->Device()))
     {
+        WriteStatus(0.0);
         const bool ok = upscaler->Dispatch(cmd, d);
         NgxDumpFrame(upscaler, cmd, d.output);
         return ok;
     }
+    WriteStatus(g_timer.smoothUs);
     const uint32_t slot = uint32_t(g_timer.written++ % Timer::kSlots);
     Collect(slot);  // recorded kSlots evaluations ago: long retired
     g_timer.reset(cmd, g_timer.pool, slot * 2, 2);

@@ -51,6 +51,20 @@ interface State {
   legacy_plugin?: boolean; // the plugin under its former name (aiss-dlss-nss) is still installed
 }
 
+// What the proxy reports from the running game (about once a second; null when nothing upscales).
+interface LiveStatus {
+  appid: string;
+  name: string;
+  exe: string;
+  api: string;      // D3D11, D3D12, Vulkan
+  input: string;    // DLSS or FSR: what the game asked for
+  upscaler: string; // what runs instead
+  render: [number, number];
+  output: [number, number];
+  gpu_us: number;   // GPU time per upscale, smoothed
+  fps: number;      // upscales per second (the game's frame rate)
+}
+
 interface OpResult {
   ok: boolean;
   status: string;
@@ -58,6 +72,7 @@ interface OpResult {
 }
 
 const getState = callable<[rescan: boolean], State>("get_state");
+const getStatus = callable<[], LiveStatus | null>("get_status");
 const enableGame = callable<[appid: string], OpResult>("enable_game");
 const disableGame = callable<[appid: string], OpResult>("disable_game");
 const verifyNow = callable<[], OpResult[]>("verify_now");
@@ -132,6 +147,26 @@ function lastRunLine(g: Game): string {
   return `Last run (${ago}): ${g.last_run.text}`;
 }
 
+/** "XeSS · 453×255 → 1280×720 (2.8×)" */
+function liveTitle(st: LiveStatus): string {
+  const [rw, rh] = st.render;
+  const [ow, oh] = st.output;
+  const scale = rw > 0 ? ` (${(ow / rw).toFixed(1)}×)` : "";
+  return `${st.upscaler} · ${rw}×${rh} → ${ow}×${oh}${scale}`;
+}
+
+/** "2.30 ms per frame · 14% of a 60 fps frame · 58 fps · DLSS (Vulkan)" */
+function liveCost(st: LiveStatus): string {
+  const parts: string[] = [];
+  if (st.gpu_us > 0) {
+    parts.push(`${(st.gpu_us / 1000).toFixed(2)} ms per frame`);
+    if (st.fps > 1) parts.push(`${Math.round((st.gpu_us / 1000) / (1000 / st.fps) * 100)}% of the frame time`);
+  } else parts.push("measuring...");
+  if (st.fps > 0) parts.push(`${Math.round(st.fps)} fps`);
+  parts.push(`game asks for ${st.input}${st.api ? ` (${st.api})` : ""}`);
+  return parts.join(" · ");
+}
+
 const STATUS_LABEL: Record<Status, string> = {
   installed: "Installed",
   not_installed: "Not installed",
@@ -178,6 +213,7 @@ function Content() {
   const [state, setState] = useState<State | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [live, setLive] = useState<LiveStatus | null>(null);
 
   const refresh = useCallback(async (rescan = false) => {
     try {
@@ -190,6 +226,22 @@ function Content() {
 
   useEffect(() => {
     refresh(false);
+    // Live status while the panel is open: a small file read, no library scan.
+    let stop = false;
+    const poll = async () => {
+      try {
+        const st = await getStatus();
+        if (!stop) setLive(st);
+      } catch {
+        if (!stop) setLive(null);
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 1000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
   const toggleGame = async (g: Game, enable: boolean) => {
@@ -315,6 +367,15 @@ function Content() {
           </PanelSectionRow>
         </PanelSection>
       )}
+      <PanelSection title="Now">
+        <PanelSectionRow>
+          {live ? (
+            <Field label={`${live.name}: ${liveTitle(live)}`} description={liveCost(live)} />
+          ) : (
+            <Field label="Not active" description="No game is upscaling through DeckyUpscaler right now." />
+          )}
+        </PanelSectionRow>
+      </PanelSection>
       <PanelSection title="Global options">
         <PanelSectionRow>
           <DropdownItem
@@ -425,7 +486,7 @@ function Content() {
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
-      <PanelSection title={`DLSS games (${state.games.length})`}>
+      <PanelSection title={`Games (${state.games.length})`}>
         <PanelSectionRow>
           <ButtonItem layout="below" disabled={!!busy} onClick={enableAll}>
             {busy === "all" ? "Working..." : "Enable all"}
@@ -439,8 +500,9 @@ function Content() {
         {state.games.map((g) => (
           <PanelSectionRow key={g.appid}>
             <ToggleField
-              label={g.name}
+              label={live && live.appid === g.appid ? `● ${g.name}` : g.name}
               description={
+                (live && live.appid === g.appid ? `Active: ${live.upscaler}, ${(live.gpu_us / 1000).toFixed(2)} ms\n` : "") +
                 `${STATUS_LABEL[g.status] ?? g.status}` +
                 (g.shim ? ` · ${g.shim}.dll` : "") +
                 (g.message ? ` · ${g.message}` : "") +

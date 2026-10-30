@@ -52,6 +52,9 @@ const char* UpscalerName(const UpscalerCreateInfo& info);
 // Records the upscale, with GPU timestamps around it when DU_GPU_TIMING is set.
 bool NgxDispatch(Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerDispatch& d);
 
+// Which game-facing interface drives the upscaler, for the live status: DLSS (NGX, the default) or FSR (FFX API).
+void NgxSetFrontEnd(bool fsr);
+
 // DU_DUMP_FRAME for XeSS and FSR 4 (NSS dumps its own output): call after each dispatch.
 void NgxDumpFrame(const Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerImage& output);
 

@@ -158,6 +158,7 @@ extern "C" __declspec(dllexport) uint32_t DU_FfxCreateUpscaleVK(const ffxCreateC
          info.displayWidth, info.displayHeight, desc->flags, reinterpret_cast<void*>(device),
          reinterpret_cast<void*>(vk.instance));
     Registry().CollectGarbage();
+    NgxSetFrontEnd(true);
     auto upscaler = CreateUpscaler(vk, NgxRemapVulkan(info));
     if (!upscaler)
         return 0;
