@@ -15,7 +15,7 @@ FSR 4 Lite, 2x (render half the output size per axis), GPU time per upscale:
 
 | API | AMD's shaders | Replacement shaders | Change |
 | --- | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.13 ms | −29% |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.12 ms | −29% |
 | D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 1.96 ms | −30% |
 | D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.30 ms | −30% |
 
@@ -153,6 +153,23 @@ Lossy options measured on top (not in the shipped set), quality as the minimum o
 | …and no depth dilation in the prepass | −128 | 63.0 | Vulkan 2.00 ms, D3D12 1.85 ms |
 | Prepass colour taps reduced to one | −25 alone | 64.8 | worst µs per dB |
 
+## Round 6: what bounds the postpass
+
+Round 4's per-stage stubs suggested the postpass was not limited by instruction issue; that was wrong. A stub writes
+garbage, the output images then compress worse (DCC), and the extra bandwidth hid the saved instructions. With DCC off
+(`RADV_DEBUG=nodcc`; the baseline is unchanged at 750 µs) the stubs give: network trunk −211, filter −185, LDS fill
+−76, stores −49, per-sub-pixel heads −48, history blend −21. Adding 256 dependent VALU instructions per thread costs
++79 µs, 0.31 µs each, as the issue model predicts. The executed path is about 2115 VALU per thread (the static count of
+3548 includes fallback blocks that never run), which models 656 of the 734 µs; image traffic (about 32 bytes per
+pixel) is the rest. Transcendentals cost about one issue slot each, occupancy is not the limit (80 VGPRs is slower), and
+the tail of the last workgroups is about 10 µs.
+
+| Change | Exact? | µs (Vulkan) |
+| --- | --- | --- |
+| Postpass waves entirely outside the image (8 of 400 rows) skip the network and sub-pixel loop (VGPR 128 → 96) | yes | −10 to −16 |
+| Filter weights re-associated as `exp2(fma(..))` with shared per-row and per-column factors | no (about 72 dB from the shipped set; same results in the motion test) | a further −5 to −13, not shipped |
+| Prepass colour taps from a per-wave LDS tile (−76 VALU per pixel) | yes | +36 or more: the prepass is latency- and bandwidth-bound at full occupancy |
+
 ## Quality in motion
 
 The 16-combination test above replays 8 frames with little motion (median under a pixel per frame). A second test
@@ -197,7 +214,11 @@ pixels, and the static test understates it about 5×), so it is not shipped.
 The int8 dot4 instructions fixed by the network are 65–73% of the executed VALU in pass1–3 and 41% in the postpass;
 the dot-only floors are about pass1 300, pass2 120, pass3 160 and postpass 300 µs. What remains above them is
 requantisation, residual shifts and address maths, close to minimal per output, plus the postpass's float colour maths.
-The prepass (now 2×2 pixels per lane, ~515 µs) sits above a ~360 µs memory floor. Pass 1 and pass 3 remain issue-bound
-near their dot4 floors, and the int8 weights are dense, so pruning would remove almost no dot4s. Without a driver change
-exposing `v_dot8` (and an int4-activation network), the remaining gains on Van Gogh/RADV are lossy ones (the round-5
-table above).
+Every pass now runs at 89–96% of its instruction-issue model or against its image traffic: pass 1–3 at 95–96% (their
+floors set by the network's dot4 count; the int8 weights are dense, so pruning would remove almost no dot4s), the
+postpass at about 89% plus its image traffic, and the prepass (2×2 pixels per lane, ~505 µs) latency- and
+bandwidth-bound at full occupancy above a ~360 µs memory floor. What is left changes the output: fewer filter taps,
+less depth dilation (both measured in round 5 and not shipped after the motion test), or formats and bindings fixed
+by the DLL (the reprojected colour's round trip is about 16 MB per frame, and the postpass has no binding to recompute
+it). Without a driver change exposing `v_dot8` (and an int4-activation network), FSR 4 Lite at 2x on Van Gogh/RADV
+stays at about 2.1 ms for a 1280x785 output with the output unchanged.

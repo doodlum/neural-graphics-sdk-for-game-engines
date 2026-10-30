@@ -259,7 +259,7 @@ per-pass numbers, everything tried and the remaining limits: [`docs/fsr4_deck_tu
 
 | FSR 4 Lite, 2x | AMD's shaders | Replacement shaders |
 | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.13 ms |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.12 ms |
 | D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 1.96 ms |
 | D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.30 ms |
 
