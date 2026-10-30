@@ -15,13 +15,14 @@ FSR 4 Lite, 2x (render half the output size per axis), GPU time per upscale:
 
 | API | AMD's shaders | Replacement shaders | Change |
 | --- | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.13 ms | −29% |
-| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 1.96 ms | −30% |
-| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.30 ms | −30% |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.05 ms | −32% |
+| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 1.89 ms | −32% |
+| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.23 ms | −32% |
 
-Quality against AMD's own shaders: 69.1–72.7 dB tonemapped PSNR on all 16 combinations of the context flags (below);
-the largest differences are single pixels in a dithered shadow edge, invisible at 1:1. Frame-to-frame flicker on static
-content stays inside AMD's own run-to-run spread. A bit-identical set (all 16 combinations identical) runs at 2.56 ms on
+Quality against AMD's own shaders: 65.6–67.1 dB tonemapped PSNR on all 16 combinations of the context flags (below);
+the differences sit on geometry edges (a faint 2-pixel grid in amplified diffs, from the 5-tap postpass filter of round
+5), not visible side by side at 1:1. Frame-to-frame flicker on static content is 0.094–0.096 against AMD's own
+0.084–0.090 run-to-run spread. Without the 5-tap filter: 69.1–72.7 dB, flicker inside AMD's spread, 0.08 ms more. A bit-identical set (all 16 combinations identical) runs at 2.56 ms on
 Vulkan.
 
 For context: before this work, Vulkan games ran FSR 4 through a D3D12 interop at 4.6 ms plus ~2.8 ms of cross-queue
@@ -145,11 +146,11 @@ auto exposure, D3D11 and D3D12), and the Inf / NaN replay dumps give the same fr
 The DLL's command stream is 11 dispatches and 12 barriers, no copies or clears. Same session: round 4 2.26 → 2.13 ms
 on Vulkan, 2.08 → 1.96 ms on the D3D12 sample, 2.45 → 2.32 ms on the D3D11 replay with auto exposure.
 
-Lossy options measured on top (not in the shipped set), quality as the minimum over the 16 flag combinations:
+Lossy options measured on top, quality as the minimum over the 16 flag combinations. The first is in the shipped set:
 
 | Change | µs | dB | Note |
 | --- | --- | --- | --- |
-| Postpass filter on 5 of the network's 9 taps (cross) | −82 | 65.6 | flicker within AMD's spread, static edges 0.35% sharper |
+| Postpass filter on 5 of the network's 9 taps (cross) | −82 | 65.6 | shipped; static flicker 0.094–0.096 (AMD 0.084–0.090), static edges 0.35% sharper |
 | …and no depth dilation in the prepass | −128 | 63.0 | Vulkan 2.00 ms, D3D12 1.85 ms |
 | Prepass colour taps reduced to one | −25 alone | 64.8 | worst µs per dB |
 
