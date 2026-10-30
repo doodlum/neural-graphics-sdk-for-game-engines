@@ -15,11 +15,11 @@ FSR 4 Lite, 2x (render half the output size per axis), GPU time per upscale:
 
 | API | AMD's shaders | Replacement shaders | Change |
 | --- | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.34 ms | −22% |
-| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 2.17 ms | −22% |
-| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.50 ms | −24% |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.26 ms | −25% |
+| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 2.09 ms | −25% |
+| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.39 ms | −28% |
 
-Quality against AMD's own shaders: 70.5–72.9 dB tonemapped PSNR on all 16 combinations of the context flags (below);
+Quality against AMD's own shaders: 69.1–72.7 dB tonemapped PSNR on all 16 combinations of the context flags (below);
 the largest differences are single pixels in a dithered shadow edge, invisible at 1:1. Frame-to-frame flicker on static
 content stays inside AMD's own run-to-run spread. A bit-identical set (all 16 combinations identical) runs at 2.56 ms on
 Vulkan.
@@ -111,6 +111,25 @@ Vulkan layer now enables it on Vulkan and DXVK devices, and the proxy uses the d
 | Round-half-up requantisation (rounding constant folded into the bias; only exact ties differ, by +1 LSB) | no | −67 |
 | Prepass micro-changes (`v_fma_mix` forms, dot2 chains starting from the bias) | no | −7.5 |
 
+## Round 4: prepass and postpass, 2.39 → 2.26 ms
+
+The round-3 set measured 2.39 ms on Vulkan this time (2.34 ms before: run-to-run drift of the machine), so the deltas
+below are against it, run interleaved in the same session.
+
+A per-stage breakdown (one stage stubbed at a time, everything else live) showed that neither pass is VALU-bound any
+more. In the prepass the costs are the history colour fetch (113 µs), the int8 tensor and reprojected-colour stores
+(112 together), depth dilation (74) and the convolution's LDS barrier (30 of its 69). In the postpass the network's
+dot4 work now hides behind memory: the three output stores (100), the 9-tap filter (61) and the history blend (44).
+
+| Change | Exact? | µs | Quality |
+| --- | --- | --- | --- |
+| Prepass pixel-to-wave mapping: 8×4 pixels per wave instead of 16×2 | yes | −36 | identical |
+| Prepass tensor stores transposed, combined with the round-3 store changes | yes | −8 | identical |
+| History reprojection: one bilinear fetch instead of the 5-tap Catmull-Rom | no | −78 | 69.1–72.7 dB; flicker and static-edge sharpness unchanged |
+
+Same session, the round-3 set against round 4: Vulkan 2.39 → 2.26 ms, D3D12 sample 2.19 → 2.09, D3D11 replay
+2.50 → 2.39, D3D12 replay 2.48 → 2.40 and 2.72 → 2.63 (two captured scenes).
+
 ## What did not work (and why)
 
 | Idea | Result |
@@ -124,11 +143,18 @@ Vulkan layer now enables it on Vulkan and DXVK devices, and the proxy uses the d
 | Wave64 | All passes already compile as wave32; RDNA2 has no dual issue, so wave64 cannot add VALU throughput and would undo the wave-uniform weights |
 | int4 weights (`v_dot8_i32_i4`) | Not reachable: RADV has no 8×4-bit dot operation and SPIR-V cannot express one; it also needs int4 activations. Ceiling if it were: 2.49 → 1.97 ms. Weight-only int4 quality per layer was measured anyway: 49–60 dB |
 | Frame skipping (network on alternate frames) | Ruled out on purpose |
+| Postpass filter with 5 or 4 taps instead of the network's 9 | −53 µs but 65.7–67.4 dB, and the 4-tap version shimmers more on static content |
+| Postpass filter on the k largest of the 9 weights | Selecting them costs more than the skipped taps (+82 µs) |
+| No depth dilation in the prepass | −70 µs, 65.1 dB worst case |
+| Fusing pass3 into the postpass | Each pass reads a 3×3 neighbourhood of the previous one's output, so a fused shader must recompute a halo of pass3 per tile: at least +130 µs against a −47 µs ceiling |
+| Fusing pass2 and pass3 | Ceiling only −7 µs before any halo recompute |
 
 ## Limits
 
 The int8 dot4 instructions fixed by the network are 65–73% of the executed VALU in pass1–3 and 41% in the postpass;
 the dot-only floors are about pass1 300, pass2 120, pass3 160 and postpass 300 µs. What remains above them is
 requantisation, residual shifts and address maths, close to minimal per output, plus the postpass's float colour maths.
-The prepass sits above a ~360 µs memory floor with only ~10 µs items left. Without a driver change exposing `v_dot8`
-(and an int4-activation network), FSR 4 Lite on Van Gogh/RADV is within roughly 3–5% of its practical maximum.
+The prepass sits above a ~360 µs memory floor; one larger exact rewrite is untried (each lane handling a 2×2 pixel
+block, dropping the LDS exchange and sharing taps, estimated −50 to −90 µs). Without a driver change exposing `v_dot8`
+(and an int4-activation network), the remaining exact gains on Van Gogh/RADV are a few percent, that rewrite being the
+largest known.

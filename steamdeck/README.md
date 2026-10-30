@@ -238,8 +238,8 @@ the original SPIR-V, so a replacement only ever applies to the exact module it w
 
 - `fsr4_shaders.bin`: the Deck's set. Bit-exact rewrites of AMD's passes (wave-uniform weights loaded into SGPRs,
   LDS sharing, unrolled loops, integer requantisation and output tails, cheaper packing and addressing) plus small
-  precision changes: the prepass convolution accumulates exact f16 products in f32, the history reprojection uses a
-  5-tap Catmull-Rom instead of 9 taps, and requantisation rounds half up (only exact ties differ, by one step).
+  precision changes: the prepass convolution accumulates exact f16 products in f32, the history reprojection uses one
+  bilinear fetch instead of a 9-tap Catmull-Rom, and requantisation rounds half up (only exact ties differ, by one step).
 - `fsr4_shaders_dot2.bin`: the prepass variants with that convolution on `v_dot2_f32_f16`
   (`SPV_VALVE_mixed_float_dot_product`), the instruction AMD's own D3D12 build of this network compiles to. Used only
   when the device has `VK_VALVE_shader_mixed_float_dot_product` enabled: vkd3d-proton enables it itself, and the Vulkan
@@ -247,16 +247,16 @@ the original SPIR-V, so a replacement only ever applies to the exact module it w
   first pack.
 
 Against AMD's own shaders, replaying 8 captured game frames ×4 through the D3D11 path for all 16 combinations of HDR,
-motion-vector resolution, depth direction and auto exposure, the output stays within 70.5–72.9 dB (tonemapped PSNR;
+motion-vector resolution, depth direction and auto exposure, the output stays within 69.1–72.7 dB (tonemapped PSNR;
 the largest differences are single pixels in a dithered shadow edge, invisible at 1:1), and frame-to-frame flicker on
 static content stays inside AMD's own run-to-run spread. Method, per-pass numbers, everything tried and the remaining
 limits: [`docs/fsr4_deck_tuning.md`](../docs/fsr4_deck_tuning.md).
 
 | FSR 4 Lite, 2x | AMD's shaders | Replacement shaders |
 | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.34 ms |
-| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 2.17 ms |
-| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.50 ms |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.26 ms |
+| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 2.09 ms |
+| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.39 ms |
 
 For comparison, the D3D12 interop that Vulkan games used before cost 4.6 ms plus about 2.8 ms of cross-queue idle
 per frame, and AMD's D3D12 DLL natively 2.8 ms.
