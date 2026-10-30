@@ -11,8 +11,14 @@ namespace
 const uint32_t kDilateSpirv[] = {
 #include "mv_dilate.spv.inc"
 };
-const uint32_t kSanitizeSpirv[] = {
-#include "color_sanitize.spv.inc"
+const uint32_t kSanitize16f[] = {
+#include "color_sanitize_rgba16f.spv.inc"
+};
+const uint32_t kSanitize32f[] = {
+#include "color_sanitize_rgba32f.spv.inc"
+};
+const uint32_t kSanitize11f[] = {
+#include "color_sanitize_r11f_g11f_b10f.spv.inc"
 };
 
 bool IsDepthFormat(VkFormat f)
@@ -35,11 +41,42 @@ struct MvDilator::Fn
 #undef FN
 };
 
-std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t maxWidth, uint32_t maxHeight, Pass pass)
+VkFormat MvDilator::SanitizeFormat(VkFormat f)
+{
+    switch (f)
+    {
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        return f;
+    case VK_FORMAT_R16G16B16_SFLOAT:
+        return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case VK_FORMAT_R32G32B32_SFLOAT:
+        return VK_FORMAT_R32G32B32A32_SFLOAT;
+    default:
+        return VK_FORMAT_UNDEFINED;
+    }
+}
+
+std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t maxWidth, uint32_t maxHeight, Pass pass,
+                                             VkFormat colorFormat)
 {
     std::unique_ptr<MvDilator> d(new MvDilator());
     d->m_dev    = dev;
-    d->m_format = pass == Pass::SanitizeColor ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32_SFLOAT;
+    d->m_format = pass == Pass::SanitizeColor ? colorFormat : VK_FORMAT_R32G32_SFLOAT;
+    const uint32_t* code     = kDilateSpirv;
+    size_t          codeSize = sizeof(kDilateSpirv);
+    if (pass == Pass::SanitizeColor)
+    {
+        if (colorFormat == VK_FORMAT_R16G16B16A16_SFLOAT)
+            code = kSanitize16f, codeSize = sizeof(kSanitize16f);
+        else if (colorFormat == VK_FORMAT_R32G32B32A32_SFLOAT)
+            code = kSanitize32f, codeSize = sizeof(kSanitize32f);
+        else if (colorFormat == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+            code = kSanitize11f, codeSize = sizeof(kSanitize11f);
+        else
+            return nullptr;
+    }
     d->m_fn.reset(new Fn());
     Fn& fn = *d->m_fn;
 #define LOAD(name) fn.name = reinterpret_cast<PFN_##name>(dev.gdpa(dev.device, #name));
@@ -84,8 +121,8 @@ std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t m
     if (fn.vkCreatePipelineLayout(device, &pl, nullptr, &d->m_pipeLayout) != VK_SUCCESS)
         return nullptr;
     VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize                 = pass == Pass::SanitizeColor ? sizeof(kSanitizeSpirv) : sizeof(kDilateSpirv);
-    smci.pCode                    = pass == Pass::SanitizeColor ? kSanitizeSpirv : kDilateSpirv;
+    smci.codeSize                 = codeSize;
+    smci.pCode                    = code;
     VkShaderModule module         = VK_NULL_HANDLE;
     if (fn.vkCreateShaderModule(device, &smci, nullptr, &module) != VK_SUCCESS)
         return nullptr;
@@ -116,7 +153,7 @@ std::unique_ptr<MvDilator> MvDilator::Create(const VulkanDevice& dev, uint32_t m
     if (fn.vkAllocateDescriptorSets(device, &dsai, d->m_sets) != VK_SUCCESS)
         return nullptr;
 
-    // The output (RG32F / RGBA16F) at the maximum render size, device local, sampled by FSR and written as storage here.
+    // The output (RG32F, or the colour's format) at the maximum render size, device local, sampled by FSR and written as storage here.
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType         = VK_IMAGE_TYPE_2D;
     ici.format            = d->m_format;

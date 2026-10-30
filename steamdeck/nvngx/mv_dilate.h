@@ -18,8 +18,12 @@ public:
         SanitizeColor,
     };
     // Null when the pipeline or the image cannot be created (the caller then passes the game's input).
+    // SanitizeColor writes `colorFormat` (RGBA16F, RGBA32F or B10G11R11, see SanitizeFormat).
     static std::unique_ptr<MvDilator> Create(const VulkanDevice& dev, uint32_t maxWidth, uint32_t maxHeight,
-                                             Pass pass = Pass::DilateMv);
+                                             Pass pass = Pass::DilateMv, VkFormat colorFormat = VK_FORMAT_UNDEFINED);
+    // The format SanitizeColor writes for game colour in `f`, or VK_FORMAT_UNDEFINED when `f` cannot hold Inf or
+    // NaN (UNORM / sRGB: no clean-up needed).
+    static VkFormat SanitizeFormat(VkFormat f);
     ~MvDilator();
 
     // Records the pass into the owned image and returns that image, in GENERAL layout and visible to compute reads, as

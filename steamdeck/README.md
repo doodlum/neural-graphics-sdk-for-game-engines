@@ -322,8 +322,10 @@ Black frames with auto exposure: FSR 4's auto exposure averages the frame's lumi
 pixel (an overflowed highlight) makes the exposure non-finite and the whole output black, with the history poisoned,
 until a reset; in games this shows as black flashes (seen in Star Wars Galactic Racer, which sets DLSS AutoExposure;
 reproduced with a replay dump with 0.1% Inf colour pixels, with or without the shader packs). When auto exposure is on,
-the SDK Vulkan path first copies the colour to an owned RGBA16F image with Inf clamped to ±65504 and NaN set to 0
-(`color_sanitize.comp`). Finite input gives bit-identical output; the pass costs about 85 µs at 853x533 → 1280x800.
+the SDK Vulkan path first copies the colour to an owned image in the game's own float format (RGBA16F, RGBA32F or
+B10G11R11) with Inf clamped to the format's largest finite value and NaN set to 0 (`color_sanitize.comp`); UNORM
+colour cannot hold either and skips the pass. Finite input gives bit-identical output; the pass costs about 43 µs at
+853x533 → 1280x800 with B10G11R11 colour (a straight read and write of the colour; an RGBA16F intermediate cost 91).
 FSR 3.1 and NSS are unaffected (the proxy's NSS auto exposure already skips non-finite pixels).
 
 ### D3D12 interop for D3D11 games
