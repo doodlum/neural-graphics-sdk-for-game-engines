@@ -16,12 +16,12 @@
 // the submissions (SplitSubmitter): the D3D11 front end submits its own command buffers on DXVK's queue.
 //
 // Vulkan games: NGX hands the proxy only the game's command buffer, which the game submits later. The proxy records
-// copy-in, a split marker (vkCmdFillBuffer on a marker buffer, aiss_split_abi.h) and copy-out into it, and queues the
-// D3D12 work (wait N, FSR 4, signal N+1) right away; VK_LAYER_AISS_ngx (native) cuts the game's command buffer at the
-// marker. A "capture" vkQueueSubmit2 (signal N, wait N+1) right after the marker goes through winevulkan, which emulates
+// copy-in, a split marker (vkCmdFillBuffer on a marker buffer, split_abi.h) and copy-out into it, and queues the
+// D3D12 work (wait N, FSR 4, signal N+1) right away; VK_LAYER_DECKYUPSCALER (native) cuts the game's command buffer at
+// the marker. A "capture" vkQueueSubmit2 (signal N, wait N+1) right after the marker goes through winevulkan, which emulates
 // D3D12 fences with per-operation host semaphores; the layer keeps those instead of submitting it, and when the game
 // submits its command buffer makes the part before signal N and the part after wait N+1 - the same
-// submissions as the D3D11 path, all in the same frame. Without the layer (or with AISS_LAYER_SPLIT=0) the
+// submissions as the D3D11 path, all in the same frame. Without the layer (or with DU_LAYER_SPLIT=0) the
 // registration below fails and the game gets NSS.
 //
 // GPU-side waits inside one command buffer do not work (measured on a Steam Deck, both removed): vkCmdWaitEvents on a
@@ -34,7 +34,7 @@
 #include "common.h"
 #include "fsr4_dx12.h"
 #include "ngx_common.h"
-#include "../layer/aiss_split_abi.h"
+#include "../layer/split_abi.h"
 
 #include <windows.h>
 
@@ -261,7 +261,7 @@ private:
         }
     }
 
-    // Timing (AISS_GPU_TIMING): 4 timestamps per frame on the game's queue.
+    // Timing (DU_GPU_TIMING): 4 timestamps per frame on the game's queue.
     VkQueryPool m_qp = VK_NULL_HANDLE;
     float       m_nsPerTick = 1.0f;
     uint64_t    m_timed = 0;
@@ -379,11 +379,11 @@ bool Fsr4InteropUpscaler::Init(const VulkanDevice& device, const UpscalerCreateI
         m_nsPerTick = pp.limits.timestampPeriod;
     }
     LOGI("FSR 4 interop: network %s on the D3D12 device, sync: shared ID3D12Fence = Vulkan timeline semaphore%s",
-         Fsr4ModelName(m_info.fsr4Active), m_info.layerSplit ? ", game command buffer split by the AISS layer" : "");
+         Fsr4ModelName(m_info.fsr4Active), m_info.layerSplit ? ", game command buffer split by the DeckyUpscaler layer" : "");
     return true;
 }
 
-// Vulkan front end: tell VK_LAYER_AISS_ngx our semaphore and create its marker buffer (aiss_split_abi.h). winevulkan
+// Vulkan front end: tell VK_LAYER_DECKYUPSCALER our semaphore and create its marker buffer (split_abi.h). winevulkan
 // forwards no private entry points, so this is a vkWaitSemaphores the layer recognises by its timeout; it answers
 // VK_TIMEOUT, which a driver never does for value 0.
 bool Fsr4InteropUpscaler::RegisterWithLayer(std::string& why)
@@ -401,22 +401,22 @@ bool Fsr4InteropUpscaler::RegisterWithLayer(std::string& why)
         why = "no queue found on the game's VkDevice";
         return false;
     }
-    m_token = nextToken++ % AISS_SPLIT_TOKEN_COUNT;
+    m_token = nextToken++ % DU_SPLIT_TOKEN_COUNT;
     const uint64_t      zero = 0;
     VkSemaphoreWaitInfo wi   = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount        = 1;
     wi.pSemaphores           = &m_semaphore;
     wi.pValues               = &zero;
-    const VkResult r         = vkWaitSemaphores(m_dev.device, &wi, AISS_SPLIT_REGISTER | m_token);
+    const VkResult r         = vkWaitSemaphores(m_dev.device, &wi, DU_SPLIT_REGISTER | m_token);
     if (r != VK_TIMEOUT)
     {
         m_token = UINT32_MAX;
-        why     = "the AISS Vulkan layer (VK_LAYER_AISS_ngx with command buffer split; AISS_LAYER=1) is not active on the "
+        why     = "the DeckyUpscaler Vulkan layer (VK_LAYER_DECKYUPSCALER with command buffer split; DU_LAYER=1) is not active on the "
                   "game's device (registration returned " + std::to_string(r) + ")";
         return false;
     }
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size               = AISS_SPLIT_BUFFER_SIZE;
+    bci.size               = DU_SPLIT_BUFFER_SIZE;
     bci.usage              = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (vkCreateBuffer(m_dev.device, &bci, nullptr, &m_marker) != VK_SUCCESS)
     {
@@ -424,7 +424,7 @@ bool Fsr4InteropUpscaler::RegisterWithLayer(std::string& why)
         why      = "cannot create the command buffer split marker buffer";
         return false;
     }
-    LOGI("FSR 4 interop: AISS layer command buffer split registered (token %u)", m_token);
+    LOGI("FSR 4 interop: DeckyUpscaler layer command buffer split registered (token %u)", m_token);
     return true;
 }
 
@@ -462,7 +462,7 @@ Fsr4InteropUpscaler::~Fsr4InteropUpscaler()
         wi.semaphoreCount        = 1;
         wi.pSemaphores           = &m_semaphore;
         wi.pValues               = &zero;
-        vkWaitSemaphores(m_dev.device, &wi, AISS_SPLIT_UNREGISTER | m_token);
+        vkWaitSemaphores(m_dev.device, &wi, DU_SPLIT_UNREGISTER | m_token);
     }
     if (m_marker) vkDestroyBuffer(m_dev.device, m_marker, nullptr);
     if (m_semaphore) vkDestroySemaphore(m_dev.device, m_semaphore, nullptr);
@@ -847,8 +847,8 @@ bool Fsr4InteropUpscaler::DispatchSplit(SplitSubmitter& s, const UpscalerDispatc
     return ok;
 }
 
-// Vulkan front end: everything goes into the game's command buffer; the "submissions" are split markers the AISS layer
-// turns into real ones when the game submits it.
+// Vulkan front end: everything goes into the game's command buffer; the "submissions" are split markers the
+// DeckyUpscaler layer turns into real ones when the game submits it.
 bool Fsr4InteropUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
 {
     if (!m_info.layerSplit || !m_marker)
@@ -865,10 +865,10 @@ bool Fsr4InteropUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& 
             {
                 // The layer cuts here: the part before signals sv, the part after waits for sv + 1 (D3D12's signal).
                 signalled = sv;
-                self->vkCmdFillBuffer(cmd, self->m_marker, sv, sv + 1, AISS_SPLIT_FILL | self->m_token);
+                self->vkCmdFillBuffer(cmd, self->m_marker, sv, sv + 1, DU_SPLIT_FILL | self->m_token);
                 // Capture: winevulkan turns these D3D12-fence operations into host semaphore operations, which the
                 // layer puts on the cut instead of submitting this.
-                const uint64_t        stage = AISS_SPLIT_STAGE | (uint64_t(self->m_token) << 32);
+                const uint64_t        stage = DU_SPLIT_STAGE | (uint64_t(self->m_token) << 32);
                 VkSemaphoreSubmitInfo w = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
                 w.semaphore             = signal;
                 w.value                 = sv + 1;
@@ -891,7 +891,7 @@ bool Fsr4InteropUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& 
     split.self = this;
     split.cmd  = cmd;
     // Evaluate marker: the layer ends a render pass the game left open (copies and the cut need to be outside one).
-    vkCmdFillBuffer(cmd, m_marker, 0, 0, AISS_SPLIT_FILL | m_token);
+    vkCmdFillBuffer(cmd, m_marker, 0, 0, DU_SPLIT_FILL | m_token);
     return DispatchSplit(split, d);
 }
 

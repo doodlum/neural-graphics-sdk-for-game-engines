@@ -1,8 +1,10 @@
-# Steam Deck: DLSS → Arm NSS under Proton
+# DeckyUpscaler: DLSS and FSR → NSS, FSR 4 Lite or XeSS on the Steam Deck
 
-This branch turns the SDK into a drop-in DLSS Super Resolution replacement for Steam Deck games running under Proton.
-Games keep calling DLSS (directly through NGX, or through Streamline), and the frames are upscaled by Arm's Neural
-Super Sampling network, running on the Deck's GPU through the native compute ML path of the `universal` branch.
+DeckyUpscaler turns the SDK into a drop-in DLSS Super Resolution replacement for Steam Deck games running under Proton,
+set up per game by a Decky plugin. Games keep calling DLSS (directly through NGX, or through Streamline), and the frames
+are upscaled by Arm's Neural Super Sampling network, running on the Deck's GPU through the native compute ML path of the
+`universal` branch, or by FSR 4 Lite or Intel XeSS (chosen in the plugin). Vulkan games that use AMD's FSR instead get
+the same upscalers through their FSR option (below).
 
 ## Based on OptiScaler's DLSS proxy
 
@@ -35,8 +37,8 @@ are written from scratch.
 | --- | --- | --- |
 | `nvngx.dll` | `steamdeck/nvngx` | Replacement NGX core. Implements the NGX D3D12, Vulkan and D3D11 entry points and runs NSS for the SuperSampling feature. Installed as `C:\windows\system32\_nvngx.dll` in the game's prefix, where NGX looks for the driver's core. |
 | Loader shim | `steamdeck/loader` | `dbghelp.dll` (Streamline games) or `dxgi.dll` (others), placed next to the game. Forwards to the system DLL and redirects NGX's signature check of the core to an NVIDIA-signed DLL the game ships (its `nvngx_dlss.dll`), so the unsigned core is accepted. Only import tables are patched; `LoadLibrary` still loads the proxy. |
-| Vulkan layer | `steamdeck/layer` | Native Linux implicit layer `VK_LAYER_AISS_ngx`, active only with `AISS_LAYER=1`. Emulates `VK_NVX_binary_import`, `VK_NVX_image_view_handle` and `VK_NV_low_latency(2)`, which Vulkan DLSS/Reflex integrations require, and enables the int8 / dot-product / subgroup-size features the ML kernels need on every device (DXVK's and vkd3d-proton's included). Splits a Vulkan game's command buffer at the evaluate for FSR 4 (D3D12 interop). |
-| Decky plugin | `steamdeck/decky` | Finds installed games that ship DLSS and sets them up (files, prefix, launch options) per game. |
+| Vulkan layer | `steamdeck/layer` | Native Linux implicit layer `VK_LAYER_DECKYUPSCALER`, active only with `DU_LAYER=1`. Emulates `VK_NVX_binary_import`, `VK_NVX_image_view_handle` and `VK_NV_low_latency(2)`, which Vulkan DLSS/Reflex integrations require, and enables the int8 / dot-product / subgroup-size features the ML kernels need on every device (DXVK's and vkd3d-proton's included). Splits a Vulkan game's command buffer at the evaluate for FSR 4 (D3D12 interop). |
+| Decky plugin | `steamdeck/decky` | DeckyUpscaler: finds installed games that ship DLSS and sets them up (files, prefix, launch options) per game. |
 
 Each API runs NSS on the game's own Vulkan device, with no copies:
 
@@ -65,7 +67,26 @@ NVIDIA. The ML runtime still picks its kernels from the real hardware (Vulkan dr
   the preprocess; unrolled word and kernel-row loops and cheaper addressing / int8 packing in the graph. Quality,
   in-frame: 640x400 2219 → 2157 µs, 853x533 3725 → 3510 µs, Forza Horizon 6's 640x392 → 1280x785 2444 → 2319 µs
   (details in `docs/nss_gpu_tuning.md`). The postprocess now uses `storageBuffer8BitAccess`; RADV accepts it on any
-  device, and the layer (`AISS_LAYER=1`) enables it explicitly.
+  device, and the layer (`DU_LAYER=1`) enables it explicitly.
+
+## FSR games, other upscaler mods, game launchers
+
+**FSR (AMD FidelityFX API, Vulkan).** For a game that ships `amd_fidelityfx_vk.dll` (e.g. DOOM: The Dark Ages, in
+`amd-ffx\`), the plugin keeps AMD's DLL as `amd_fidelityfx_vk.deckyupscaler-orig.dll` and puts the FFX forwarder
+(`loader/ffx_forwarder.cpp`) in its place. Upscale contexts go to the proxy (`nvngx/ffx_vulkan.cpp`), so the game's FSR
+option runs the upscaler picked in the plugin; frame generation and everything else stay with AMD's DLL. The FFX API
+does not hand over the `VkInstance`, which XeSS and the SDK's Vulkan backend need: the loader shim records each physical
+device's instance from `vkEnumeratePhysicalDevices`, and without one the game keeps AMD's upscaler. `DU_FFX=0` turns the
+forwarding off.
+
+**OptiScaler.** OptiScaler (installed by hand, by Decky Framegen or as HelixSR Scaler) hooks the same calls, so the
+plugin moves it out of the games it manages, into `.deckyupscaler-optiscaler-removed\<time>\` in the game folder (a
+rename on the same disk, never loaded from there), and puts back the game files its installers had backed up.
+
+**id Tech launcher.** `idTechLauncher.exe` checks for hardware ray tracing and 8 GB of dedicated VRAM and stops at an
+error dialog on a Steam Deck (in Game Mode the dialog may not even show, so the game looks frozen). The game's own exe
+runs fine, so for games with the launcher next to their exe the launch options start the exe instead:
+`bash -c 'exec "${@/idTechLauncher.exe/DOOMTheDarkAges.exe}"' -- %command%`.
 
 ## Performance (Steam Deck, RDNA2)
 
@@ -96,13 +117,13 @@ Every DLSS mode uses NSS's full network by default. At 640x400 → 1280x800 its 
 about 1.2 ms more per frame than the small network, which ghosts visibly. The Decky plugin switches between them while the
 game runs: the plugin's Quick Access panel carries every option (upscaler, NSS quality, FSR 4 model and watermark,
 motion vector dilation for FSR, XeSS preset, GPU-time logging, log level, capture) through a control file the proxy
-re-reads twice a second (`AISS_CONTROL`). The file is `key=value` lines (upscaler 0 = NSS Quality, 1 = Balanced,
+re-reads twice a second (`DU_CONTROL`). The file is `key=value` lines (upscaler 0 = NSS Quality, 1 = Balanced,
 2 = Performance, 3 = XeSS, 4-6/8 = FSR 4, 9 = FSR 3.1), with a legacy first line `<upscaler> <fast_math> <capture>` so
 older proxies still parse it.
 
 ## Equal-cost render scale
 
-**Off by default; launch option only** (`AISS_EQUAL_COST=1`, or control key `equal_cost=1`). The plugin no longer
+**Off by default; launch option only** (`DU_EQUAL_COST=1`, or control key `equal_cost=1`). The plugin no longer
 offers it: every upscaler renders at the standard DLSS ratios.
 
 The upscalers cost very different amounts on the Deck: FSR 4 INT8 through the Vulkan interop takes about 8 ms of frame
@@ -150,7 +171,7 @@ last 360 upscales. Before, at the standard 2x, FSR 4 Lite on Vulkan ran at 24.5 
 ## Intel XeSS (alternative upscaler)
 
 The proxy can run Intel XeSS Super Resolution (Vulkan path of `libxess.dll`, XeSS SDK 3.0.2, SR library 2.0.2) instead of
-NSS: plugin "Upscaler" = XeSS, control file value 3, or `AISS_UPSCALER=xess` at launch. It switches live like the NSS
+NSS: plugin "Upscaler" = XeSS, control file value 3, or `DU_UPSCALER=xess` at launch. It switches live like the NSS
 models. `libxess.dll` is loaded at runtime from the proxy's own directory (the prefix's `system32`, next to
 `_nvngx.dll`) and used only through its public API; when it is missing or fails to initialise the proxy logs it and
 stays on NSS.
@@ -159,20 +180,20 @@ stays on NSS.
   vectors (render resolution by default, `XESS_INIT_FLAG_HIGH_RES_MV` when the game does not set `MVLowRes`), jitter
   (DLSS and XeSS share the convention; checked visually, the other three sign combinations blur static detail),
   `xessSetVelocityScale` = the DLSS MV scale, reset, HDR (`LDR_INPUT_COLOR` otherwise), inverted depth. DLSS
-  AutoExposure maps to `XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE`; otherwise the exposure value is 1 (or `AISS_EXPOSURE`).
+  AutoExposure maps to `XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE`; otherwise the exposure value is 1 (or `DU_EXPOSURE`).
 - Dynamic resolution works: the per-frame render subrect is the XeSS input size. The context uses the Ultra
   Performance preset, whose input range is 1/3 of the output up to the output (presets only set the range: at a
   given input size the output is bit-identical across presets).
 - Device requirements (`xessVKGetRequired*` under Proton on the Deck): no instance extensions, Vulkan 1.3,
   `VK_EXT_mutable_descriptor_type` + `mutableDescriptorType`, `shaderStorageImageWriteWithoutFormat`,
   `scalarBlockLayout`, `shaderInt8`, `shaderIntegerDotProduct`. The Deck supports all of them; the Vulkan layer enables
-  them on every device when `AISS_LAYER=1` (`AISS_LAYER_XESS=0` to skip). vkd3d-proton and DXVK already enable enough
+  them on every device when `DU_LAYER=1` (`DU_LAYER_XESS=0` to skip). vkd3d-proton and DXVK already enable enough
   for XeSS to run without the layer.
 - On RDNA2 XeSS uses its DP4a (int8 dot product) path, not XMX. Pipelines are built up front
   (`xessVKBuildPipelines`, blocking): ~260 ms for the first context in a process, 45-110 ms for later ones. Its
   temporary memory is 28-33 MB at 1280x722-1280x800, plus its persistent history and weights.
 
-GPU time per upscale (`AISS_GPU_TIMING=120`: timestamps around the evaluate in the game's command buffer) and frame
+GPU time per upscale (`DU_GPU_TIMING=120`: timestamps around the evaluate in the game's command buffer) and frame
 rate, Streamline sample (ray tracing on), Steam Deck:
 
 | API | Mode | NSS Quality | NSS Performance | XeSS |
@@ -213,7 +234,7 @@ of AMD's Windows D3D12 driver (Adrenalin 26.10.1, FidelityFX 2.4.0.4370):
 - **D3D11 games** (DXVK): through **D3D12 interop** (`fsr4_interop.cpp`): an in-process vkd3d-proton D3D12 device that
   shares textures and a fence with the game's VkDevice (below).
 - **Vulkan games**: through the same D3D12 interop, with the Vulkan layer splitting the game's command buffer at the
-  evaluate (see "FSR 4 for Vulkan games"); needs `AISS_LAYER=1` (the plugin sets it).
+  evaluate (see "FSR 4 for Vulkan games"); needs `DU_LAYER=1` (the plugin sets it).
 
 ### FSR SDK 2.4 Vulkan DLL on RADV
 
@@ -233,8 +254,8 @@ Out of the box the SDK DLL offers only FSR 3.1.6 and 2.3.4 on a Steam Deck. Thre
 
 **Replacement shader modules.** The proxy can replace any shader module the DLL creates, keyed by an FNV-1a hash of
 the original SPIR-V, so a replacement only ever applies to the exact module it was made for. They come from packs in
-`system32\aiss\` (format in `tools/pack_fsr4_shaders.py`; the plugin installs them when its bundle has them) or from
-`AISS_FSR4_VK_SHADER_DIR`. **No replacement shaders are part of this repository.**
+`system32\deckyupscaler\` (format in `tools/pack_fsr4_shaders.py`; the plugin installs them when its bundle has them) or from
+`DU_FSR4_VK_SHADER_DIR`. **No replacement shaders are part of this repository.**
 
 - `fsr4_shaders.bin`: the Deck's set. Bit-exact rewrites of AMD's passes (wave-uniform weights loaded into SGPRs,
   LDS sharing, unrolled loops, integer requantisation and output tails, cheaper packing and addressing) plus small
@@ -247,7 +268,7 @@ the original SPIR-V, so a replacement only ever applies to the exact module it w
 - `fsr4_shaders_dot2.bin`: the prepass variants with that convolution on `v_dot2_f32_f16`
   (`SPV_VALVE_mixed_float_dot_product`), the instruction AMD's own D3D12 build of this network compiles to. Used only
   when the device has `VK_VALVE_shader_mixed_float_dot_product` enabled: vkd3d-proton enables it itself, and the Vulkan
-  layer enables it on Vulkan and DXVK devices (`AISS_LAYER=1`, set by the plugin). `AISS_FSR4_VK_DOT2=0` keeps to the
+  layer enables it on Vulkan and DXVK devices (`DU_LAYER=1`, set by the plugin). `DU_FSR4_VK_DOT2=0` keeps to the
   first pack.
 
 Against AMD's own shaders, replaying 8 captured game frames ×4 through the D3D11 path for all 16 combinations of HDR,
@@ -266,17 +287,17 @@ per-pass numbers, everything tried and the remaining limits: [`docs/fsr4_deck_tu
 For comparison, the D3D12 interop that Vulkan games used before cost 4.6 ms plus about 2.8 ms of cross-queue idle
 per frame, and AMD's D3D12 DLL natively 2.8 ms.
 
-Per-pass diagnostics: `AISS_FSR4_VK_PROFILE=N` logs the GPU time of each dispatch the DLL records (by shader entry
-point), `AISS_FSR4_DX12_PROFILE=N` the same for the D3D12 DLL, `AISS_FSR4_VK_DUMP=dir` writes each original module as
-`<hash>_<entry point>.spv`, and `AISS_FSR4_VK_SHADERS=0` turns replacement off.
+Per-pass diagnostics: `DU_FSR4_VK_PROFILE=N` logs the GPU time of each dispatch the DLL records (by shader entry
+point), `DU_FSR4_DX12_PROFILE=N` the same for the D3D12 DLL, `DU_FSR4_VK_DUMP=dir` writes each original module as
+`<hash>_<entry point>.spv`, and `DU_FSR4_VK_SHADERS=0` turns replacement off.
 
 The plugin's "Upscaler" dropdown offers **FSR 4**, with an "FSR 4 model" choice of **Auto** (AMD's choice: Lite on a
 Steam Deck), **Lite**, **INT8** and **INT8 RDNA 2**. Control-file upscaler values: 4 Lite, 5 INT8, 6 INT8 RDNA 2, 8 Auto;
-launch options `AISS_UPSCALER=fsr4` with `AISS_FSR4_MODEL=lite|int8|rdna2|auto`. FSR 4 switches live like the other
+launch options `DU_UPSCALER=fsr4` with `DU_FSR4_MODEL=lite|int8|rdna2|auto`. FSR 4 switches live like the other
 upscalers.
 
-**4.1.2 is required.** Both DLLs (`amd_fidelityfx_upscaler_vk.dll` must be file version 4.1.2.x) are loaded by full path from a private `aiss` subfolder of the prefix's `system32`
-(`system32\aiss\`, next to `_nvngx.dll`), not from `system32` itself, because Proton ships its own older
+**4.1.2 is required.** Both DLLs (`amd_fidelityfx_upscaler_vk.dll` must be file version 4.1.2.x) are loaded by full path from a private `deckyupscaler` subfolder of the prefix's `system32`
+(`system32\deckyupscaler\`, next to `_nvngx.dll`), not from `system32` itself, because Proton ships its own older
 `amdxcffx64.dll` (FSR 4.1.1, sha256 4e7dc37a…) there and reinstalls it on every launch, which would shadow ours. The
 proxy logs the DLL's file version, loads it, and checks the FidelityFX provider's version name: anything that is not
 4.1.2 (an older 4.0.x/4.1.1, or an FSR 3.1 fallback) is **refused loudly**. If the DLL is missing, refused, hands out no
@@ -297,7 +318,7 @@ FidelityFX SDK 2.3 types (`steamdeck/nvngx/amd_ffx/`, MIT); the file is never ch
    AMD's `amdxc64.dll` extension, which Proton ships). Wine has no answer to the D3DKMT query, so the DLL would refuse
    every FSR 4 network — the problem FSR4Injector solved with a GE-Proton `amdxc64` shim. The proxy points the DLL's
    `GetProcAddress` import at its own D3DKMT pair answering with the amdgpu family / external revision: 144 / 1 on Van
-   Gogh (read with `DRM_IOCTL_AMDGPU_INFO`; `AISS_FSR4_GPU=family,revision` overrides). No extra shim DLL is needed.
+   Gogh (read with `DRM_IOCTL_AMDGPU_INFO`; `DU_FSR4_GPU=family,revision` overrides). No extra shim DLL is needed.
 3. **Model selection.** Each network is its own provider class (RTTI `ffxProvider_FSR4`, `..._FSR4_Int8`,
    `..._FSR4_Int8_Navi2`, `..._FSR4Lite_Int8`) whose device check is the third virtual function; FidelityFX asks FP8,
    INT8, INT8 RDNA 2, then Lite and runs the first that accepts. The proxy wraps those checks: with a model selected only
@@ -309,7 +330,7 @@ Proof of which network and version ran:
 
 - The log names the file version (2.4.0.4370), the provider (`"4.1.2 *"`, id `…1002`), the network that runs, and AMD's
   own choice.
-- `AISS_FSR4_WATERMARK=1` / `FSR_WATERMARK=1` / the plugin's "FSR 4 watermark" set `MLSR-WATERMARK`, and the DLL draws
+- `DU_FSR4_WATERMARK=1` / `FSR_WATERMARK=1` / the plugin's "FSR 4 watermark" set `MLSR-WATERMARK`, and the DLL draws
   `FSR4L-i8` (Lite), `FSR4-i8` (INT8) or `FSR4-i8-2` (INT8 RDNA 2) followed by `Upscale 4.1.2 DRS 2.00x Source: Driver`,
   on D3D12 and through interop (`testlogs/fsr4/dx12_lite_watermark.png`, `d3d11_interop_lite_watermark.png`).
 
@@ -356,8 +377,8 @@ for every format, so RGBA32F colour above 65504 is clamped too) and map NaN to t
 
 ### Performance
 
-GPU time per upscale (`AISS_GPU_TIMING`), Steam Deck. Native D3D12 is the Streamline sample (ray tracing on); interop is
-the D3D11 harness (DXVK, `AISS_LAYER=1`, 64 evaluations), which does little else, so the GPU runs at lower clocks there:
+GPU time per upscale (`DU_GPU_TIMING`), Steam Deck. Native D3D12 is the Streamline sample (ray tracing on); interop is
+the D3D11 harness (DXVK, `DU_LAYER=1`, 64 evaluations), which does little else, so the GPU runs at lower clocks there:
 compare a row's interop columns with each other, and with native only through the "normalised" column.
 
 | Ratio | Network | Native D3D12 (sample) | Interop total (harness) | of which: copy-in | D3D12 dispatch | sync gap | copy-out | Interop normalised to sample clocks |
@@ -378,7 +399,7 @@ the native one. For reference: NSS Quality 2.21 / 3.53 ms, XeSS 2.88 / 3.03 ms i
 ### FSR 4 for Vulkan games
 
 NGX gives the proxy only the game's Vulkan command buffer, which the game submits later, and a command buffer cannot
-signal a semaphore halfway. So the native layer (`VK_LAYER_AISS_ngx`) **cuts the game's command buffer in two at the
+signal a semaphore halfway. So the native layer (`VK_LAYER_DECKYUPSCALER`) **cuts the game's command buffer in two at the
 evaluate**; the submissions then look exactly like the D3D11 path's, in the same frame:
 
 ```
@@ -388,11 +409,11 @@ submit:   { game's waits, part 1, signal fence=N }  ->  D3D12 queue: wait N, FSR
 ```
 
 - The proxy talks to the layer with ordinary Vulkan calls the layer recognises and swallows (winevulkan does not
-  forward private entry points; contract in `steamdeck/layer/aiss_split_abi.h`): a `vkWaitSemaphores` with a magic
+  forward private entry points; contract in `steamdeck/layer/split_abi.h`): a `vkWaitSemaphores` with a magic
   timeout registers (the layer answers `VK_TIMEOUT`, so without the layer the game gets NSS); `vkCmdFillBuffer` on a
   magic marker buffer marks the evaluate start and the cut.
 - After the cut the layer records the game's commands into a fresh command buffer of the same queue family: every
-  `vkCmd*` entry point goes through a generated trampoline (`aiss_cmd_trampolines.inc`, from `vulkan_core.h` by
+  `vkCmd*` entry point goes through a generated trampoline (`cmd_trampolines.inc`, from `vulkan_core.h` by
   `gen_cmd_trampolines.py`). At `vkQueueSubmit` / `vkQueueSubmit2` the game's batch is expanded into the parts; the
   game's waits stay on the first, its signals and fence on the last.
 - Proton's winevulkan emulates D3D12 fences: each wait or signal of a D3D12-fence semaphore becomes a temporary host
@@ -407,12 +428,12 @@ submit:   { game's waits, part 1, signal fence=N }  ->  D3D12 queue: wait N, FSR
   never a hang) in secondary command buffers and ones allocated before the layer saw them. A command buffer submitted
   twice without re-recording runs its parts without the fence operations; one reset before it was ever submitted
   releases the D3D12 wait on the host.
-- Only native Vulkan games' devices get this (not DXVK / vkd3d-proton); `AISS_LAYER_SPLIT=0` turns it off (FSR 4 then
+- Only native Vulkan games' devices get this (not DXVK / vkd3d-proton); `DU_LAYER_SPLIT=0` turns it off (FSR 4 then
   falls back to NSS with a log line). The layer also enables `timelineSemaphore`; the proxy requests
   `VK_KHR_external_memory_win32`, `VK_KHR_external_semaphore_win32` and `VK_KHR_timeline_semaphore` through NGX's
   device-extension query.
 
-Measured in the Streamline sample (Vulkan, ray tracing on, 1200 frames, `AISS_GPU_TIMING`), game-queue GPU time per
+Measured in the Streamline sample (Vulkan, ray tracing on, 1200 frames, `DU_GPU_TIMING`), game-queue GPU time per
 upscale, with the D3D12 dispatch timed on the interop queue:
 
 | Ratio | Network | Total (game queue) | copy-in | wait for D3D12 | of which D3D12 dispatch | copy-out | FPS | NSS Quality (same run setup) |
@@ -436,11 +457,11 @@ three times); host-memory staging with a 750 ms release never saw the D3D12 work
 ### FSR 3.1
 
 AMD's SDK Vulkan DLL also carries FSR 3.1 (3.1.6), the non-neural upscaler. The plugin offers it as **FSR 3.1**
-(control-file upscaler 9, `AISS_UPSCALER=fsr3`), on every API through the same native path as FSR 4. It needs no
+(control-file upscaler 9, `DU_UPSCALER=fsr3`), on every API through the same native path as FSR 4. It needs no
 network, so none of the FSR 4 device-check or shader work applies to it.
 
 It runs with AMD's default settings. The settings below bring its output as close as FSR 3.1 can to FSR 4 INT8's, and
-can be set with the `AISS_FSR3_*` launch options (e.g. `AISS_FSR3_ACCUMULATION=0.05 AISS_FSR3_SHADING=32`). Reference:
+can be set with the `DU_FSR3_*` launch options (e.g. `DU_FSR3_ACCUMULATION=0.05 DU_FSR3_SHADING=32`). Reference:
 INT8's output on the replay harness (8 captured game frames ×4, auto exposure on and off); measure: tonemapped PSNR
 against it. One parameter at a time, then jointly:
 
@@ -458,7 +479,7 @@ change at static edges of the Streamline sample: default 0.08, tuned 0.15, Lite 
 
 ### Motion vector dilation (FSR 4 and FSR 3.1)
 
-Optional (plugin toggle **Dilate motion vectors**, control key `dilate_mv`, `AISS_FSR_DILATE_MV=1`; switches live):
+Optional (plugin toggle **Dilate motion vectors**, control key `dilate_mv`, `DU_FSR_DILATE_MV=1`; switches live):
 before FSR runs, the proxy's own compute pass (`mv_dilate.comp`) gives each render pixel the motion vector of the
 nearest surface in its 3×3 neighbourhood, written to a proxy-owned image that FSR reads instead of the game's. Thin
 foreground detail (foliage, wires, edges) then moves with its own motion rather than the background's. FSR does a
@@ -504,54 +525,63 @@ steamdeck/build.sh
 The SDK's own Linux build (`python build.py -t Release -b vk_linux_x64`) builds `ffx_ml_runtime_test`, which checks the
 ML kernels bit-for-bit and times them on the Deck.
 
+## Upgrading from AISS DLSS-NSS
+
+The plugin was called AISS DLSS-NSS (folder `aiss-dlss-nss`, `AISS_*` variables) before. Remove that folder when
+installing DeckyUpscaler (`steamdeck/decky/build.sh` prints the command); until it is gone, DeckyUpscaler warns and does
+not repair games automatically. On its first start DeckyUpscaler imports the old plugin's state (read only), replaces
+the old builds it finds (their `AISS_` markers mark them as its own), moves AMD's files from `system32\aiss\` to
+`system32\deckyupscaler\`, removes the old Vulkan layer files and the old variables from the launch options, and
+restores backups with the old suffixes (`.aiss-orig`, `amd_fidelityfx_vk.aiss-orig.dll`) on uninstall.
+
 ## Install for one game (manual)
 
 Use the Decky plugin for this. By hand:
 
-1. Copy `build_win_nvngx/nvngx.dll` to `steamapps/compatdata/<appid>/pfx/drive_c/windows/system32/_nvngx.dll`. The prefix exists after the first launch. For XeSS, put `libxess.dll` next to it; for FSR 4, put `amdxcffx64.dll` in a `system32\aiss\` subfolder (not `system32` itself, where Proton's own older `amdxcffx64.dll` would shadow it).
+1. Copy `build_win_nvngx/nvngx.dll` to `steamapps/compatdata/<appid>/pfx/drive_c/windows/system32/_nvngx.dll`. The prefix exists after the first launch. For XeSS, put `libxess.dll` next to it; for FSR 4, put `amdxcffx64.dll` in a `system32\deckyupscaler\` subfolder (not `system32` itself, where Proton's own older `amdxcffx64.dll` would shadow it).
 2. Copy the loader shim next to the game executable:
    - `build_win_loader/dbghelp/dbghelp.dll` if the game ships `sl.interposer.dll`;
    - `build_win_loader/dxgi/dxgi.dll` otherwise.
-3. Copy `build_layer/libVkLayer_aiss_ngx.so` and `VkLayer_aiss_ngx.json` to `~/.local/share/vulkan/implicit_layer.d/`.
-4. Launch options: `PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dbghelp=n,b" %command%`. Use `dxgi=n,b` for the dxgi shim.
+3. Copy `build_layer/libVkLayer_deckyupscaler.so` and `VkLayer_deckyupscaler.json` to `~/.local/share/vulkan/implicit_layer.d/`.
+4. Launch options: `PROTON_FORCE_NVAPI=1 DU_LAYER=1 WINEDLLOVERRIDES="dbghelp=n,b" %command%`. Use `dxgi=n,b` for the dxgi shim.
 5. Enable DLSS in the game.
 
 ## Options (launch-option environment variables)
 
 | Variable | Effect |
 | --- | --- |
-| `AISS_NSS_QUALITY=0/1/2` | NSS shader quality at launch: 0 = Quality network (default), 1 = Balanced, 2 = Performance |
-| `AISS_CONTROL=/path` | File holding "upscaler [fast maths] [capture]": 0/1/2 (NSS model), 3 (XeSS), 4/5/6 (FSR 4 Lite / INT8 / INT8 RDNA 2), 7 (FSR 4 FP8), 8 (FSR 4, AMD's choice); re-read twice a second; switches the upscaler while the game runs (set by the plugin) |
-| `AISS_UPSCALER=xess` | XeSS instead of NSS at launch (the control file overrides it) |
-| `AISS_UPSCALER=fsr4`, `AISS_FSR4_MODEL=auto/lite/int8/rdna2` | AMD FSR 4 (amdxcffx64.dll: native on D3D12, D3D12 interop on D3D11 and Vulkan) at launch, with that network (default auto: Lite on a Steam Deck); also `AISS_UPSCALER=fsr4-lite` etc. |
-| `AISS_FSR4_DIR=C:\path` | Folder amd_fidelityfx_upscaler_vk.dll and amdxcffx64.dll are loaded from (default: the `aiss` subfolder next to `_nvngx.dll`) |
-| `AISS_FSR4_VK_SHADERS=0`, `AISS_FSR4_VK_SHADER_DIR=C:\path`, `AISS_FSR4_VK_DOT2=0` | FSR 4 on the SDK Vulkan DLL: no replacement shader modules / take them from `<path>\<hash>.spv` instead of the `aiss\fsr4_shaders*.bin` packs / skip the dot2 pack |
-| `AISS_FSR4_VK_PROFILE=N`, `AISS_FSR4_DX12_PROFILE=N`, `AISS_FSR4_VK_DUMP=dir` | FSR 4 diagnostics: per-dispatch GPU time (SDK Vulkan / D3D12 DLL), dump the SDK DLL's shader modules |
-| `AISS_FSR4_ALLOW_ANY_VERSION=1` | Accept an FSR 4 provider that is not 4.1.2 (diagnostics; normally such a provider is refused and the proxy uses NSS) |
-| `AISS_FSR4_WATERMARK=1` (or `FSR_WATERMARK=1`) | FSR 4: have AMD's DLL draw its banner (network name, version) on the output |
-| `AISS_FSR4_GPU=family,revision` | FSR 4: amdgpu family / revision handed to AMD's GPU query (default 144,1 on a Steam Deck, nothing elsewhere) |
-| `AISS_FSR4_DX12_VER=0xVER` | FSR 4 D3D12: chain an upscaler version desc with this value (default: none; the 4.1.2 DLL rejects it) |
-| `AISS_EQUAL_COST=0/1` | Equal-cost render scale (default 0, not offered by the plugin): each upscaler gets the render size at which game + upscale costs the same GPU time as NSS Quality at the DLSS mode's ratio (see *Equal-cost render scale*); 0 = the standard DLSS ratios for every upscaler. The control file's `equal_cost=` overrides it |
-| `AISS_UPSCALER=fsr3` | AMD FSR 3.1 (3.1.6, from the SDK Vulkan DLL) at launch; control-file upscaler 9 |
-| `AISS_FSR3_SHARPNESS`, `AISS_FSR3_VELOCITY`, `AISS_FSR3_REACTIVENESS`, `AISS_FSR3_SHADING`, `AISS_FSR3_ACCUMULATION`, `AISS_FSR3_MIN_DISOCCLUSION` | Override FSR 3.1's settings (AMD's defaults; see *FSR 3.1* for the values closest to FSR 4 INT8; sharpness < 0 = off) |
-| `AISS_FSR_DILATE_MV=1` | Dilate motion vectors by nearest depth ahead of FSR 4 / FSR 3.1 (plugin toggle "Dilate motion vectors", control key `dilate_mv`, switches live) |
-| `AISS_RATIO=r` | Force one render-scale divisor for every DLSS mode (testing); turns equal cost off |
-| `AISS_XESS_QUALITY=100..105` | XeSS preset (default 100, Ultra Performance: the widest input range) |
-| `AISS_GPU_TIMING=N` | Log the GPU time of the upscale and the evaluations per second, averaged over N evaluations |
-| `AISS_CAMERA_NEAR`, `AISS_CAMERA_FAR`, `AISS_CAMERA_FOV` | Camera values NGX does not pass. Defaults: 0.1, 100000, 60° (reversed-Z, infinite far plane). |
-| `AISS_EXPOSURE` | Exposure passed to NSS (default 1.0) |
-| `AISS_LOG=0..4` | Log to `aiss_nvngx.log` next to the exe: 1 lifecycle (default), 2 per-frame, 3 NGX calls, 4 every parameter |
-| `AISS_DEBUG_VIEW=0..16` | Write NSS's internal views instead of the image (0 = 4x4 grid) |
-| `AISS_DUMP_FRAME=N` | Write output frame N to `aiss_frame_N.ppm` (any upscaler); for upscalers other than NSS, `AISS_DUMP_FRAME_COUNT=K` writes frames N..N+K-1 |
+| `DU_NSS_QUALITY=0/1/2` | NSS shader quality at launch: 0 = Quality network (default), 1 = Balanced, 2 = Performance |
+| `DU_CONTROL=/path` | File holding "upscaler [fast maths] [capture]": 0/1/2 (NSS model), 3 (XeSS), 4/5/6 (FSR 4 Lite / INT8 / INT8 RDNA 2), 7 (FSR 4 FP8), 8 (FSR 4, AMD's choice); re-read twice a second; switches the upscaler while the game runs (set by the plugin) |
+| `DU_UPSCALER=xess` | XeSS instead of NSS at launch (the control file overrides it) |
+| `DU_UPSCALER=fsr4`, `DU_FSR4_MODEL=auto/lite/int8/rdna2` | AMD FSR 4 (amdxcffx64.dll: native on D3D12, D3D12 interop on D3D11 and Vulkan) at launch, with that network (default auto: Lite on a Steam Deck); also `DU_UPSCALER=fsr4-lite` etc. |
+| `DU_FSR4_DIR=C:\path` | Folder amd_fidelityfx_upscaler_vk.dll and amdxcffx64.dll are loaded from (default: the `deckyupscaler` subfolder next to `_nvngx.dll`) |
+| `DU_FSR4_VK_SHADERS=0`, `DU_FSR4_VK_SHADER_DIR=C:\path`, `DU_FSR4_VK_DOT2=0` | FSR 4 on the SDK Vulkan DLL: no replacement shader modules / take them from `<path>\<hash>.spv` instead of the `deckyupscaler\fsr4_shaders*.bin` packs / skip the dot2 pack |
+| `DU_FSR4_VK_PROFILE=N`, `DU_FSR4_DX12_PROFILE=N`, `DU_FSR4_VK_DUMP=dir` | FSR 4 diagnostics: per-dispatch GPU time (SDK Vulkan / D3D12 DLL), dump the SDK DLL's shader modules |
+| `DU_FSR4_ALLOW_ANY_VERSION=1` | Accept an FSR 4 provider that is not 4.1.2 (diagnostics; normally such a provider is refused and the proxy uses NSS) |
+| `DU_FSR4_WATERMARK=1` (or `FSR_WATERMARK=1`) | FSR 4: have AMD's DLL draw its banner (network name, version) on the output |
+| `DU_FSR4_GPU=family,revision` | FSR 4: amdgpu family / revision handed to AMD's GPU query (default 144,1 on a Steam Deck, nothing elsewhere) |
+| `DU_FSR4_DX12_VER=0xVER` | FSR 4 D3D12: chain an upscaler version desc with this value (default: none; the 4.1.2 DLL rejects it) |
+| `DU_EQUAL_COST=0/1` | Equal-cost render scale (default 0, not offered by the plugin): each upscaler gets the render size at which game + upscale costs the same GPU time as NSS Quality at the DLSS mode's ratio (see *Equal-cost render scale*); 0 = the standard DLSS ratios for every upscaler. The control file's `equal_cost=` overrides it |
+| `DU_UPSCALER=fsr3` | AMD FSR 3.1 (3.1.6, from the SDK Vulkan DLL) at launch; control-file upscaler 9 |
+| `DU_FSR3_SHARPNESS`, `DU_FSR3_VELOCITY`, `DU_FSR3_REACTIVENESS`, `DU_FSR3_SHADING`, `DU_FSR3_ACCUMULATION`, `DU_FSR3_MIN_DISOCCLUSION` | Override FSR 3.1's settings (AMD's defaults; see *FSR 3.1* for the values closest to FSR 4 INT8; sharpness < 0 = off) |
+| `DU_FSR_DILATE_MV=1` | Dilate motion vectors by nearest depth ahead of FSR 4 / FSR 3.1 (plugin toggle "Dilate motion vectors", control key `dilate_mv`, switches live) |
+| `DU_RATIO=r` | Force one render-scale divisor for every DLSS mode (testing); turns equal cost off |
+| `DU_XESS_QUALITY=100..105` | XeSS preset (default 100, Ultra Performance: the widest input range) |
+| `DU_GPU_TIMING=N` | Log the GPU time of the upscale and the evaluations per second, averaged over N evaluations |
+| `DU_CAMERA_NEAR`, `DU_CAMERA_FAR`, `DU_CAMERA_FOV` | Camera values NGX does not pass. Defaults: 0.1, 100000, 60° (reversed-Z, infinite far plane). |
+| `DU_EXPOSURE` | Exposure passed to NSS (default 1.0) |
+| `DU_LOG=0..4` | Log to `deckyupscaler.log` next to the exe: 1 lifecycle (default), 2 per-frame, 3 NGX calls, 4 every parameter |
+| `DU_DEBUG_VIEW=0..16` | Write NSS's internal views instead of the image (0 = 4x4 grid) |
+| `DU_DUMP_FRAME=N` | Write output frame N to `deckyupscaler_frame_N.ppm` (any upscaler); for upscalers other than NSS, `DU_DUMP_FRAME_COUNT=K` writes frames N..N+K-1 |
 | `FFX_PROFILE_PASSES=file` | Per-pass GPU timings |
 | `FFX_ML_RESCALE_FLOAT=1` | Fast maths: fp32 requantisation in the ML graph, ~1-2% faster, not bit exact; launch option only (the plugin no longer offers it and always writes fast maths off) |
-| `AISS_DUMP_INPUTS=first,count` | Raw colour/depth/MV/output per dispatch next to the game exe (the plugin's "Capture frames" button does the same for the next 8 frames of a running game, into `~/.local/share/aiss-dlss-nss/captures/`) |
-| `AISS_JITTER_SIGN=x,y`, `AISS_MV_SIGN=x,y` | Multipliers on the jitter / motion vector scale handed to NSS (convention debugging) |
-| `AISS_LAYER_LOG=1` | Vulkan layer: log instances, device extensions and NULL proc lookups to stderr |
-| `AISS_LAYER_FEATURES=0`, `AISS_LAYER_EMULATE=0` | Vulkan layer: don't force ML features / don't emulate the NVIDIA extensions (debugging) |
-| `AISS_LAYER_XESS=0` | Vulkan layer: don't enable the XeSS device features (debugging) |
-| `AISS_LAYER_SPLIT=0` | Vulkan layer: no command buffer split (FSR 4 on Vulkan games then falls back to NSS) |
-| `AISS_LAYER_RPLOG=1` | Vulkan layer: log render pass begin/end on split devices (debugging) |
+| `DU_DUMP_INPUTS=first,count` | Raw colour/depth/MV/output per dispatch next to the game exe (the plugin's "Capture frames" button does the same for the next 8 frames of a running game, into `~/.local/share/deckyupscaler/captures/`) |
+| `DU_JITTER_SIGN=x,y`, `DU_MV_SIGN=x,y` | Multipliers on the jitter / motion vector scale handed to NSS (convention debugging) |
+| `DU_LAYER_LOG=1` | Vulkan layer: log instances, device extensions and NULL proc lookups to stderr |
+| `DU_LAYER_FEATURES=0`, `DU_LAYER_EMULATE=0` | Vulkan layer: don't force ML features / don't emulate the NVIDIA extensions (debugging) |
+| `DU_LAYER_XESS=0` | Vulkan layer: don't enable the XeSS device features (debugging) |
+| `DU_LAYER_SPLIT=0` | Vulkan layer: no command buffer split (FSR 4 on Vulkan games then falls back to NSS) |
+| `DU_LAYER_RPLOG=1` | Vulkan layer: log render pass begin/end on split devices (debugging) |
 
 ## Tested
 
@@ -559,9 +589,9 @@ All tests use the original Streamline Sample 2.14.16 with the production Streaml
 clang-cl, under Proton Experimental:
 
 - **D3D12** (with and without the Vulkan layer): DLSS reported supported. NSS runs inline on vkd3d-proton; the output, the debug view (depth, motion vectors, disocclusion) and the exit are clean. The layer hides its emulated NVIDIA extensions from DXVK and vkd3d-proton, which would otherwise switch on Reflex/CUDA interop paths that nothing implements.
-- **Vulkan** (`-vk`): DLSS reported supported; output frame verified with `AISS_DUMP_FRAME`; clean exit.
+- **Vulkan** (`-vk`): DLSS reported supported; output frame verified with `DU_DUMP_FRAME`; clean exit.
 - **D3D11**: the sample's D3D11 path needs `fxc`, so `steamdeck/tests/ngx_d3d11_test` drives the NGX D3D11 API on DXVK instead (64 evaluations, upscaled output within 0.009 mean error of the reference).
-- **Inputs larger than the render size** (e.g. Galactic Racer: 428x268 colour for a 427x267 render): NSS samples colour and motion vectors with UVs from the render size, so the proxy copies the render-size region of an oversized input into an exact-size image of the same format first (depth always goes through such a copy). `ngx_d3d11_test --pad N` pads the inputs with junk and must match the unpadded run bit for bit; `--replay DIR [--crop]` replays a capture or `AISS_DUMP_INPUTS` dump, as dumped or cropped to the render size.
+- **Inputs larger than the render size** (e.g. Galactic Racer: 428x268 colour for a 427x267 render): NSS samples colour and motion vectors with UVs from the render size, so the proxy copies the render-size region of an oversized input into an exact-size image of the same format first (depth always goes through such a copy). `ngx_d3d11_test --pad N` pads the inputs with junk and must match the unpadded run bit for bit; `--replay DIR [--crop]` replays a capture or `DU_DUMP_INPUTS` dump, as dumped or cropped to the render size.
 
 The sample's `SLWrapper::UpdateFeatureAvailable` reads a LUID through a pointer to a variable whose scope has ended.
 MSVC builds happen to work; an optimised clang build makes Streamline see LUID 0 and report DLSS as unsupported.

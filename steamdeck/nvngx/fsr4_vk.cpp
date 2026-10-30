@@ -42,7 +42,8 @@ bool       g_loadTried = false, g_loadOk = false, g_deviceFailed = false, g_fsr3
 Sdk        g_sdk;
 Fsr4Driver g_drv;  // the SDK DLL's FSR 4 networks (device checks wrapped, see fsr4_common)
 
-// <folder of _nvngx.dll>\aiss\<name>, or AISS_FSR4_DIR\<name> (same place as amdxcffx64.dll, see fsr4_common.cpp).
+// <folder of _nvngx.dll>\deckyupscaler\<name>, or DU_FSR4_DIR\<name> (same place as amdxcffx64.dll, see
+// fsr4_common.cpp).
 std::wstring DllPath()
 {
     wchar_t path[MAX_PATH] = {};
@@ -51,10 +52,10 @@ std::wstring DllPath()
                        reinterpret_cast<LPCWSTR>(&DllPath), &self);
     GetModuleFileNameW(self, path, MAX_PATH);
     if (wchar_t* slash = wcsrchr(path, L'\\'))
-        wcscpy(slash + 1, L"aiss\\");
+        wcscpy(slash + 1, L"deckyupscaler\\");
     else
         path[0] = 0;
-    if (const char* dir = getenv("AISS_FSR4_DIR"))
+    if (const char* dir = getenv("DU_FSR4_DIR"))
     {
         MultiByteToWideChar(CP_UTF8, 0, dir, -1, path, MAX_PATH);
         size_t n = wcslen(path);
@@ -75,7 +76,7 @@ bool LoadSdk()
         LOGI("FSR 4 Vulkan: %ls not found; FSR 4 goes through the D3D12 interop", path.c_str());
         return false;
     }
-    // Only FSR Upscaling 4.1.2 (file version 4.1.2.x) unless AISS_FSR4_ALLOW_ANY_VERSION=1.
+    // Only FSR Upscaling 4.1.2 (file version 4.1.2.x) unless DU_FSR4_ALLOW_ANY_VERSION=1.
     unsigned v[4] = {};
     if (DWORD vsz = GetFileVersionInfoSizeW(path.c_str(), nullptr))
     {
@@ -88,9 +89,9 @@ bool LoadSdk()
             v[3] = LOWORD(fi->dwFileVersionLS);
     }
     LOGI("FSR 4 Vulkan: %ls file version %u.%u.%u.%u", path.c_str(), v[0], v[1], v[2], v[3]);
-    if (!(v[0] == 4 && v[1] == 1 && v[2] == 2) && !(getenv("AISS_FSR4_ALLOW_ANY_VERSION") && atoi(getenv("AISS_FSR4_ALLOW_ANY_VERSION"))))
+    if (!(v[0] == 4 && v[1] == 1 && v[2] == 2) && !(getenv("DU_FSR4_ALLOW_ANY_VERSION") && atoi(getenv("DU_FSR4_ALLOW_ANY_VERSION"))))
     {
-        LOGI("FSR 4 Vulkan: not FSR Upscaling 4.1.2; refused (AISS_FSR4_ALLOW_ANY_VERSION=1 accepts it)");
+        LOGI("FSR 4 Vulkan: not FSR Upscaling 4.1.2; refused (DU_FSR4_ALLOW_ANY_VERSION=1 accepts it)");
         return false;
     }
     const auto t0 = GetTickCount64();
@@ -156,9 +157,9 @@ uint64_t PickVersion(VkDeviceContext* dc, std::string* name, char major)
 
 // AMD's Windows Vulkan driver exposes vkUpdateFfxApiProviderAMD (it hands the SDK a driver-side FSR 4 provider); RADV
 // does not, and the SDK's own FSR 4 networks then serve (their device checks are answered in fsr4_common).
-// AISS_FSR4_VK_PROBE=1/2 answers the lookup with a logger that fails / succeeds (diagnostics).
+// DU_FSR4_VK_PROBE=1/2 answers the lookup with a logger that fails / succeeds (diagnostics).
 PFN_vkGetDeviceProcAddr g_gameGdpa = nullptr;
-int                     g_probeMode = 0;  // AISS_FSR4_VK_PROBE: 0 = NULL (as RADV), 1 = log and fail, 2 = log and succeed
+int                     g_probeMode = 0;  // DU_FSR4_VK_PROBE: 0 = NULL (as RADV), 1 = log and fail, 2 = log and succeed
 
 VkResult VKAPI_CALL ProbeUpdateProvider(uint64_t a, uint64_t b, uint64_t c, uint64_t d)
 {
@@ -179,7 +180,7 @@ void ProfRememberModule(VkShaderModule mod, const VkShaderModuleCreateInfo* ci, 
 
 // Shader modules the DLL creates, keyed by a 64-bit FNV-1a hash of the original SPIR-V: a module is replaced with
 // its replacement from Shaders() when there is one, so a replacement only ever applies to the exact module it was made
-// for. AISS_FSR4_VK_DUMP=dir writes each original to dir\<hash>_<entry point>.spv (diagnostics).
+// for. DU_FSR4_VK_DUMP=dir writes each original to dir\<hash>_<entry point>.spv (diagnostics).
 uint64_t SpirvHash(const void* code, size_t size)
 {
     uint64_t       h = 1469598103934665603ull;
@@ -223,12 +224,12 @@ std::vector<uint32_t> ReadSpirv(const char* path)
 }
 
 // Where replacement modules come from (none of them are part of this repository):
-//  - AISS_FSR4_VK_SHADER_DIR=dir: dir\<hash>.spv files (shader development);
+//  - DU_FSR4_VK_SHADER_DIR=dir: dir\<hash>.spv files (shader development);
 //  - else packs beside the DLL, installed by the plugin when it has them: fsr4_shaders.bin, and fsr4_shaders_dot2.bin
 //    whose modules use v_dot2_f32_f16 (SPV_VALVE_mixed_float_dot_product) and take precedence when the device has
-//    VK_VALVE_shader_mixed_float_dot_product enabled (see Dot2Enabled). Format: "AISSSPV1", u32 count, then per module
-//    u64 hash, u32 word count and the SPIR-V words.
-// AISS_FSR4_VK_SHADERS=0 turns replacement off; AISS_FSR4_VK_DOT2=0 keeps to fsr4_shaders.bin.
+//    VK_VALVE_shader_mixed_float_dot_product enabled (see Dot2Enabled). Format: "DUSPACK1" (older packs: "AISSSPV1"),
+//    u32 count, then per module u64 hash, u32 word count and the SPIR-V words.
+// DU_FSR4_VK_SHADERS=0 turns replacement off; DU_FSR4_VK_DOT2=0 keeps to fsr4_shaders.bin.
 //
 // A set can also take over work the proxy or the DLL otherwise does, declared in an options entry under the reserved
 // hash 0 (dir\0000000000000000.spv in a shader dir). It has a SPIR-V header so older proxies load it as a module no
@@ -277,7 +278,8 @@ ShaderPack ReadPack(const wchar_t* name)
         return pack;
     char     magic[8] = {};
     uint32_t count    = 0;
-    bool ok = fread(magic, 1, 8, f) == 8 && !memcmp(magic, "AISSSPV1", 8) && fread(&count, 4, 1, f) == 1 && count < 4096;
+    bool ok = fread(magic, 1, 8, f) == 8 && (!memcmp(magic, "DUSPACK1", 8) || !memcmp(magic, "AISSSPV1", 8)) &&
+              fread(&count, 4, 1, f) == 1 && count < 4096;
     for (uint32_t i = 0; ok && i < count; ++i)
     {
         uint64_t hash  = 0;
@@ -302,9 +304,9 @@ const ShaderSource& Shaders()
 {
     static const ShaderSource src = [] {
         ShaderSource s;
-        if (const char* off = getenv("AISS_FSR4_VK_SHADERS"); off && !strcmp(off, "0"))
+        if (const char* off = getenv("DU_FSR4_VK_SHADERS"); off && !strcmp(off, "0"))
             return s;
-        if (const char* env = getenv("AISS_FSR4_VK_SHADER_DIR"); env && *env)
+        if (const char* env = getenv("DU_FSR4_VK_SHADER_DIR"); env && *env)
         {
             s.dir = env;
             std::vector<uint32_t> opts = ReadSpirv((s.dir + "\\0000000000000000.spv").c_str());
@@ -314,7 +316,7 @@ const ShaderSource& Shaders()
         }
         s.pack    = ReadPack(L"fsr4_shaders.bin");
         s.options = ParseOptions(s.pack);
-        if (const char* off = getenv("AISS_FSR4_VK_DOT2"); !(off && !strcmp(off, "0")))
+        if (const char* off = getenv("DU_FSR4_VK_DOT2"); !(off && !strcmp(off, "0")))
         {
             s.dot2        = ReadPack(L"fsr4_shaders_dot2.bin");
             s.dot2Options = ParseOptions(s.dot2);
@@ -325,8 +327,9 @@ const ShaderSource& Shaders()
 }
 
 // Whether the dot2 modules are valid on the FSR 4 device: the GPU must have VK_VALVE_shader_mixed_float_dot_product, and
-// the device must have enabled it, which vkd3d-proton does itself (D3D12 games) and the AISS layer does for every other
-// device (AISS_LAYER=1, which the plugin sets). Set by Fsr4VkUpscaler::Create before the DLL builds its pipelines.
+// the device must have enabled it, which vkd3d-proton does itself (D3D12 games) and the DeckyUpscaler layer does for
+// every other device (DU_LAYER=1, which the plugin sets). Set by Fsr4VkUpscaler::Create before the DLL builds its
+// pipelines.
 std::atomic<bool> g_dot2{false};
 
 bool Dot2Enabled(const VulkanDevice& dev, CostApi api)
@@ -368,7 +371,7 @@ VkResult VKAPI_CALL HookedCreateShaderModule(VkDevice device, const VkShaderModu
     const uint64_t hash  = SpirvHash(ci->pCode, ci->codeSize);
     const char*    entry = SpirvEntryPoint(ci->pCode, ci->codeSize / 4);
     char           path[MAX_PATH];
-    if (const char* dir = getenv("AISS_FSR4_VK_DUMP"); dir && *dir)
+    if (const char* dir = getenv("DU_FSR4_VK_DUMP"); dir && *dir)
     {
         snprintf(path, sizeof(path), "%s\\%016llx_%s.spv", dir, (unsigned long long)hash, entry);
         if (FILE* f = fopen(path, "wb"))
@@ -412,7 +415,7 @@ VkResult VKAPI_CALL HookedCreateShaderModule(VkDevice device, const VkShaderModu
 }
 
 // The DLL's compute pipelines and dispatches. Dispatches of pipelines made from a module in the set's skip list are not
-// recorded (ActiveOptions). AISS_FSR4_VK_PROFILE=N: GPU time of each compute dispatch the DLL records, by shader entry
+// recorded (ActiveOptions). DU_FSR4_VK_PROFILE=N: GPU time of each compute dispatch the DLL records, by shader entry
 // point, averaged over N evaluations (diagnostics). Pipelines are named from the entry point of the module they were
 // created from.
 struct PassProfiler
@@ -528,7 +531,7 @@ void VKAPI_CALL ProfDispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32
 // Around each evaluate: collect the ring slot recorded kRing evaluations ago, reset it, and mark it current.
 void ProfBeginEval(const VulkanDevice& dev, VkCommandBuffer cmd)
 {
-    static const int every = getenv("AISS_FSR4_VK_PROFILE") ? atoi(getenv("AISS_FSR4_VK_PROFILE")) : 0;
+    static const int every = getenv("DU_FSR4_VK_PROFILE") ? atoi(getenv("DU_FSR4_VK_PROFILE")) : 0;
     if (every <= 0)
         return;
     std::lock_guard<std::mutex> l(g_prof.m);
@@ -587,7 +590,7 @@ void ProfBeginEval(const VulkanDevice& dev, VkCommandBuffer cmd)
 // The DLL allocates its weights and tensors from the first memory type its filter allows, which on RADV is a
 // DEVICE_COHERENT_AMD | DEVICE_UNCACHED_AMD type: every access then bypasses the GPU's L2 and FSR 4 runs ~2.4x slower
 // (7.3 vs 3.0 ms on the Deck). Such allocations move to the same heap's plain type with the same other flags.
-// AISS_FSR4_VK_KEEP_UNCACHED=1 keeps AMD's choice; AISS_LOG=2 logs each allocation.
+// DU_FSR4_VK_KEEP_UNCACHED=1 keeps AMD's choice; DU_LOG=2 logs each allocation.
 PFN_vkAllocateMemory             g_realAllocateMemory = nullptr;
 VkPhysicalDeviceMemoryProperties g_memProps           = {};
 VkResult VKAPI_CALL LogAllocateMemory(VkDevice d, const VkMemoryAllocateInfo* ai, const VkAllocationCallbacks* a,
@@ -596,7 +599,7 @@ VkResult VKAPI_CALL LogAllocateMemory(VkDevice d, const VkMemoryAllocateInfo* ai
     VkMemoryAllocateInfo fixed = *ai;
     const VkMemoryPropertyFlags kAmdUncached = VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
     const VkMemoryType& t = g_memProps.memoryTypes[ai->memoryTypeIndex];
-    if ((t.propertyFlags & kAmdUncached) && !getenv("AISS_FSR4_VK_KEEP_UNCACHED"))
+    if ((t.propertyFlags & kAmdUncached) && !getenv("DU_FSR4_VK_KEEP_UNCACHED"))
         for (uint32_t i = 0; i < g_memProps.memoryTypeCount; ++i)
             if (g_memProps.memoryTypes[i].propertyFlags == (t.propertyFlags & ~kAmdUncached) &&
                 g_memProps.memoryTypes[i].heapIndex == t.heapIndex)
@@ -621,7 +624,7 @@ PFN_vkVoidFunction VKAPI_CALL HookedGdpa(VkDevice device, const char* name)
     if (name && !strcmp(name, "vkAllocateMemory"))
         return g_realAllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(g_gameGdpa(device, name)),
                reinterpret_cast<PFN_vkVoidFunction>(&LogAllocateMemory);
-    if (name && (getenv("AISS_FSR4_VK_PROFILE") || !Shaders().options.skipDispatch.empty()))
+    if (name && (getenv("DU_FSR4_VK_PROFILE") || !Shaders().options.skipDispatch.empty()))
     {
         if (!strcmp(name, "vkCmdDispatch"))
             return g_prof.realDispatch = reinterpret_cast<PFN_vkCmdDispatch>(g_gameGdpa(device, name)),
@@ -656,11 +659,11 @@ FfxApiResource Resource(const UpscalerImage& img, bool output)
                                state);
 }
 
-// FSR 3.1 settings (the SDK DLL's FSR 3.1.6, AISS_UPSCALER=fsr3 / control code 9): AMD's defaults. The values that bring
+// FSR 3.1 settings (the SDK DLL's FSR 3.1.6, DU_UPSCALER=fsr3 / control code 9): AMD's defaults. The values that bring
 // its output closest to FSR 4 INT8's (accumulation 0.05, shading change 32: 53.9 -> 56.1 dB against INT8) are in the
 // README ("FSR 3.1"). Each can be overridden:
-// AISS_FSR3_SHARPNESS (< 0 = sharpening off), AISS_FSR3_VELOCITY, AISS_FSR3_REACTIVENESS, AISS_FSR3_SHADING,
-// AISS_FSR3_ACCUMULATION, AISS_FSR3_MIN_DISOCCLUSION (the SDK's configure keys of the same names).
+// DU_FSR3_SHARPNESS (< 0 = sharpening off), DU_FSR3_VELOCITY, DU_FSR3_REACTIVENESS, DU_FSR3_SHADING,
+// DU_FSR3_ACCUMULATION, DU_FSR3_MIN_DISOCCLUSION (the SDK's configure keys of the same names).
 struct Fsr3Tuning
 {
     float sharpness        = -1.0f;
@@ -679,12 +682,12 @@ const Fsr3Tuning& Fsr3Settings()
             if (const char* s = getenv(name); s && *s)
                 v = float(atof(s));
         };
-        env("AISS_FSR3_SHARPNESS", r.sharpness);
-        env("AISS_FSR3_VELOCITY", r.velocity);
-        env("AISS_FSR3_REACTIVENESS", r.reactiveness);
-        env("AISS_FSR3_SHADING", r.shading);
-        env("AISS_FSR3_ACCUMULATION", r.accumulation);
-        env("AISS_FSR3_MIN_DISOCCLUSION", r.minDisocclusion);
+        env("DU_FSR3_SHARPNESS", r.sharpness);
+        env("DU_FSR3_VELOCITY", r.velocity);
+        env("DU_FSR3_REACTIVENESS", r.reactiveness);
+        env("DU_FSR3_SHADING", r.shading);
+        env("DU_FSR3_ACCUMULATION", r.accumulation);
+        env("DU_FSR3_MIN_DISOCCLUSION", r.minDisocclusion);
         return r;
     }();
     return t;
@@ -708,7 +711,7 @@ public:
         // the device context's pointer): memory type fix-up, the absent driver hook, and the optional diagnostics.
         if (!g_gameGdpa)
         {
-            g_probeMode = getenv("AISS_FSR4_VK_PROBE") ? atoi(getenv("AISS_FSR4_VK_PROBE")) : 0;
+            g_probeMode = getenv("DU_FSR4_VK_PROBE") ? atoi(getenv("DU_FSR4_VK_PROBE")) : 0;
             g_gameGdpa  = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
                 Fsr4RedirectImport(g_sdk.lib, "vulkan-1.dll", "vkGetDeviceProcAddr", reinterpret_cast<void*>(&HookedGdpa)));
             if (!g_gameGdpa)
@@ -785,7 +788,7 @@ public:
         }
         if (fsr3)
         {
-            // FSR 3.1's own knobs (no network): the tuned defaults, or the AISS_FSR3_* overrides.
+            // FSR 3.1's own knobs (no network): the tuned defaults, or the DU_FSR3_* overrides.
             const Fsr3Tuning& t = Fsr3Settings();
             const std::pair<uint64_t, float> keys[] = {
                 {FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR, t.velocity},

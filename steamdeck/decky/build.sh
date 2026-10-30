@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Builds the "AISS DLSS-NSS" Decky plugin.
+# Builds the DeckyUpscaler Decky plugin.
 #   1. copies the built binaries into bin/ (from the repo build dirs, override with env vars below)
 #   2. builds the frontend (dist/index.js) with pnpm, inside the `aissbuild` distrobox when node is not on the host
-#   3. assembles out/aiss-dlss-nss/ (the folder that goes into ~/homebrew/plugins/) and out/aiss-dlss-nss.zip
+#   3. assembles out/deckyupscaler/ (the folder that goes into ~/homebrew/plugins/) and out/deckyupscaler.zip
 #
 #   steamdeck/decky/build.sh            full build
 #   SKIP_FRONTEND=1 steamdeck/decky/build.sh   refresh binaries + package only (reuses existing dist/)
 #   PNPM="node /path/pnpm/bin/pnpm.cjs" steamdeck/decky/build.sh   use a pnpm that is not on PATH
 #
-# Install (Decky plugin dirs are root-owned):
-#   sudo rm -rf ~/homebrew/plugins/aiss-dlss-nss
-#   sudo cp -r steamdeck/decky/out/aiss-dlss-nss ~/homebrew/plugins/
+# Install (Decky plugin dirs are root-owned). The plugin's former folder, aiss-dlss-nss, must go too: on its first
+# start the new plugin takes over the old one's games, files and settings.
+#   sudo rm -rf ~/homebrew/plugins/deckyupscaler ~/homebrew/plugins/aiss-dlss-nss
+#   sudo cp -r steamdeck/decky/out/deckyupscaler ~/homebrew/plugins/
 #   sudo systemctl restart plugin_loader
 set -euo pipefail
 
@@ -28,16 +29,17 @@ FSR4_VK_DIR="${FSR4_VK_DIR:-$REPO/../third_party/amd/sdk240}"
 FSR4_SHADERS="${FSR4_SHADERS:-$REPO/../third_party/amd/fsr4_shaders.bin}"
 FSR4_SHADERS_DOT2="${FSR4_SHADERS_DOT2:-$REPO/../third_party/amd/fsr4_shaders_dot2.bin}"
 DISTROBOX="${DISTROBOX:-aissbuild}"
-NAME="aiss-dlss-nss"
+NAME="deckyupscaler"
 
 echo "== binaries -> bin/"
 mkdir -p "$HERE/bin"
+rm -f "$HERE/bin/libVkLayer_aiss_ngx.so" "$HERE/bin/VkLayer_aiss_ngx.json" "$HERE/bin/aiss_ffx_vk.dll"  # former names
 for f in "$NVNGX_DLL" "$LOADER_DIR/dbghelp/dbghelp.dll" "$LOADER_DIR/dxgi/dxgi.dll" \
-         "$LAYER_DIR/libVkLayer_aiss_ngx.so" "$LAYER_DIR/VkLayer_aiss_ngx.json"; do
+         "$LAYER_DIR/libVkLayer_deckyupscaler.so" "$LAYER_DIR/VkLayer_deckyupscaler.json"; do
     [ -f "$f" ] || { echo "missing $f - build it first" >&2; exit 1; }
     install -m 0755 "$f" "$HERE/bin/"
 done
-chmod 0644 "$HERE/bin/VkLayer_aiss_ngx.json"
+chmod 0644 "$HERE/bin/VkLayer_deckyupscaler.json"
 [ -f "$XESS_SDK/bin/libxess.dll" ] && [ -f "$XESS_SDK/LICENSE.txt" ] || { echo "missing XeSS SDK at $XESS_SDK" >&2; exit 1; }
 install -m 0644 "$XESS_SDK/bin/libxess.dll" "$HERE/bin/libxess.dll"
 install -m 0644 "$XESS_SDK/LICENSE.txt" "$HERE/bin/libxess-LICENSE.txt"
@@ -64,8 +66,8 @@ for pair in "$FSR4_VK_DIR/amd_fidelityfx_upscaler_vk.dll:amd_fidelityfx_upscaler
 done
 echo "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)$(git -C "$REPO" diff --quiet 2>/dev/null || echo -dirty) built $(date -u +%Y-%m-%dT%H:%MZ)" > "$HERE/bin/VERSION"
 # The FFX forwarder (stands in for a game's amd_fidelityfx_vk.dll), bundled under its own name.
-install -m 0755 "$LOADER_DIR/ffx/amd_fidelityfx_vk.dll" "$HERE/bin/aiss_ffx_vk.dll"
-(cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_aiss_ngx.so VkLayer_aiss_ngx.json libxess.dll aiss_ffx_vk.dll \
+install -m 0755 "$LOADER_DIR/ffx/amd_fidelityfx_vk.dll" "$HERE/bin/deckyupscaler_ffx_vk.dll"
+(cd "$HERE/bin" && sha256sum nvngx.dll dbghelp.dll dxgi.dll libVkLayer_deckyupscaler.so VkLayer_deckyupscaler.json libxess.dll deckyupscaler_ffx_vk.dll \
     libxess-LICENSE.txt $FSR4_SUM > SHA256SUMS)
 
 if [ "${SKIP_FRONTEND:-0}" != 1 ]; then
@@ -86,7 +88,7 @@ OUT="$HERE/out/$NAME"
 rm -rf "$OUT" "$HERE/out/$NAME.zip"
 mkdir -p "$OUT/py_modules" "$OUT/bin" "$OUT/dist"
 cp "$HERE/plugin.json" "$HERE/package.json" "$HERE/main.py" "$OUT/"
-cp "$HERE/py_modules/aiss_core.py" "$OUT/py_modules/"
+cp "$HERE/py_modules/deckyupscaler_core.py" "$OUT/py_modules/"
 cp "$HERE/dist/index.js" "$OUT/dist/"
 [ -f "$HERE/dist/index.js.map" ] && cp "$HERE/dist/index.js.map" "$OUT/dist/"
 cp -p "$HERE/bin/"* "$OUT/bin/"
@@ -97,4 +99,4 @@ else
         "$HERE/out/$NAME" "$HERE/out" "$NAME"
 fi
 echo "done: $OUT  ($HERE/out/$NAME.zip)"
-echo "install: sudo rm -rf ~/homebrew/plugins/$NAME && sudo cp -r '$OUT' ~/homebrew/plugins/ && sudo systemctl restart plugin_loader"
+echo "install: sudo rm -rf ~/homebrew/plugins/$NAME ~/homebrew/plugins/aiss-dlss-nss && sudo cp -r '$OUT' ~/homebrew/plugins/ && sudo systemctl restart plugin_loader"

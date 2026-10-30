@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Packs replacement FSR 4 shader modules into the file the proxy loads from beside AMD's SDK Vulkan DLL
-(system32\\aiss\\fsr4_shaders.bin, see Shaders() in nvngx/fsr4_vk.cpp).
+(system32\\deckyupscaler\\fsr4_shaders.bin, see Shaders() in nvngx/fsr4_vk.cpp).
 
     pack_fsr4_shaders.py DIR OUT [--cleans-colour] [--skip-dispatch HASH]...
 
     DIR holds <hash>.spv files: <hash> is the 16-hex-digit FNV-1a hash of the original module the file replaces (as
-    AISS_FSR4_VK_DUMP names them). The options add the set's options entry (reserved hash 0; or DIR holds
+    DU_FSR4_VK_DUMP names them). The options add the set's options entry (reserved hash 0; or DIR holds
     0000000000000000.spv): --cleans-colour when the set's colour readers clean Inf / NaN themselves (the proxy then skips
     its clean-up pass), --skip-dispatch for each original module whose dispatches the set makes unnecessary.
 
-Format: b"AISSSPV1", u32 count, then per module u64 hash, u32 word count and the SPIR-V words (little endian). The
-options entry is a SPIR-V header (5 words) followed by u32 flags, u32 count and count u64 hashes.
+Format: b"DUSPACK1", u32 count, then per module u64 hash, u32 word count and the SPIR-V words (little endian). The
+options entry is a SPIR-V header (5 words) followed by u32 flags, u32 count and count u64 hashes. The proxy also reads
+packs written by older builds of this tool (magic b"AISSSPV1").
 """
 import struct
 import sys
@@ -47,7 +48,7 @@ def main() -> int:
         entries.append((int(f.stem, 16), code))
     if cleans_colour or skip:
         entries = [e for e in entries if e[0] != 0] + [(0, options_entry(cleans_colour, skip))]
-    out = bytearray(b"AISSSPV1" + struct.pack("<I", len(entries)))
+    out = bytearray(b"DUSPACK1" + struct.pack("<I", len(entries)))
     for h, code in entries:
         out += struct.pack("<QI", h, len(code) // 4) + code
     Path(args[1]).write_bytes(out)

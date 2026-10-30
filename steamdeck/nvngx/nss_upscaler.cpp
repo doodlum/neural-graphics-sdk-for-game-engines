@@ -192,7 +192,7 @@ int NssQualityForDlss(int perfQualityValue)
 {
     // The full (QUALITY) network by default for every DLSS mode: with the RDNA2 kernels it costs about 1.3 ms more
     // than the small one at 640x400 -> 1280x800 on a Steam Deck. The control file (plugin, at runtime) and
-    // AISS_NSS_QUALITY (launch option) override it.
+    // DU_NSS_QUALITY (launch option) override it.
     (void)perfQualityValue;
     const int live = LiveNssQuality();
     if (live >= 0)
@@ -862,12 +862,12 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     const bool  captured     = NextCaptureFrame(captureDir, captureIndex);
     const bool  dumpInputs   = captured || (Config().dumpInputsFrom >= 0 && m_dispatchCount > uint64_t(Config().dumpInputsFrom) &&
                                          m_dispatchCount <= uint64_t(Config().dumpInputsFrom + Config().dumpInputsCount));
-    // File prefix: "<capture dir>\NNN_" for a capture, "aiss_in_NNN_" next to the game for AISS_DUMP_INPUTS.
+    // File prefix: "<capture dir>\NNN_" for a capture, "deckyupscaler_in_NNN_" next to the game for DU_DUMP_INPUTS.
     char dumpPrefix[MAX_PATH];
     if (captured)
         snprintf(dumpPrefix, sizeof(dumpPrefix), "%s\\%03d_", captureDir.c_str(), captureIndex);
     else
-        snprintf(dumpPrefix, sizeof(dumpPrefix), "aiss_in_%03llu_", (unsigned long long)(m_dispatchCount - 1));
+        snprintf(dumpPrefix, sizeof(dumpPrefix), "deckyupscaler_in_%03llu_", (unsigned long long)(m_dispatchCount - 1));
     VkImageMemoryBarrier post[2] = {toRead, depthToRead};
     if (depthNeedsTransition)
     {
@@ -1019,7 +1019,7 @@ bool NssUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// AISS_DUMP_FRAME: copy one output frame to host memory and write it as a PPM next to the log (debugging aid).
+// DU_DUMP_FRAME: copy one output frame to host memory and write it as a PPM next to the log (debugging aid).
 // ---------------------------------------------------------------------------------------------------------------------
 void NssUpscaler::RecordDump(VkCommandBuffer cmd, const UpscalerImage& output)
 {
@@ -1180,7 +1180,7 @@ void NssUpscaler::WriteDump()
     if (fn.vkMapMemory(m_dev.device, m_dumpMemory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS)
     {
         char name[64];
-        snprintf(name, sizeof(name), "aiss_frame_%d.ppm", Config().dumpFrame);
+        snprintf(name, sizeof(name), "deckyupscaler_frame_%d.ppm", Config().dumpFrame);
         if (FILE* f = fopen(name, "wb"))
         {
             const uint32_t w = m_dumpImage.width, h = m_dumpImage.height;

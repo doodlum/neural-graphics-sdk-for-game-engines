@@ -8,14 +8,14 @@
 //   --save FILE   write the output (RGBA16F) to FILE
 //   --cmp FILE    compare the output with one written by --save
 //   --log FILE    print to FILE instead of stdout (Proton does not always pass a console through)
-//   --replay DIR  instead of the synthetic scene, replay dumped inputs (NNN_*.raw or aiss_in_NNN_*.raw, with
+//   --replay DIR  instead of the synthetic scene, replay dumped inputs (NNN_*.raw or deckyupscaler_in_NNN_*.raw, with
 //                 jitter / MV scale from DIR/frames.txt): the textures keep the dumped extents, the render size is the
 //                 depth dump's (the proxy dumps its render-size depth copy), the display size the output dump's
 //   --first N --count K   frames of the replay (default 0, 8)
 //   --crop        replay with colour and motion vectors cropped to the render size (the exact-size reference)
 //   --color16     replay B10G11R11 colour as RGBA16F (the same values)
 //   --loops L     play the replayed frames L times (reset only on the first)
-//   --anysize     accept any MaxPerf render size (e.g. with AISS_RATIO=1.5), not only 640x400
+//   --anysize     accept any MaxPerf render size (e.g. with DU_RATIO=1.5), not only 640x400
 //   --flags N     DLSS create flags (default 11: HDR, low-res MVs, inverted depth; 64 = auto exposure)
 //   --sync        wait for the GPU after every replayed frame
 // SPDX-License-Identifier: MIT
@@ -127,7 +127,7 @@ static bool Compare(const std::vector<uint16_t>& out, const char* file)
     return mx < 0.01;
 }
 
-// Raw input dump as the proxy writes them (AISS_DUMP_INPUTS / capture): uint32 {'AISR', w, h, VkFormat, bpp}, pixels.
+// Raw input dump as the proxy writes them (DU_DUMP_INPUTS / capture): uint32 {'AISR', w, h, VkFormat, bpp}, pixels.
 struct Raw
 {
     uint32_t             w = 0, h = 0, format = 0, bpp = 0;
@@ -199,7 +199,7 @@ int main(int argc, char** argv)
     int         first = 0, replayCount = 8;
     bool        crop = false, color16 = false;
     int         loops = 1;
-    bool        anySize = false;  // accept the render size the proxy reports (AISS_RATIO), not only 640x400
+    bool        anySize = false;  // accept the render size the proxy reports (DU_RATIO), not only 640x400
     bool        sync = false;
     for (int i = 2; i < argc; ++i)
     {
@@ -244,13 +244,16 @@ int main(int argc, char** argv)
         for (int i = 0; i < count; ++i)
         {
             const int n = first + i;
-            char a[64], b[64];
-            snprintf(a, sizeof(a), "%03d_", n);
-            snprintf(b, sizeof(b), "aiss_in_%03d_", n);
             const std::string dir = std::string(replayDir) + "\\";
-            std::string pre = dir + a;
-            Raw probe;
-            if (!probe.Load(pre + "depth.raw")) pre = dir + b;
+            std::string pre;
+            for (const char* fmt : {"%03d_", "deckyupscaler_in_%03d_", "aiss_in_%03d_"})  // the last: older builds' dumps
+            {
+                char a[64];
+                snprintf(a, sizeof(a), fmt, n);
+                Raw probe;
+                pre = dir + a;
+                if (probe.Load(pre + "depth.raw")) break;
+            }
             Frame& f = frames[i];
             if (!f.color.Load(pre + "color.raw") || !f.mv.Load(pre + "mv.raw") || !f.depth.Load(pre + "depth.raw"))
             { printf("FAIL: cannot load %s*.raw\n", pre.c_str()); return 1; }
@@ -272,13 +275,14 @@ int main(int argc, char** argv)
         Raw out0;
         {
             char a[64];
-            snprintf(a, sizeof(a), "%03d_output.raw", first);
             std::string dir = std::string(replayDir) + "\\";
-            if (!out0.Load(dir + a))
+            bool        ok  = false;
+            for (const char* fmt : {"%03d_output.raw", "deckyupscaler_in_%03d_output.raw", "aiss_in_%03d_output.raw"})
             {
-                snprintf(a, sizeof(a), "aiss_in_%03d_output.raw", first);
-                if (!out0.Load(dir + a)) { printf("FAIL: no output dump for the display size\n"); return 1; }
+                snprintf(a, sizeof(a), fmt, first);
+                if ((ok = out0.Load(dir + a))) break;
             }
+            if (!ok) { printf("FAIL: no output dump for the display size\n"); return 1; }
         }
         const unsigned rw = frames[0].depth.w, rh = frames[0].depth.h, outW = out0.w, outH = out0.h;
         const Raw& c0 = frames[0].color;

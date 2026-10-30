@@ -171,7 +171,7 @@ NVSDK_NGX_Result InitDevice(ID3D11Device* device)
     if (!vk.gipa)
         return NVSDK_NGX_Result_FAIL_PlatformError;
     vk.gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(vk.gipa(vk.instance, "vkGetDeviceProcAddr"));
-    // DXVK does not report its enabled features; the aiss Vulkan layer (AISS_LAYER=1) guarantees the ML ones.
+    // DXVK does not report its enabled features; the DeckyUpscaler Vulkan layer (DU_LAYER=1) guarantees the ML ones.
     vk.mlFeatures = Config().mlFeaturesForced ? ffxQueryMlDeviceFeaturesVK(vk.instance, vk.physicalDevice, vk.gipa, nullptr, nullptr) : 0;
 
     VkQueue  queue  = VK_NULL_HANDLE;
@@ -186,7 +186,7 @@ NVSDK_NGX_Result InitDevice(ID3D11Device* device)
     g_submitter = submitter;  // a previous one (device re-init) is leaked deliberately: its fences may still be pending
     g_vk        = vk;
     LOGI("D3D11 init on DXVK: VkDevice %p, ML features 0x%x%s", reinterpret_cast<void*>(vk.device), vk.mlFeatures,
-         Config().mlFeaturesForced ? "" : " (set AISS_LAYER=1 for the fast ML path)");
+         Config().mlFeaturesForced ? "" : " (set DU_LAYER=1 for the fast ML path)");
     return NVSDK_NGX_Result_Success;
 }
 

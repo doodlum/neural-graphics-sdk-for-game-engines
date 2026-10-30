@@ -32,7 +32,7 @@ using UpscalerRemap  = std::function<UpscalerCreateInfo(const UpscalerCreateInfo
 Upscaler* NgxApplyLiveSettings(unsigned int id, Upscaler* current, const UpscalerCreate& create = {},
                                const UpscalerRemap& remap = {});
 
-// The upscaler asked for (control file, else AISS_UPSCALER): kBackendXess or kBackendFsr4 (with the FSR 4 model in
+// The upscaler asked for (control file, else DU_UPSCALER): kBackendXess or kBackendFsr4 (with the FSR 4 model in
 // *fsr4Model) unless that one has failed to load, else kBackendNss.
 int SelectedBackend(int* fsr4Model);
 
@@ -42,16 +42,17 @@ UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& info);   // Vulkan: 
 UpscalerCreateInfo NgxRemapD3D11(const UpscalerCreateInfo& info);    // D3D11: FSR 4 native on DXVK's device, else interop
 UpscalerCreateInfo NgxRemapD3D11(const UpscalerCreateInfo& in);
 
-// FFX_API_VK_ML_FEATURE_* the GPU has (ngx_vulkan.cpp, which has the SDK's Vulkan header): what the AISS layer enables.
+// FFX_API_VK_ML_FEATURE_* the GPU has (ngx_vulkan.cpp, which has the SDK's Vulkan header): what the DeckyUpscaler layer
+// enables.
 uint32_t VkMlFeatures(VkInstance instance, VkPhysicalDevice pd, PFN_vkGetInstanceProcAddr gipa);
 
 // "NSS quality 2", "XeSS", "FSR 4 Lite", ...
 const char* UpscalerName(const UpscalerCreateInfo& info);
 
-// Records the upscale, with GPU timestamps around it when AISS_GPU_TIMING is set.
+// Records the upscale, with GPU timestamps around it when DU_GPU_TIMING is set.
 bool NgxDispatch(Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerDispatch& d);
 
-// AISS_DUMP_FRAME for XeSS and FSR 4 (NSS dumps its own output): call after each dispatch.
+// DU_DUMP_FRAME for XeSS and FSR 4 (NSS dumps its own output): call after each dispatch.
 void NgxDumpFrame(const Upscaler* upscaler, VkCommandBuffer cmd, const UpscalerImage& output);
 
 // Allocates a handle for a created upscaler. NGX hands handles back by pointer, so they must stay valid.

@@ -25,6 +25,6 @@ ninja -C build_layer
 echo
 echo "nvngx.dll:      build_win_nvngx/nvngx.dll"
 echo "loader shims:   build_win_loader/{dbghelp,dxgi}/*.dll"
-echo "Vulkan layer:   build_layer/{libVkLayer_aiss_ngx.so,VkLayer_aiss_ngx.json}"
+echo "Vulkan layer:   build_layer/{libVkLayer_deckyupscaler.so,VkLayer_deckyupscaler.json}"
 echo "D3D11 harness:  build_win_tests/ngx_d3d11_test.exe"
 echo "D3D12 harness:  build_win_tests/ngx_d3d12_test.exe"

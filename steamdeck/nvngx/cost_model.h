@@ -21,8 +21,8 @@ CostApi CostGetApi();
 void CostNoteEvaluate(const UpscalerCreateInfo& info, unsigned renderW, unsigned renderH, unsigned outW, unsigned outH);
 
 // The render-scale divisor (output / render, per axis) for DLSS mode `perfQuality` at this output size. Returns
-// `standardRatio` for DLAA, when equal cost is off (control file equal_cost=0, AISS_EQUAL_COST=0) or for NSS Quality.
+// `standardRatio` for DLAA, when equal cost is off (control file equal_cost=0, DU_EQUAL_COST=0) or for NSS Quality.
 float EqualCostRatio(int perfQuality, float standardRatio, unsigned outW, unsigned outH);
 
-// Whether equal cost is on: the control file's equal_cost, else AISS_EQUAL_COST (default on).
+// Whether equal cost is on: the control file's equal_cost, else DU_EQUAL_COST (default on).
 bool EqualCostEnabled();

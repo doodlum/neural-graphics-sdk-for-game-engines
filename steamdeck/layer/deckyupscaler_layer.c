@@ -1,4 +1,4 @@
-// VK_LAYER_AISS_ngx: native (Linux) implicit Vulkan layer used by the NSS NGX proxy under Proton.
+// VK_LAYER_DECKYUPSCALER: native (Linux) implicit Vulkan layer used by the NSS NGX proxy under Proton.
 //
 // 1. Advertises VK_NVX_binary_import, VK_NVX_image_view_handle and VK_NV_low_latency(2) with stub entry points when the
 //    driver lacks them. Vulkan DLSS integrations (Streamline, NGX) require them at device creation even though the NSS
@@ -13,15 +13,15 @@
 //    a Steam Deck under Proton (no instance extensions, Vulkan 1.3); the layer is native and cannot call the Windows
 //    library, so the list is fixed here.
 // 4. Splits a native Vulkan game's command buffer at the proxy's NGX evaluate marker, so FSR 4 can run on a D3D12 queue
-//    between the two halves within the same frame ("Command buffer split" below; aiss_split_abi.h), and enables
+//    between the two halves within the same frame ("Command buffer split" below; split_abi.h), and enables
 //    timeline semaphores for it.
 //
-// Enabled with AISS_LAYER=1 (see VkLayer_aiss_ngx.json); applies to the game's devices and to DXVK/vkd3d-proton's.
+// Enabled with DU_LAYER=1 (see VkLayer_deckyupscaler.json); applies to the game's devices and to DXVK/vkd3d-proton's.
 // SPDX-License-Identifier: MIT
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 
-#include "aiss_split_abi.h"
+#include "split_abi.h"
 
 #include <pthread.h>
 #include <stdarg.h>
@@ -97,8 +97,8 @@ typedef struct DeviceData
     PFN_vkWaitSemaphores                  waitSemaphores;
     PFN_vkWaitSemaphores                  waitSemaphoresKHR;
     PFN_vkGetSemaphoreCounterValue        getSemaphoreCounterValue;
-    bool                                  token[AISS_SPLIT_TOKEN_COUNT];     // registered by the proxy
-    struct Boundary*                      awaiting[AISS_SPLIT_TOKEN_COUNT];  // split waiting for its capture
+    bool                                  token[DU_SPLIT_TOKEN_COUNT];     // registered by the proxy
+    struct Boundary*                      awaiting[DU_SPLIT_TOKEN_COUNT];  // split waiting for its capture
     VkBuffer                              marker[8];                      // split marker buffers
     struct Split*                         freeSplits;                     // recycled split states (keep their pools)
     struct Split*                         allSplits;                      // every split state, for vkDestroyDevice
@@ -169,14 +169,14 @@ static InstanceData* FindInstanceForPhysicalDevice(VkPhysicalDevice pd)
 // NGX gives the proxy only the game's command buffer at Evaluate, and the D3D12 FSR 4 (amdxcffx64 on an in-process
 // vkd3d-proton device) must run between what the game recorded before Evaluate and what it records after. A command
 // buffer cannot signal a semaphore halfway, and a GPU-side wait inside one stalls the gfx ring (amdgpu lockup timeouts
-// on the Steam Deck), so the layer cuts the game's command buffer in two at the proxy's marker (aiss_split_abi.h):
+// on the Steam Deck), so the layer cuts the game's command buffer in two at the proxy's marker (split_abi.h):
 //
 //   game cb:  [ game commands ... proxy copy-in ] MARKER [ proxy copy-out ... game commands ]
 //   real:     seg[0] = the game's command buffer  |  seg[1] = a layer command buffer (same queue family)
 //   submit:   batch A = { game's waits, ..., seg[0], signal "fence = N" }   (D3D12 queue: wait N, FSR 4, signal N+1)
 //             batch B = { wait "fence >= N+1", seg[1], ..., game's signals + fence }
 // The fence operations are host semaphores winevulkan made for the proxy's capture submission right after the marker
-// (Proton emulates D3D12 fences per operation, see aiss_split_abi.h).
+// (Proton emulates D3D12 fences per operation, see split_abi.h).
 //
 // After the marker every command the game records on its command buffer is forwarded to the newest segment (the
 // trampolines below: every vkCmd* entry point goes through Cur()). Pipeline/descriptor state does not carry over a
@@ -187,13 +187,13 @@ static InstanceData* FindInstanceForPhysicalDevice(VkPhysicalDevice pd)
 // reset before it was ever submitted signals the values on the host so the D3D12 queue never waits forever.
 //
 // Only devices of native Vulkan games get this (not DXVK / vkd3d-proton, see InstanceData::emulate);
-// AISS_LAYER_SPLIT=0 disables it.
+// DU_LAYER_SPLIT=0 disables it.
 // ---------------------------------------------------------------------------------------------------------------------
 #define MAX_SEGMENTS 8
 #define MAX_SPLITS   32
 
 // One cut (or a refused one). `signal`/`wait` are the proxy's D3D12 fence values; the host semaphores and values that
-// implement them come from the proxy's capture submission (aiss_split_abi.h).
+// implement them come from the proxy's capture submission (split_abi.h).
 typedef struct Boundary
 {
     uint64_t    signal, wait;
@@ -234,7 +234,7 @@ static void SplitLog(const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "aiss-layer: ");
+    fprintf(stderr, "deckyupscaler-layer: ");
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
@@ -275,7 +275,7 @@ static inline bool RenderPassScope(VkCommandBuffer cb, bool begin, const char* n
 {
     static int debug = -1;
     if (debug < 0)
-        debug = getenv("AISS_LAYER_RPLOG") != NULL;
+        debug = getenv("DU_LAYER_RPLOG") != NULL;
     if (debug)
         SplitLog("%s cb %p (open: %p)", name, (void*)cb, (void*)tls_renderPass);
     if (begin)
@@ -296,7 +296,7 @@ static inline bool RenderPassScope(VkCommandBuffer cb, bool begin, const char* n
     return false;
 }
 
-#include "aiss_cmd_trampolines.inc"
+#include "cmd_trampolines.inc"
 
 // ---- command buffer / pool bookkeeping (pool and level of every command buffer on split devices) --------------------
 typedef struct CbNode
@@ -375,7 +375,7 @@ static void Recycle(Split* s)
     s->recording = false;
     s->submitted = false;
     pthread_mutex_lock(&g_splitLock);
-    for (uint32_t t = 0; t < AISS_SPLIT_TOKEN_COUNT; ++t)
+    for (uint32_t t = 0; t < DU_SPLIT_TOKEN_COUNT; ++t)
         if ((char*)d->awaiting[t] >= (char*)s && (char*)d->awaiting[t] < (char*)(s + 1))
             d->awaiting[t] = NULL;
     for (uint32_t i = 0; i < MAX_SPLITS; ++i)
@@ -468,7 +468,7 @@ static VkCommandBuffer NextSegment(DeviceData* d, Split* s)
 static void DoSplit(DeviceData* d, VkCommandBuffer cb, uint32_t token, uint64_t signal, uint64_t wait)
 {
     static bool loggedFirst = false;
-    if (token >= AISS_SPLIT_TOKEN_COUNT || !d->token[token])
+    if (token >= DU_SPLIT_TOKEN_COUNT || !d->token[token])
     {
         SplitLog("split marker for unregistered token %u ignored", token);
         return;
@@ -528,13 +528,13 @@ static void DoSplit(DeviceData* d, VkCommandBuffer cb, uint32_t token, uint64_t 
     d->awaiting[token]  = &s->cut[s->nseg - 1];
     s->seg[s->nseg++]   = next;
     s->recording        = true;
-    if (!loggedFirst || getenv("AISS_LAYER_LOG"))
+    if (!loggedFirst || getenv("DU_LAYER_LOG"))
         SplitLog("command buffer split at the NGX evaluate: segment %u signals %llu, segment %u waits %llu", s->nseg - 2,
                  (unsigned long long)signal, s->nseg - 1, (unsigned long long)wait);
     loggedFirst = true;
 }
 
-// The proxy's capture submission (aiss_split_abi.h): winevulkan has turned its D3D12-fence wait and signal into host
+// The proxy's capture submission (split_abi.h): winevulkan has turned its D3D12-fence wait and signal into host
 // semaphore operations; they belong to the split just recorded. Never submitted.
 static bool Capture(DeviceData* d, uint32_t count, const VkSubmitInfo2* submits)
 {
@@ -543,11 +543,11 @@ static bool Capture(DeviceData* d, uint32_t count, const VkSubmitInfo2* submits)
         return false;
     const VkSemaphoreSubmitInfo* w = &submits[0].pWaitSemaphoreInfos[0];
     const VkSemaphoreSubmitInfo* g = &submits[0].pSignalSemaphoreInfos[0];
-    if ((w->stageMask & AISS_SPLIT_STAGE_MASK) != AISS_SPLIT_STAGE || (g->stageMask & AISS_SPLIT_STAGE_MASK) != AISS_SPLIT_STAGE)
+    if ((w->stageMask & DU_SPLIT_STAGE_MASK) != DU_SPLIT_STAGE || (g->stageMask & DU_SPLIT_STAGE_MASK) != DU_SPLIT_STAGE)
         return false;
     const uint32_t token = (uint32_t)((g->stageMask >> 32) & 0xFFFF);
-    Boundary*      b     = token < AISS_SPLIT_TOKEN_COUNT ? d->awaiting[token] : NULL;
-    if (token < AISS_SPLIT_TOKEN_COUNT)
+    Boundary*      b     = token < DU_SPLIT_TOKEN_COUNT ? d->awaiting[token] : NULL;
+    if (token < DU_SPLIT_TOKEN_COUNT)
         d->awaiting[token] = NULL;
     if (!b)
     {
@@ -560,7 +560,7 @@ static bool Capture(DeviceData* d, uint32_t count, const VkSubmitInfo2* submits)
     b->waitSem     = w->semaphore;
     b->waitValue   = w->value;
     b->captured    = true;
-    if (getenv("AISS_LAYER_LOG"))
+    if (getenv("DU_LAYER_LOG"))
         SplitLog("capture token %u: fence %llu -> host signal 0x%llx:%llu, fence %llu -> host wait 0x%llx:%llu", token,
                  (unsigned long long)b->signal, (unsigned long long)(uintptr_t)g->semaphore, (unsigned long long)g->value,
                  (unsigned long long)b->wait, (unsigned long long)(uintptr_t)w->semaphore, (unsigned long long)w->value);
@@ -581,7 +581,7 @@ static void CloseOpenPass(DeviceData* d, VkCommandBuffer cb)
     tls_renderPass = VK_NULL_HANDLE;
     tls_closedPass = cb;
     static bool logged = false;
-    if (!logged || getenv("AISS_LAYER_LOG"))
+    if (!logged || getenv("DU_LAYER_LOG"))
         SplitLog("ended the game's open %s at the NGX evaluate (its own end is dropped)",
                  tls_passKind == kPassRendering ? "dynamic rendering" : "render pass");
     logged = true;
@@ -591,12 +591,12 @@ static void CloseOpenPass(DeviceData* d, VkCommandBuffer cb)
 static void VKAPI_CALL Split_CmdFillBuffer(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t data)
 {
     DeviceData* d = FindDevice(cb);
-    if ((data & AISS_SPLIT_FILL_MASK) == AISS_SPLIT_FILL)
+    if ((data & DU_SPLIT_FILL_MASK) == DU_SPLIT_FILL)
         for (uint32_t i = 0; i < 8; ++i)
             if (buffer && __atomic_load_n(&d->marker[i], __ATOMIC_ACQUIRE) == buffer)
             {
                 if (offset || size)
-                    DoSplit(d, cb, data & ~AISS_SPLIT_FILL_MASK, offset, size);
+                    DoSplit(d, cb, data & ~DU_SPLIT_FILL_MASK, offset, size);
                 else
                     CloseOpenPass(d, cb);
                 return;
@@ -765,7 +765,7 @@ static VkResult VKAPI_CALL Split_CreateBuffer(VkDevice device, const VkBufferCre
 {
     DeviceData* d = FindDevice(device);
     VkResult    r = d->createBuffer(device, info, alloc, out);
-    if (r == VK_SUCCESS && info->size == AISS_SPLIT_BUFFER_SIZE && info->usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT &&
+    if (r == VK_SUCCESS && info->size == DU_SPLIT_BUFFER_SIZE && info->usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT &&
         !info->flags)
     {
         pthread_mutex_lock(&g_splitLock);
@@ -793,15 +793,15 @@ static void VKAPI_CALL Split_DestroyBuffer(VkDevice device, VkBuffer buffer, con
 static VkResult WaitSemaphoresCommon(DeviceData* d, PFN_vkWaitSemaphores next, VkDevice device, const VkSemaphoreWaitInfo* info,
                                      uint64_t timeout)
 {
-    const uint64_t cmd = timeout & AISS_SPLIT_CMD_MASK;
-    if ((cmd == AISS_SPLIT_REGISTER || cmd == AISS_SPLIT_UNREGISTER) && info && info->semaphoreCount == 1)
+    const uint64_t cmd = timeout & DU_SPLIT_CMD_MASK;
+    if ((cmd == DU_SPLIT_REGISTER || cmd == DU_SPLIT_UNREGISTER) && info && info->semaphoreCount == 1)
     {
-        const uint64_t token = timeout & ~AISS_SPLIT_CMD_MASK;
-        if (token < AISS_SPLIT_TOKEN_COUNT)
+        const uint64_t token = timeout & ~DU_SPLIT_CMD_MASK;
+        if (token < DU_SPLIT_TOKEN_COUNT)
         {
-            d->token[token] = cmd == AISS_SPLIT_REGISTER;
-            if (getenv("AISS_LAYER_LOG") || cmd == AISS_SPLIT_REGISTER)
-                SplitLog("command buffer split: %s token %llu", cmd == AISS_SPLIT_REGISTER ? "registered" : "unregistered",
+            d->token[token] = cmd == DU_SPLIT_REGISTER;
+            if (getenv("DU_LAYER_LOG") || cmd == DU_SPLIT_REGISTER)
+                SplitLog("command buffer split: %s token %llu", cmd == DU_SPLIT_REGISTER ? "registered" : "unregistered",
                          (unsigned long long)token);
             return VK_TIMEOUT;  // tells the proxy the layer took it
         }
@@ -1199,11 +1199,11 @@ static VkResult VKAPI_CALL Layer_CreateInstance(const VkInstanceCreateInfo* info
     // the emulation is only for games that use Vulkan directly. ML features are still enabled for them.
     const char* engine = info->pApplicationInfo ? info->pApplicationInfo->pEngineName : NULL;
     d->emulate         = !(engine && (!strncmp(engine, "vkd3d", 5) || !strncmp(engine, "DXVK", 4)));
-    const char* emulateEnv = getenv("AISS_LAYER_EMULATE");
+    const char* emulateEnv = getenv("DU_LAYER_EMULATE");
     if (emulateEnv && !strcmp(emulateEnv, "0"))
         d->emulate = false;
-    if (getenv("AISS_LAYER_LOG"))
-        fprintf(stderr, "aiss-layer: instance engine '%s' api 0x%x emulate %d\n", engine ? engine : "(null)", d->apiVersion, d->emulate);
+    if (getenv("DU_LAYER_LOG"))
+        fprintf(stderr, "deckyupscaler-layer: instance engine '%s' api 0x%x emulate %d\n", engine ? engine : "(null)", d->apiVersion, d->emulate);
     d->destroyInstance           = (PFN_vkDestroyInstance)gipa(*out, "vkDestroyInstance");
     d->enumerateDeviceExtensions = (PFN_vkEnumerateDeviceExtensionProperties)gipa(*out, "vkEnumerateDeviceExtensionProperties");
     d->getFeatures2              = (PFN_vkGetPhysicalDeviceFeatures2)gipa(*out, "vkGetPhysicalDeviceFeatures2");
@@ -1297,7 +1297,7 @@ static VkResult VKAPI_CALL Layer_EnumerateDeviceExtensionProperties(VkPhysicalDe
                                                                     VkExtensionProperties* out)
 {
     InstanceData* inst = FindInstanceForPhysicalDevice(pd);
-    if (layer && !strcmp(layer, "VK_LAYER_AISS_ngx"))
+    if (layer && !strcmp(layer, "VK_LAYER_DECKYUPSCALER"))
     {
         *count = 0;
         return VK_SUCCESS;
@@ -1314,7 +1314,7 @@ static VkResult VKAPI_CALL Layer_EnumerateDeviceExtensionProperties(VkPhysicalDe
     // Drop the emulated extensions from the loader's list (it adds them for every instance because the manifest
     // declares them), then add them back only for instances that should see them.
     uint32_t    total = 0;
-    const char* hide  = getenv("AISS_LAYER_HIDE");  // comma-separated extension names hidden from the app (debugging)
+    const char* hide  = getenv("DU_LAYER_HIDE");  // comma-separated extension names hidden from the app (debugging)
     for (uint32_t i = 0; i < driverCount; ++i)
         if (!IsFakeExtension(all[i].extensionName) && !(hide && strstr(hide, all[i].extensionName)))
             all[total++] = all[i];
@@ -1563,7 +1563,7 @@ static void EnableMlFeatures(InstanceData* inst, VkPhysicalDevice pd, VkDeviceCr
     }
 
     // XeSS (see the top of the file).
-    const char* xessEnv = getenv("AISS_LAYER_XESS");
+    const char* xessEnv = getenv("DU_LAYER_XESS");
     if (xessEnv && !strcmp(xessEnv, "0"))
         return;
     if (sbl.scalarBlockLayout)
@@ -1648,24 +1648,24 @@ static VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice pd, const VkDevic
             fakeNvx = true;
     }
 
-    if (getenv("AISS_LAYER_LOG"))
+    if (getenv("DU_LAYER_LOG"))
         for (uint32_t f = 0; f < FAKE_EXTENSION_COUNT; ++f)
-            fprintf(stderr, "aiss-layer: createDevice inst %p emulate %d driver has %s: %d\n", (void*)inst, inst->emulate,
+            fprintf(stderr, "deckyupscaler-layer: createDevice inst %p emulate %d driver has %s: %d\n", (void*)inst, inst->emulate,
                     kFakeExtensions[f].extensionName, DriverHasExtension(inst, pd, kFakeExtensions[f].extensionName));
     VkDeviceCreateInfo modified = *info;
     FeatureStorage     storage;
-    const char*        featuresEnv = getenv("AISS_LAYER_FEATURES");
+    const char*        featuresEnv = getenv("DU_LAYER_FEATURES");
     if (!featuresEnv || strcmp(featuresEnv, "0"))
         EnableMlFeatures(inst, pd, &modified, &storage, exts, &extCount);
     modified.enabledExtensionCount   = extCount;
     modified.ppEnabledExtensionNames = exts;
 
     VkResult res = create(pd, &modified, alloc, out);
-    if (getenv("AISS_LAYER_LOG"))
+    if (getenv("DU_LAYER_LOG"))
     {
         for (uint32_t i = 0; i < modified.enabledExtensionCount; ++i)
-            fprintf(stderr, "aiss-layer: device extension %s\n", modified.ppEnabledExtensionNames[i]);
-        fprintf(stderr, "aiss-layer: vkCreateDevice -> %d\n", res);
+            fprintf(stderr, "deckyupscaler-layer: device extension %s\n", modified.ppEnabledExtensionNames[i]);
+        fprintf(stderr, "deckyupscaler-layer: vkCreateDevice -> %d\n", res);
     }
     free(exts);
     if (res != VK_SUCCESS)
@@ -1682,7 +1682,7 @@ static VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice pd, const VkDevic
     d->signalSemaphore = (PFN_vkSignalSemaphore)gdpa(*out, "vkSignalSemaphore");
     if (!d->signalSemaphore)
         d->signalSemaphore = (PFN_vkSignalSemaphore)gdpa(*out, "vkSignalSemaphoreKHR");
-    const char* splitEnv = getenv("AISS_LAYER_SPLIT");
+    const char* splitEnv = getenv("DU_LAYER_SPLIT");
     d->split = inst->emulate && !(splitEnv && !strcmp(splitEnv, "0")) && d->queueSubmit && d->signalSemaphore;
     d->destroyDevice = (PFN_vkDestroyDevice)gdpa(*out, "vkDestroyDevice");
     // Never serve stubs to an instance the extensions were not advertised to (DXVK, vkd3d-proton).
@@ -1690,8 +1690,8 @@ static VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice pd, const VkDevic
     d->fakeLowLatency = fakeLowLatency && inst->emulate;
     if (!d->split)
         ;
-    else if (getenv("AISS_LAYER_LOG"))
-        fprintf(stderr, "aiss-layer: command buffer split available on device %p\n", (void*)*out);
+    else if (getenv("DU_LAYER_LOG"))
+        fprintf(stderr, "deckyupscaler-layer: command buffer split available on device %p\n", (void*)*out);
     pthread_mutex_lock(&g_lock);
     d->next = g_devices;
     __atomic_store_n(&g_devices, d, __ATOMIC_RELEASE);
@@ -1721,10 +1721,10 @@ static void VKAPI_CALL Layer_DestroyDevice(VkDevice device, const VkAllocationCa
 // ---------------------------------------------------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------------------------------------------------
-EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetDeviceProcAddr(VkDevice device, const char* name)
+EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL du_GetDeviceProcAddr(VkDevice device, const char* name)
 {
     if (!strcmp(name, "vkGetDeviceProcAddr"))
-        return (PFN_vkVoidFunction)aiss_GetDeviceProcAddr;
+        return (PFN_vkVoidFunction)du_GetDeviceProcAddr;
     if (!strcmp(name, "vkDestroyDevice"))
         return (PFN_vkVoidFunction)Layer_DestroyDevice;
     DeviceData* d = FindDevice(device);
@@ -1748,18 +1748,18 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetDeviceProcAddr(VkDevice 
         if (own)
             return own;
         if (!strncmp(name, "vkCmd", 5) && !IsCmdEntryPoint(name) && d->gdpa(device, name))
-            fprintf(stderr, "aiss-layer: %s has no command buffer split trampoline; avoid it after an FSR 4 evaluate\n", name);
+            fprintf(stderr, "deckyupscaler-layer: %s has no command buffer split trampoline; avoid it after an FSR 4 evaluate\n", name);
     }
     PFN_vkVoidFunction fn = d ? d->gdpa(device, name) : NULL;
-    if (!fn && getenv("AISS_LAYER_LOG"))
-        fprintf(stderr, "aiss-layer: vkGetDeviceProcAddr(%s) -> NULL (device %s)\n", name, d ? "known" : "UNKNOWN");
+    if (!fn && getenv("DU_LAYER_LOG"))
+        fprintf(stderr, "deckyupscaler-layer: vkGetDeviceProcAddr(%s) -> NULL (device %s)\n", name, d ? "known" : "UNKNOWN");
     return fn;
 }
 
-EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetInstanceProcAddr(VkInstance instance, const char* name)
+EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL du_GetInstanceProcAddr(VkInstance instance, const char* name)
 {
     if (!strcmp(name, "vkGetInstanceProcAddr"))
-        return (PFN_vkVoidFunction)aiss_GetInstanceProcAddr;
+        return (PFN_vkVoidFunction)du_GetInstanceProcAddr;
     if (!strcmp(name, "vkCreateInstance"))
         return (PFN_vkVoidFunction)Layer_CreateInstance;
     if (!strcmp(name, "vkDestroyInstance"))
@@ -1773,7 +1773,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetInstanceProcAddr(VkInsta
     if (!strcmp(name, "vkEnumeratePhysicalDeviceGroups") || !strcmp(name, "vkEnumeratePhysicalDeviceGroupsKHR"))
         return (PFN_vkVoidFunction)Layer_EnumeratePhysicalDeviceGroups;
     if (!strcmp(name, "vkGetDeviceProcAddr"))
-        return (PFN_vkVoidFunction)aiss_GetDeviceProcAddr;
+        return (PFN_vkVoidFunction)du_GetDeviceProcAddr;
     if (!strcmp(name, "vkDestroyDevice"))
         return (PFN_vkVoidFunction)Layer_DestroyDevice;
     if (!instance)
@@ -1784,18 +1784,18 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetInstanceProcAddr(VkInsta
 
 // Physical-device functions the loader has no trampoline for (newer extensions) are resolved through this chain;
 // without it they would come back NULL to DXVK/vkd3d-proton.
-EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL aiss_GetPhysicalDeviceProcAddr(VkInstance instance, const char* name)
+EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL du_GetPhysicalDeviceProcAddr(VkInstance instance, const char* name)
 {
     InstanceData* d = FindInstance(instance);
     return d && d->gpdpa ? d->gpdpa(instance, name) : NULL;
 }
 
-EXPORT VKAPI_ATTR VkResult VKAPI_CALL aiss_NegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v)
+EXPORT VKAPI_ATTR VkResult VKAPI_CALL du_NegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v)
 {
     if (v->loaderLayerInterfaceVersion > 2)
         v->loaderLayerInterfaceVersion = 2;
-    v->pfnGetInstanceProcAddr       = aiss_GetInstanceProcAddr;
-    v->pfnGetDeviceProcAddr         = aiss_GetDeviceProcAddr;
-    v->pfnGetPhysicalDeviceProcAddr = aiss_GetPhysicalDeviceProcAddr;
+    v->pfnGetInstanceProcAddr       = du_GetInstanceProcAddr;
+    v->pfnGetDeviceProcAddr         = du_GetDeviceProcAddr;
+    v->pfnGetPhysicalDeviceProcAddr = du_GetPhysicalDeviceProcAddr;
     return VK_SUCCESS;
 }

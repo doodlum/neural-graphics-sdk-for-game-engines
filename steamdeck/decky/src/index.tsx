@@ -48,6 +48,7 @@ interface State {
   games: Game[];
   settings: Settings;
   bundle: { missing: string[]; version: string; fsr4?: boolean; fsr3?: boolean };
+  legacy_plugin?: boolean; // the plugin under its former name (aiss-dlss-nss) is still installed
 }
 
 interface OpResult {
@@ -117,7 +118,7 @@ async function syncAllLaunchOptions(games?: Game[]): Promise<void> {
       if (g.enabled && g.shim && g.status !== "conflict") await applyLaunchOptions(g.appid, true);
       else if (!g.enabled && g.launch_applied) await applyLaunchOptions(g.appid, false);
     } catch (e) {
-      console.error(`[AISS] launch options for ${g.appid}:`, e);
+      console.error(`[DeckyUpscaler] launch options for ${g.appid}:`, e);
     }
   }
 }
@@ -198,17 +199,17 @@ function Content() {
         const r = await enableGame(g.appid);
         if (r.ok) {
           await applyLaunchOptions(g.appid, true);
-          toaster.toast({ title: "AISS", body: `${g.name}: ${r.message || "enabled"}` });
+          toaster.toast({ title: "DeckyUpscaler", body: `${g.name}: ${r.message || "enabled"}` });
         } else {
-          toaster.toast({ title: "AISS - not enabled", body: `${g.name}: ${r.message}` });
+          toaster.toast({ title: "DeckyUpscaler - not enabled", body: `${g.name}: ${r.message}` });
         }
       } else {
         await applyLaunchOptions(g.appid, false);
         const r = await disableGame(g.appid);
-        toaster.toast({ title: "AISS", body: `${g.name}: ${r.message || "disabled"}` });
+        toaster.toast({ title: "DeckyUpscaler", body: `${g.name}: ${r.message || "disabled"}` });
       }
     } catch (e) {
-      toaster.toast({ title: "AISS error", body: String(e) });
+      toaster.toast({ title: "DeckyUpscaler error", body: String(e) });
     }
     setBusy(null);
     await refresh(false);
@@ -230,7 +231,7 @@ function Content() {
         failed++;
       }
     }
-    toaster.toast({ title: "AISS", body: `Enabled ${ok} game(s)${failed ? `, ${failed} failed` : ""}` });
+    toaster.toast({ title: "DeckyUpscaler", body: `Enabled ${ok} game(s)${failed ? `, ${failed} failed` : ""}` });
     setBusy(null);
     await refresh(false);
   };
@@ -253,7 +254,7 @@ function Content() {
   const changeSetting = async (patch: Partial<Settings>) => {
     setBusy("settings");
     const r = await setSettings(patch);
-    if (!r.ok) toaster.toast({ title: "AISS", body: r.message ?? "invalid setting" });
+    if (!r.ok) toaster.toast({ title: "DeckyUpscaler", body: r.message ?? "invalid setting" });
     const s = await getState(false);
     setState(s);
     await syncAllLaunchOptions(s.games);
@@ -264,12 +265,12 @@ function Content() {
     setBusy("capture");
     const since = Date.now() / 1000 - 1;
     const r = await requestCapture();
-    toaster.toast({ title: "AISS", body: "Capturing the next 8 frames of the running game..." });
+    toaster.toast({ title: "DeckyUpscaler", body: "Capturing the next 8 frames of the running game..." });
     // The game picks the request up within half a second and writes the files a few frames later.
     await new Promise((res) => setTimeout(res, 4000));
     const c = await latestCapture(since);
     toaster.toast({
-      title: "AISS",
+      title: "DeckyUpscaler",
       body: c && c.frames > 0 ? `Saved ${c.frames} frames: ${c.name}` : `No capture yet. Is a DLSS game running? (${r.dir})`,
     });
     setBusy(null);
@@ -278,7 +279,7 @@ function Content() {
   const repair = async () => {
     setBusy("all");
     const results = await verifyNow();
-    toaster.toast({ title: "AISS", body: results.length ? `Repaired ${results.length} game(s)` : "Everything in place" });
+    toaster.toast({ title: "DeckyUpscaler", body: results.length ? `Repaired ${results.length} game(s)` : "Everything in place" });
     await syncAllLaunchOptions();
     setBusy(null);
     await refresh(true);
@@ -297,6 +298,16 @@ function Content() {
   const s = state.settings;
   return (
     <>
+      {state.legacy_plugin && (
+        <PanelSection title="Old plugin still installed">
+          <PanelSectionRow>
+            <Field
+              label="Remove aiss-dlss-nss"
+              description="This plugin replaces it and has taken over its games. Delete ~/homebrew/plugins/aiss-dlss-nss and restart Decky; automatic repairs wait until then."
+            />
+          </PanelSectionRow>
+        </PanelSection>
+      )}
       {state.bundle.missing.length > 0 && (
         <PanelSection title="Plugin bundle incomplete">
           <PanelSectionRow>
@@ -388,7 +399,7 @@ function Content() {
         <PanelSectionRow>
           <ToggleField
             label="Log GPU time"
-            description="Log the GPU milliseconds per upscale to aiss_nvngx.log (AISS_GPU_TIMING). Switches live."
+            description="Log the GPU milliseconds per upscale to deckyupscaler.log (DU_GPU_TIMING). Switches live."
             checked={!!s.gpu_timing}
             disabled={!!busy}
             onChange={(v) => changeSetting({ gpu_timing: v ? 1 : 0 })}
@@ -396,7 +407,7 @@ function Content() {
         </PanelSectionRow>
         <PanelSectionRow>
           <DropdownItem
-            label="Logging (AISS_LOG)"
+            label="Logging (DU_LOG)"
             rgOptions={LOG_OPTIONS}
             selectedOption={s.log}
             disabled={!!busy}
@@ -471,7 +482,9 @@ function Content() {
 export default definePlugin(() => {
   // Steam may have reset launch options (or the plugin was updated): reconcile them once Steam is up.
   const startup = window.setTimeout(() => {
-    syncAllLaunchOptions().catch((e) => console.error("[AISS] startup sync failed", e));
+    getState(false)
+      .then((s) => (s.legacy_plugin ? undefined : syncAllLaunchOptions(s.games)))
+      .catch((e) => console.error("[DeckyUpscaler] startup sync failed", e));
   }, 15000);
 
   // When a game exits its prefix exists and the registry can be edited safely: let the backend finish setup.
@@ -481,12 +494,12 @@ export default definePlugin(() => {
       if (n && !n.bRunning && n.unAppID) gameStopped(String(n.unAppID)).catch(() => {});
     });
   } catch (e) {
-    console.error("[AISS] lifetime hook failed", e);
+    console.error("[DeckyUpscaler] lifetime hook failed", e);
   }
 
   return {
-    name: "AISS DLSS-NSS",
-    titleView: <div className={staticClasses.Title}>AISS – DLSS→NSS</div>,
+    name: "DeckyUpscaler",
+    titleView: <div className={staticClasses.Title}>DeckyUpscaler</div>,
     content: <Content />,
     icon: <FaMagic />,
     onDismount() {

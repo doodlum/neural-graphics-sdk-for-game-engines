@@ -1,5 +1,5 @@
 #version 450
-// Motion vector dilation for FSR (AISS_FSR_DILATE_MV / the plugin's "Dilate motion vectors"): each render pixel takes
+// Motion vector dilation for FSR (DU_FSR_DILATE_MV / the plugin's "Dilate motion vectors"): each render pixel takes
 // the motion vector of the nearest surface in its 3x3 neighbourhood, so thin foreground detail (foliage, wires, edges)
 // moves with its own motion instead of the background's. Ties keep the centre: flat areas are passed through unchanged.
 // SPDX-License-Identifier: MIT

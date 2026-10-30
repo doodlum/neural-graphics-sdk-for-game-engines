@@ -1,4 +1,5 @@
-"""Decky backend of "AISS - DLSS->NSS". The logic lives in py_modules/aiss_core.py; this file only adapts it to Decky."""
+"""Decky backend of DeckyUpscaler. The logic lives in py_modules/deckyupscaler_core.py; this file only adapts it to
+Decky."""
 
 import asyncio
 import os
@@ -11,19 +12,25 @@ _PLUGIN_DIR = Path(getattr(decky, "DECKY_PLUGIN_DIR", os.path.dirname(os.path.ab
 if str(_PLUGIN_DIR / "py_modules") not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR / "py_modules"))
 
-from aiss_core import AissCore  # noqa: E402
+from deckyupscaler_core import LEGACY_PLUGIN, UpscalerCore  # noqa: E402
 
 VERIFY_INTERVAL_S = 120
 
 
+def _legacy_plugin_installed() -> bool:
+    """The plugin under its former name is still in Decky's plugin folder: both would keep re-installing their own
+    builds over each other's, so the periodic repair waits until it is removed."""
+    return (_PLUGIN_DIR.parent / LEGACY_PLUGIN).is_dir()
+
+
 class Plugin:
-    core: AissCore = None
+    core: UpscalerCore = None
     _task = None
     _lock = None
 
-    def _core(self) -> AissCore:
+    def _core(self) -> UpscalerCore:
         if Plugin.core is None:
-            Plugin.core = AissCore(
+            Plugin.core = UpscalerCore(
                 home=Path(decky.DECKY_USER_HOME),
                 bin_dir=_PLUGIN_DIR / "bin",
                 state_file=Path(decky.DECKY_PLUGIN_SETTINGS_DIR) / "state.json",
@@ -41,17 +48,21 @@ class Plugin:
     # ---- lifecycle -----------------------------------------------------------------------------------------------
 
     async def _main(self):
-        decky.logger.info("AISS DLSS->NSS loaded")
+        decky.logger.info("DeckyUpscaler loaded")
         core = self._core()
         missing = core.bundle_missing()
         if missing:
             decky.logger.error("bundle incomplete, missing: " + ", ".join(missing))
+        if _legacy_plugin_installed():
+            decky.logger.warning(f"{_PLUGIN_DIR.parent / LEGACY_PLUGIN} is still installed; remove it (automatic "
+                                 "repairs are paused until then)")
         Plugin._task = asyncio.get_running_loop().create_task(self._verify_loop())
 
     async def _verify_loop(self):
         while True:
             try:
-                await self._run(self._core().verify_all)
+                if not _legacy_plugin_installed():
+                    await self._run(self._core().verify_all)
             except Exception as e:
                 decky.logger.error(f"verify failed: {e}")
             await asyncio.sleep(VERIFY_INTERVAL_S)
@@ -60,7 +71,7 @@ class Plugin:
         if Plugin._task:
             Plugin._task.cancel()
             Plugin._task = None
-        decky.logger.info("AISS DLSS->NSS unloaded")
+        decky.logger.info("DeckyUpscaler unloaded")
 
     async def _uninstall(self):
         # Files are removed; launch options can only be changed by the frontend, so disable games before uninstalling.
@@ -81,6 +92,7 @@ class Plugin:
             "settings": core.state["settings"],
             "bundle": core.bundle_info(),
             "layer": core.state.get("layer", {}).get("files", {}),
+            "legacy_plugin": _legacy_plugin_installed(),
         }
 
     async def enable_game(self, appid: str) -> dict:
@@ -109,4 +121,6 @@ class Plugin:
 
     async def game_stopped(self, appid: str) -> list:
         """Called by the frontend when a game exits: the prefix may now exist, deferred registry edits can run."""
+        if _legacy_plugin_installed():
+            return []
         return await self._run(self._core().verify_all)

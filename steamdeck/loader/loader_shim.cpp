@@ -93,7 +93,7 @@ static const std::wstring& SignedStandIn()
 {
     static std::wstring path = [] {
         wchar_t buf[MAX_PATH];
-        if (GetEnvironmentVariableW(L"AISS_SIGNED_DLL", buf, MAX_PATH))
+        if (GetEnvironmentVariableW(L"DU_SIGNED_DLL", buf, MAX_PATH))
             return std::wstring(buf);
         GetModuleFileNameW(nullptr, buf, MAX_PATH);
         std::wstring dir = buf;
@@ -129,7 +129,7 @@ static HANDLE WINAPI HookCreateFileW(LPCWSTR name, DWORD access, DWORD share, LP
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// AISS_SL_LOG=<folder> (diagnostics): Streamline's own log, which production games leave off. The game's slInit is
+// DU_SL_LOG=<folder> (diagnostics): Streamline's own log, which production games leave off. The game's slInit is
 // looked up with GetProcAddress; the hook hands out a wrapper that sets sl::Preferences' log level to verbose and its
 // log folder before calling it. Preferences (Streamline's public sl.h): BaseStructure {next, 16-byte type,
 // size_t version} = 32 bytes, then bool showConsole, LogLevel logLevel (0 off, 1 default, 2 verbose) at 36,
@@ -152,7 +152,7 @@ static int __cdecl HookSlInit(void* pref, uint64_t sdkVersion)
         memcpy(&level, b + 36, sizeof(level));
     }
     char line[160];
-    snprintf(line, sizeof(line), "aiss-shim: slInit(preferences version %llu, log level %u, sdk 0x%llx)\n",
+    snprintf(line, sizeof(line), "deckyupscaler-shim: slInit(preferences version %llu, log level %u, sdk 0x%llx)\n",
              (unsigned long long)version, level, (unsigned long long)sdkVersion);
     OutputDebugStringA(line);
     fputs(line, stderr);
@@ -172,7 +172,7 @@ static FARPROC WINAPI HookGetProcAddress(HMODULE module, LPCSTR name)
     if (fn && reinterpret_cast<ULONG_PTR>(name) > 0xFFFF && !strcmp(name, "slInit"))
     {
         g_realSlInit = reinterpret_cast<PFN_slInit>(fn);
-        fputs("aiss-shim: GetProcAddress(slInit) wrapped\n", stderr);
+        fputs("deckyupscaler-shim: GetProcAddress(slInit) wrapped\n", stderr);
         return reinterpret_cast<FARPROC>(&HookSlInit);
     }
     return fn;
@@ -181,7 +181,7 @@ static FARPROC WINAPI HookGetProcAddress(HMODULE module, LPCSTR name)
 // ---------------------------------------------------------------------------------------------------------------------
 // Vulkan instances for the proxy's FFX front end: AMD's FidelityFX API hands over a VkPhysicalDevice but not its
 // VkInstance, which XeSS and the SDK's Vulkan backend need. vkEnumeratePhysicalDevices records each physical device's
-// instance in the process environment as AISS_VK_PHYSDEV=<pd>=<instance>;... (most recent first, a few entries).
+// instance in the process environment as DU_VK_PHYSDEV=<pd>=<instance>;... (most recent first, a few entries).
 // ---------------------------------------------------------------------------------------------------------------------
 using PFN_EnumPhysDevs = int32_t(__stdcall*)(void* instance, uint32_t* count, void** devices);
 static PFN_EnumPhysDevs g_realEnumPhysDevs = nullptr;
@@ -192,19 +192,19 @@ static int32_t __stdcall HookEnumPhysDevs(void* instance, uint32_t* count, void*
     if ((res == 0 || res == 5) && devices && count)  // VK_SUCCESS, VK_INCOMPLETE
     {
         char list[1024] = {}, old[1024] = {};
-        GetEnvironmentVariableA("AISS_VK_PHYSDEV", old, sizeof(old));
+        GetEnvironmentVariableA("DU_VK_PHYSDEV", old, sizeof(old));
         size_t n = 0;
         for (uint32_t i = 0; i < *count && n < 512; ++i)
             n += snprintf(list + n, sizeof(list) - n, "%p=%p;", devices[i], instance);
         snprintf(list + n, sizeof(list) - n, "%.*s", int(sizeof(list) - n - 1 > 400 ? 400 : sizeof(list) - n - 1), old);
-        SetEnvironmentVariableA("AISS_VK_PHYSDEV", list);
+        SetEnvironmentVariableA("DU_VK_PHYSDEV", list);
     }
     return res;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Import table patching (no code patching): every module's CreateFileW import is pointed at the hook (and GetProcAddress
-// with AISS_SL_LOG, and vkEnumeratePhysicalDevices).
+// with DU_SL_LOG, and vkEnumeratePhysicalDevices).
 // ---------------------------------------------------------------------------------------------------------------------
 static void PatchModule(HMODULE module)
 {
@@ -293,7 +293,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
     g_kernel32CreateFileW = reinterpret_cast<PFN_CreateFileW>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "CreateFileW"));
     if (!g_realCreateFileW)
         return TRUE;
-    if (GetEnvironmentVariableW(L"AISS_SL_LOG", g_slLogDir, MAX_PATH))
+    if (GetEnvironmentVariableW(L"DU_SL_LOG", g_slLogDir, MAX_PATH))
     {
         g_realGetProcAddress     = reinterpret_cast<PFN_GetProcAddress>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "GetProcAddress"));
         g_kernel32GetProcAddress = reinterpret_cast<PFN_GetProcAddress>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcAddress"));

@@ -32,7 +32,7 @@ constexpr double kFullClockMhz = 1600.0;  // Van Gogh's top shader clock: the ta
 constexpr double kDefaultG     = 60.0;    // ms per extra render megapixel before anything is measured
 
 // Upscale cost per upscaler on the Steam Deck, ms at 1280x800 output (scaled by output pixels for other sizes),
-// measured at render ratios 3, 2.5, 2 and 1.5 (Streamline sample, AISS_RATIO, mean of 2x 120 evaluations; sweep in
+// measured at render ratios 3, 2.5, 2 and 1.5 (Streamline sample, DU_RATIO, mean of 2x 120 evaluations; sweep in
 // steamdeck/README.md) and interpolated linearly in render pixels between them. NSS takes its exact-2x path (static
 // LUT) only at exactly 2x, so for NSS the 2x column is used at exactly 2x and the other ratios interpolate around it.
 // FSR 4 Lite in [0] is the SDK Vulkan DLL with the replacement shaders (about 22% under AMD's D3D12 DLL, which the

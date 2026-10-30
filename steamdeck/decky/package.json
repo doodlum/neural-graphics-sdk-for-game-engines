@@ -1,7 +1,7 @@
 {
-  "name": "aiss-dlss-nss",
+  "name": "deckyupscaler",
   "version": "0.1.0",
-  "description": "AISS – DLSS→NSS: DLSS Super Resolution on Arm NSS for Steam Deck games",
+  "description": "DeckyUpscaler: DLSS Super Resolution on Arm NSS, Intel XeSS or AMD FSR for Steam Deck games",
   "type": "module",
   "scripts": {
     "build": "rollup -c",

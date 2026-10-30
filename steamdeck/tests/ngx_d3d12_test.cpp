@@ -1,14 +1,14 @@
 // D3D12 counterpart of ngx_d3d11_test's replay mode: drives nvngx.dll's D3D12 entry points on vkd3d-proton the way a
 // game's NGX code does, with dumped inputs, and saves the output.
 // Usage (under Proton): ngx_d3d12_test.exe <path to nvngx.dll> --replay DIR [options]
-//   --replay DIR  replay dumped inputs (NNN_*.raw or aiss_in_NNN_*.raw, with jitter / MV scale from DIR/frames.txt):
-//                 the textures keep the dumped extents and formats, the render size is the depth dump's, the display
-//                 size the output dump's
+//   --replay DIR  replay dumped inputs (NNN_*.raw or deckyupscaler_in_NNN_*.raw, with jitter / MV scale from
+//                 DIR/frames.txt): the textures keep the dumped extents and formats, the render size is the depth
+//                 dump's, the display size the output dump's
 //   --first N --count K   frames of the replay (default 0, 8)
 //   --loops L     play the replayed frames L times (reset only on the first)
 //   --crop        colour and motion vectors cropped to the render size (the exact-size reference)
 //   --color16     B10G11R11 colour as RGBA16F (the same values)
-//   --anysize     accept any MaxPerf render size from the capability query (e.g. with AISS_RATIO=1.5)
+//   --anysize     accept any MaxPerf render size from the capability query (e.g. with DU_RATIO=1.5)
 //   --flags N     DLSS create flags (default 11: HDR, low-res MVs, inverted depth; 64 = auto exposure)
 //   --perf N      PerfQualityValue at create (default 0 = MaxPerf; FH6 uses 2)
 //   --save FILE   write the output (RGBA16F) to FILE
@@ -27,7 +27,7 @@
 //   --gamework    record unrelated compute-free work (a clear of a scratch UAV) in the same list before evaluating
 //   --outfmt F    output format: rgba16f (default), r11g11b10 (read back converted to RGBA16F)
 //   --outsize W,H output texture W x H (larger than the display size; the top-left display-size region is saved)
-//   --ctlseq S    runtime upscaler switches through the control file (AISS_CONTROL): S = "code@frame,..."; before
+//   --ctlseq S    runtime upscaler switches through the control file (DU_CONTROL): S = "code@frame,..."; before
 //                 that frame the harness writes "code 0 0" to the file and waits for the proxy to re-read it (codes as
 //                 the plugin's: 0-2 NSS quality/balanced/performance, 9 FSR 3.1, ...). E.g. "9@0,1@40,0@80" is FH6's
 //                 session (FSR 3 -> NSS Balanced -> NSS Quality)
@@ -236,8 +236,8 @@ int main(int argc, char** argv)
         else { printf("FAIL: unknown option %s\n", argv[i]); return 1; }
     }
     if (!replayDir) { printf("FAIL: --replay DIR is required\n"); return 1; }
-    std::string ctlPath;  // AISS_CONTROL as the proxy opens it
-    if (const char* c = getenv("AISS_CONTROL"))
+    std::string ctlPath;  // DU_CONTROL as the proxy opens it
+    if (const char* c = getenv("DU_CONTROL"))
     {
         ctlPath = c[0] == '/' ? std::string("Z:") + c : c;
         for (char& ch : ctlPath) if (ch == '/') ch = '\\';
@@ -247,7 +247,7 @@ int main(int argc, char** argv)
         else printf("note: cannot write control file %s\n", ctlPath.c_str());
         Sleep(700);  // the proxy re-reads the control file at most every 500 ms
     };
-    if (!ctlSeq.empty() && ctlPath.empty()) { printf("FAIL: --ctlseq needs AISS_CONTROL\n"); return 1; }
+    if (!ctlSeq.empty() && ctlPath.empty()) { printf("FAIL: --ctlseq needs DU_CONTROL\n"); return 1; }
     for (auto& [frame, code] : ctlSeq) if (frame == 0) { writeCtl(code); printf("control %d before create\n", code); }
 
     HMODULE ngx = LoadLibraryA(dll);
@@ -303,13 +303,16 @@ int main(int argc, char** argv)
     std::vector<Frame> frames(count);
     for (int i = 0; i < count; ++i)
     {
-        char a[64], b[64];
-        snprintf(a, sizeof(a), "%03d_", first + i);
-        snprintf(b, sizeof(b), "aiss_in_%03d_", first + i);
         const std::string dir = std::string(replayDir) + "\\";
-        std::string pre = dir + a;
-        Raw probe;
-        if (!probe.Load(pre + "depth.raw")) pre = dir + b;
+        std::string pre;
+        for (const char* fmt : {"%03d_", "deckyupscaler_in_%03d_", "aiss_in_%03d_"})  // the last: older builds' dumps
+        {
+            char a[64];
+            snprintf(a, sizeof(a), fmt, first + i);
+            Raw probe;
+            pre = dir + a;
+            if (probe.Load(pre + "depth.raw")) break;
+        }
         Frame& f = frames[i];
         if (!f.color.Load(pre + "color.raw") || !f.mv.Load(pre + "mv.raw") || !f.depth.Load(pre + "depth.raw"))
         { printf("FAIL: cannot load %s*.raw\n", pre.c_str()); return 1; }
@@ -332,12 +335,13 @@ int main(int argc, char** argv)
     {
         char a[64];
         const std::string dir = std::string(replayDir) + "\\";
-        snprintf(a, sizeof(a), "%03d_output.raw", first);
-        if (!out0.Load(dir + a))
+        bool ok = false;
+        for (const char* fmt : {"%03d_output.raw", "deckyupscaler_in_%03d_output.raw", "aiss_in_%03d_output.raw"})
         {
-            snprintf(a, sizeof(a), "aiss_in_%03d_output.raw", first);
-            if (!out0.Load(dir + a)) { printf("FAIL: no output dump for the display size\n"); return 1; }
+            snprintf(a, sizeof(a), fmt, first);
+            if ((ok = out0.Load(dir + a))) break;
         }
+        if (!ok) { printf("FAIL: no output dump for the display size\n"); return 1; }
     }
     const unsigned rw = frames[0].depth.w, rh = frames[0].depth.h, outW = out0.w, outH = out0.h;
     if (crop)

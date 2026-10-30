@@ -1,7 +1,7 @@
 # nvngx.dll: NGX core replacement that runs Arm NSS for DLSS Super Resolution under Proton.
 # Links the SDK's static Windows libraries (build them first, see steamdeck/build.sh).
 cmake_minimum_required(VERSION 3.20)
-project(aiss_nvngx CXX)
+project(deckyupscaler_nvngx CXX)
 
 set(NGSDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH "Neural graphics SDK checkout")
 set(NGSDK_LIBS "${NGSDK_ROOT}/bin" CACHE PATH "Directory holding libngsdk_windows_x64.a")
@@ -95,7 +95,7 @@ target_link_libraries(nvngx PRIVATE
     dxguid
     version)
 # Only the NGX entry points are exported (they carry __declspec(dllexport)).
-if(NOT DEFINED AISS_STRIP)
-    set(AISS_STRIP -s)
+if(NOT DEFINED DU_STRIP)
+    set(DU_STRIP -s)
 endif()
-target_link_options(nvngx PRIVATE -Wl,--exclude-all-symbols ${AISS_STRIP})
+target_link_options(nvngx PRIVATE -Wl,--exclude-all-symbols ${DU_STRIP})

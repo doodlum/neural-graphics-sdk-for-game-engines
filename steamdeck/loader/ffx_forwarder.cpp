@@ -1,8 +1,8 @@
 // FFX forwarder: stands in for a game's amd_fidelityfx_vk.dll (the plugin keeps AMD's original next to it as
-// amd_fidelityfx_vk.aiss-orig.dll). Upscale contexts on Vulkan go to the NSS proxy (system32\_nvngx.dll,
+// amd_fidelityfx_vk.deckyupscaler-orig.dll). Upscale contexts on Vulkan go to the NSS proxy (system32\_nvngx.dll,
 // nvngx/ffx_vulkan.cpp), so the game's FSR option runs the upscaler picked in the plugin; every other context (frame
 // generation, other effects) and every call without a context goes to AMD's DLL unchanged. If the proxy is missing or
-// refuses a context, the game gets AMD's upscaler as before. AISS_FFX=0 forwards everything.
+// refuses a context, the game gets AMD's upscaler as before. DU_FFX=0 forwards everything.
 // SPDX-License-Identifier: MIT
 #include <windows.h>
 
@@ -54,7 +54,7 @@ const Apis& Load()
         GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH);
         wchar_t* slash = wcsrchr(path, L'\\');
         if (slash)
-            wcscpy(slash + 1, L"amd_fidelityfx_vk.aiss-orig.dll");
+            wcscpy(slash + 1, L"amd_fidelityfx_vk.deckyupscaler-orig.dll");
         if (HMODULE amd = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH))
         {
             a.create    = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(amd, "ffxCreateContext"));
@@ -64,15 +64,15 @@ const Apis& Load()
             a.dispatch  = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(amd, "ffxDispatch"));
         }
         wchar_t off[8];
-        if (GetEnvironmentVariableW(L"AISS_FFX", off, 8) && !wcscmp(off, L"0"))
+        if (GetEnvironmentVariableW(L"DU_FFX", off, 8) && !wcscmp(off, L"0"))
             return a;
         GetSystemDirectoryW(path, MAX_PATH);
         wcscat(path, L"\\_nvngx.dll");
         if (HMODULE proxy = LoadLibraryW(path))
         {
-            a.proxyCreate   = reinterpret_cast<PFN_Create>(GetProcAddress(proxy, "AISS_FfxCreateUpscaleVK"));
-            a.proxyDispatch = reinterpret_cast<PFN_Dispatch>(GetProcAddress(proxy, "AISS_FfxDispatchUpscaleVK"));
-            a.proxyDestroy  = reinterpret_cast<PFN_Destroy>(GetProcAddress(proxy, "AISS_FfxDestroyUpscale"));
+            a.proxyCreate   = reinterpret_cast<PFN_Create>(GetProcAddress(proxy, "DU_FfxCreateUpscaleVK"));
+            a.proxyDispatch = reinterpret_cast<PFN_Dispatch>(GetProcAddress(proxy, "DU_FfxDispatchUpscaleVK"));
+            a.proxyDestroy  = reinterpret_cast<PFN_Destroy>(GetProcAddress(proxy, "DU_FfxDestroyUpscale"));
             if (!a.proxyCreate || !a.proxyDispatch || !a.proxyDestroy)
                 a.proxyCreate = nullptr;
         }
@@ -184,7 +184,7 @@ ffxReturnCode_t QueryOurs(ffxQueryDescHeader* desc)
 }  // namespace
 
 // Also the plugin's marker for this DLL (the export name is in the binary).
-extern "C" __declspec(dllexport) const char* AISS_FfxForwarderVersion()
+extern "C" __declspec(dllexport) const char* DU_FfxForwarderVersion()
 {
     return "1";
 }

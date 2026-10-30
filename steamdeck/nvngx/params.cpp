@@ -258,7 +258,7 @@ NVSDK_NGX_Result NgxOptimalSettings(NVSDK_NGX_Parameter* abi)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
 
     const int    mode   = (quality >= 0 && quality < 6) ? quality : 0;
-    // AISS_RATIO fixes the ratio; otherwise each upscaler gets the render size at which the frame costs the same as
+    // DU_RATIO fixes the ratio; otherwise each upscaler gets the render size at which the frame costs the same as
     // with NSS Quality at the DLSS mode's standard ratio (cost_model.cpp).
     const float  ratio  = Config().ratioForced ? Config().qualityRatio[mode]
                                                : EqualCostRatio(mode, Config().qualityRatio[mode], width, height);

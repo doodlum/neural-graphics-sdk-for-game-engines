@@ -1,6 +1,6 @@
 # Loader shims that let NGX accept the NSS proxy core (see loader_shim.cpp). One DLL per exports/<name>.txt.
 cmake_minimum_required(VERSION 3.20)
-project(aiss_loader CXX)
+project(deckyupscaler_loader CXX)
 
 file(GLOB SHIM_LISTS "${CMAKE_CURRENT_SOURCE_DIR}/exports/*.txt")
 foreach(list ${SHIM_LISTS})

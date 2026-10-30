@@ -5,7 +5,7 @@ under Proton, for D3D11, D3D12 and Vulkan games. Integration code: `steamdeck/nv
 `steamdeck/README.md`, "AMD FSR 4").
 
 **No AMD shader code is in this repository.** The faster shaders are replacement SPIR-V modules that the proxy loads
-from packs next to AMD's DLL (`system32\aiss\fsr4_shaders.bin`, `fsr4_shaders_dot2.bin`; format in
+from packs next to AMD's DLL (`system32\deckyupscaler\fsr4_shaders.bin`, `fsr4_shaders_dot2.bin`; format in
 `steamdeck/tools/pack_fsr4_shaders.py`). They are built and kept outside the repository. This file documents the method,
 the measurements and the techniques, not the shaders.
 
@@ -42,7 +42,7 @@ only FSR 3.1.6 and 2.3.4.
 ## Method
 
 - **Replacement hook.** Every `vkCreateShaderModule` from the DLL is keyed by an FNV-1a hash of the original SPIR-V; a
-  replacement applies only to the exact module it was made for. `AISS_FSR4_VK_DUMP=dir` writes the originals.
+  replacement applies only to the exact module it was made for. `DU_FSR4_VK_DUMP=dir` writes the originals.
 - **Variants.** The DLL builds different prepass/postpass modules depending on the context flags. The D3D11 harness
   (`steamdeck/tests/ngx_d3d11_test`, `--flags`) covers all 16 combinations of HDR, low-res motion vectors, inverted
   depth and auto exposure; the Lite network uses 11 distinct modules for them (6 prepass, 2 postpass, pass1/2/3).
@@ -50,11 +50,11 @@ only FSR 3.1.6 and 2.3.4.
   forces history rejection), per flag combination, against AMD-shader baselines: bit-identical, or tonemapped PSNR and
   max/mean difference. Accepted lossy changes had to stay ≥ 45 dB on every combination with no visible difference in
   crops and ×50/×500 amplified diffs. Synthetic scenes at render ratios 1.0–3.0 as a second check.
-- **Flicker.** `AISS_DUMP_FRAME=N AISS_DUMP_FRAME_COUNT=16` dumps consecutive frames; mean frame-to-frame luma change
+- **Flicker.** `DU_DUMP_FRAME=N DU_DUMP_FRAME_COUNT=16` dumps consecutive frames; mean frame-to-frame luma change
   on static content and edges of the Streamline sample, against several AMD runs (the sample itself varies about one
   level per frame between runs).
-- **Timing.** `AISS_FSR4_VK_PROFILE=N` (and `AISS_FSR4_DX12_PROFILE=N` for AMD's D3D12 DLL) timestamps every dispatch
-  the DLL records, by shader entry point. Totals from `AISS_GPU_TIMING`. The replay harness runs at ~350 fps with
+- **Timing.** `DU_FSR4_VK_PROFILE=N` (and `DU_FSR4_DX12_PROFILE=N` for AMD's D3D12 DLL) timestamps every dispatch
+  the DLL records, by shader entry point. Totals from `DU_GPU_TIMING`. The replay harness runs at ~350 fps with
   moving clocks, so D3D11 numbers are medians of 14 windows of 64 evaluations.
 - **ISA.** Every change was judged by the RDNA2 code ACO emits (`RADV_DEBUG=shaders,shaderstats`): VALU/VMEM counts,
   waits, VGPRs and resulting waves per SIMD, ACO's latency/throughput estimates; measured time decides.

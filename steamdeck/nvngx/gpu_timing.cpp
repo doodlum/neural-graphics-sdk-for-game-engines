@@ -1,4 +1,4 @@
-// AISS_GPU_TIMING=N: GPU timestamps around every upscale, read back without waiting (a few frames later) and logged
+// DU_GPU_TIMING=N: GPU timestamps around every upscale, read back without waiting (a few frames later) and logged
 // as an average over N evaluations. Off by default.
 // SPDX-License-Identifier: MIT
 #include "ngx_common.h"

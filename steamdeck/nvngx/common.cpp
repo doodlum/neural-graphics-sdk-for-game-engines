@@ -27,7 +27,7 @@ static int LiveLogLevelRaw();  // the control file's log value (-1 when absent),
 
 int LogLevel()
 {
-    static const int envLevel = EnvInt("AISS_LOG", 1);
+    static const int envLevel = EnvInt("DU_LOG", 1);
     const int        live     = LiveLogLevelRaw();
     return live >= 0 ? live : envLevel;
 }
@@ -48,9 +48,9 @@ void Log(int level, const char* fmt, ...)
         DWORD len = GetModuleFileNameA(nullptr, path, MAX_PATH);
         char* slash = strrchr(path, '\\');
         if (len && slash)
-            strcpy(slash + 1, "aiss_nvngx.log");
+            strcpy(slash + 1, "deckyupscaler.log");
         else
-            strcpy(path, "aiss_nvngx.log");
+            strcpy(path, "deckyupscaler.log");
         file = fopen(path, "w");
         if (!file)
             return;
@@ -62,7 +62,7 @@ void Log(int level, const char* fmt, ...)
     vsnprintf(line, sizeof(line), fmt, args);
     va_end(args);
 
-    fprintf(file, "[aiss] %s\n", line);
+    fprintf(file, "[deckyupscaler] %s\n", line);
     fflush(file);
 }
 
@@ -70,29 +70,29 @@ const ProxyConfig& Config()
 {
     static const ProxyConfig config = [] {
         ProxyConfig c = {};
-        // DLSS's standard ratios; AISS_RATIO overrides every mode with one value (e.g. 2.0 for 1280x800 -> 640x400).
+        // DLSS's standard ratios; DU_RATIO overrides every mode with one value (e.g. 2.0 for 1280x800 -> 640x400).
         const float standard[6] = {2.0f, 1.724f, 1.5f, 3.0f, 1.3f, 1.0f};
-        const float forced      = EnvFloat("AISS_RATIO", 0.0f);
+        const float forced      = EnvFloat("DU_RATIO", 0.0f);
         for (int i = 0; i < 6; ++i)
             c.qualityRatio[i] = forced >= 1.0f ? forced : standard[i];
         c.ratioForced      = forced >= 1.0f;
-        c.equalCost        = EnvInt("AISS_EQUAL_COST", 0) != 0;
-        c.dilateMv         = EnvInt("AISS_FSR_DILATE_MV", 0) != 0;
-        c.nssQuality       = EnvInt("AISS_NSS_QUALITY", -1);
+        c.equalCost        = EnvInt("DU_EQUAL_COST", 0) != 0;
+        c.dilateMv         = EnvInt("DU_FSR_DILATE_MV", 0) != 0;
+        c.nssQuality       = EnvInt("DU_NSS_QUALITY", -1);
         c.xess             = false;
-        if (const char* v = getenv("AISS_UPSCALER"))
+        if (const char* v = getenv("DU_UPSCALER"))
             c.xess = !strcmp(v, "xess") || !strcmp(v, "XeSS") || !strcmp(v, "XESS") || !strcmp(v, "3");
         c.fsr3             = false;
-        if (const char* v = getenv("AISS_UPSCALER"))
+        if (const char* v = getenv("DU_UPSCALER"))
             c.fsr3 = !_stricmp(v, "fsr3") || !_stricmp(v, "fsr3.1") || !strcmp(v, "9");
-        c.xessQuality      = EnvInt("AISS_XESS_QUALITY", 0);
+        c.xessQuality      = EnvInt("DU_XESS_QUALITY", 0);
         c.fsr4Model        = -1;
-        if (const char* v = getenv("AISS_UPSCALER"))
+        if (const char* v = getenv("DU_UPSCALER"))
         {
-            // fsr4 (model from AISS_FSR4_MODEL), or fsr4-<model> / the control file's codes 4-8
+            // fsr4 (model from DU_FSR4_MODEL), or fsr4-<model> / the control file's codes 4-8
             if (!_strnicmp(v, "fsr4", 4))
             {
-                const char* m = v[4] == '-' || v[4] == '_' || v[4] == ':' ? v + 5 : getenv("AISS_FSR4_MODEL");
+                const char* m = v[4] == '-' || v[4] == '_' || v[4] == ':' ? v + 5 : getenv("DU_FSR4_MODEL");
                 c.fsr4Model   = Fsr4ModelFromName(m ? m : "auto");
                 if (c.fsr4Model < 0)
                     c.fsr4Model = kFsr4Auto;
@@ -100,17 +100,17 @@ const ProxyConfig& Config()
             else if (v[0] >= '4' && v[0] <= '8' && !v[1])
                 c.fsr4Model = Fsr4ModelForLiveCode(v[0] - '0');
         }
-        c.gpuTiming        = EnvInt("AISS_GPU_TIMING", 0);
-        c.cameraNear       = EnvFloat("AISS_CAMERA_NEAR", 0.1f);
-        c.cameraFar        = EnvFloat("AISS_CAMERA_FAR", 100000.0f);
-        c.cameraFovY       = EnvFloat("AISS_CAMERA_FOV", 60.0f) * 3.14159265f / 180.0f;
-        c.exposure         = EnvFloat("AISS_EXPOSURE", 0.0f);
-        c.mlFeaturesForced = EnvInt("AISS_LAYER", 0) != 0;
-        c.debugView        = EnvInt("AISS_DEBUG_VIEW", -1);
-        c.dumpFrame        = EnvInt("AISS_DUMP_FRAME", -1);
+        c.gpuTiming        = EnvInt("DU_GPU_TIMING", 0);
+        c.cameraNear       = EnvFloat("DU_CAMERA_NEAR", 0.1f);
+        c.cameraFar        = EnvFloat("DU_CAMERA_FAR", 100000.0f);
+        c.cameraFovY       = EnvFloat("DU_CAMERA_FOV", 60.0f) * 3.14159265f / 180.0f;
+        c.exposure         = EnvFloat("DU_EXPOSURE", 0.0f);
+        c.mlFeaturesForced = EnvInt("DU_LAYER", 0) != 0;
+        c.debugView        = EnvInt("DU_DEBUG_VIEW", -1);
+        c.dumpFrame        = EnvInt("DU_DUMP_FRAME", -1);
         c.dumpInputsFrom   = -1;
         c.dumpInputsCount  = 0;
-        if (const char* v = getenv("AISS_DUMP_INPUTS"))
+        if (const char* v = getenv("DU_DUMP_INPUTS"))
             sscanf(v, "%d,%d", &c.dumpInputsFrom, &c.dumpInputsCount);
         c.fastMath         = getenv("FFX_ML_RESCALE_FLOAT") != nullptr;
         auto pair = [](const char* name, float* out) {
@@ -118,8 +118,8 @@ const ProxyConfig& Config()
             if (const char* v = getenv(name))
                 sscanf(v, "%f,%f", &out[0], &out[1]);
         };
-        pair("AISS_JITTER_SIGN", c.jitterSign);
-        pair("AISS_MV_SIGN", c.mvSign);
+        pair("DU_JITTER_SIGN", c.jitterSign);
+        pair("DU_MV_SIGN", c.mvSign);
         return c;
     }();
     return config;
@@ -141,7 +141,7 @@ struct LiveControl
 const std::string& ControlFilePath()
 {
     static const std::string path = [] {
-        const char* unix = getenv("AISS_CONTROL");
+        const char* unix = getenv("DU_CONTROL");
         if (!unix || unix[0] != '/')
             return std::string();
         std::string dos = std::string("Z:") + unix;  // Proton maps Z: to the Linux root

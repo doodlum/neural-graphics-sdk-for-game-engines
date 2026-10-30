@@ -270,7 +270,7 @@ void** FindVtable(HMODULE module, const char* rttiName)
 Fsr4Gpu Fsr4KnownGpu(uint32_t vendorId, uint32_t deviceId, const char* deviceName)
 {
     Fsr4Gpu ids;
-    if (const char* v = getenv("AISS_FSR4_GPU"))
+    if (const char* v = getenv("DU_FSR4_GPU"))
     {
         sscanf(v, "%u,%u", &ids.family, &ids.revision);
         return ids;
@@ -299,10 +299,10 @@ int Fsr4ModelForGpu(const Fsr4Gpu& g)
 
 void Fsr4EnableWatermark()
 {
-    // Desired state: the live control-file toggle wins, else AISS_FSR4_WATERMARK / FSR_WATERMARK. Set or clear
+    // Desired state: the live control-file toggle wins, else DU_FSR4_WATERMARK / FSR_WATERMARK. Set or clear
     // MLSR-WATERMARK (the variable both DLLs read) in both the Win32 and the CRT environment, before each context build.
     const int   live = LiveWatermark();
-    const char* a    = getenv("AISS_FSR4_WATERMARK");
+    const char* a    = getenv("DU_FSR4_WATERMARK");
     const char* b    = getenv("FSR_WATERMARK");
     const bool  want = live >= 0 ? live != 0 : ((a && *a && strcmp(a, "0")) || (b && *b && strcmp(b, "0")));
     static int  last = -1;
@@ -335,14 +335,14 @@ bool Fsr4LoadDriver(const wchar_t* dllName, const Fsr4Gpu& gpu, Fsr4Driver& out)
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&Fsr4LoadDriver), &self);
     GetModuleFileNameW(self, path, MAX_PATH);
-    // Load from a private "aiss\" subfolder next to _nvngx.dll, by full path. Proton reinstalls its own (older)
-    // amdxcffx64.dll into the prefix's system32 on launch, which would shadow a copy placed there; the subfolder is
-    // ours alone. AISS_FSR4_DIR overrides it (a Windows path, e.g. for the test harness).
+    // Load from a private "deckyupscaler\" subfolder next to _nvngx.dll, by full path. Proton reinstalls its own
+    // (older) amdxcffx64.dll into the prefix's system32 on launch, which would shadow a copy placed there; the subfolder
+    // is ours alone. DU_FSR4_DIR overrides it (a Windows path, e.g. for the test harness).
     if (wchar_t* slash = wcsrchr(path, L'\\'))
-        wcscpy(slash + 1, L"aiss\\");
+        wcscpy(slash + 1, L"deckyupscaler\\");
     else
         path[0] = 0;
-    if (const char* dir = getenv("AISS_FSR4_DIR"))
+    if (const char* dir = getenv("DU_FSR4_DIR"))
     {
         MultiByteToWideChar(CP_UTF8, 0, dir, -1, path, MAX_PATH);
         size_t n = wcslen(path);
@@ -436,11 +436,11 @@ bool Fsr4LoadDriver(const wchar_t* dllName, const Fsr4Gpu& gpu, Fsr4Driver& out)
          (unsigned long long)(GetTickCount64() - t0), out.versionName.c_str(),
          (unsigned long long)block.provider.versionId, Fsr4ModelList(out).c_str());
     // Require FSR 4.1.2 exactly: refuse an older provider (e.g. a 4.1.1 / 4.0.x driver, or an FSR 3.1 fallback) loudly
-    // rather than silently upscale with it. AISS_FSR4_ALLOW_ANY_VERSION bypasses the check (diagnostics only).
-    if (out.versionName.find("4.1.2") == std::string::npos && !getenv("AISS_FSR4_ALLOW_ANY_VERSION"))
+    // rather than silently upscale with it. DU_FSR4_ALLOW_ANY_VERSION bypasses the check (diagnostics only).
+    if (out.versionName.find("4.1.2") == std::string::npos && !getenv("DU_FSR4_ALLOW_ANY_VERSION"))
     {
         LOGI("FSR 4: %ls reports provider version \"%s\", not 4.1.2 - refusing it and using NSS (set "
-             "AISS_FSR4_ALLOW_ANY_VERSION=1 to override)", dllName, out.versionName.c_str());
+             "DU_FSR4_ALLOW_ANY_VERSION=1 to override)", dllName, out.versionName.c_str());
         return false;
     }
     return true;

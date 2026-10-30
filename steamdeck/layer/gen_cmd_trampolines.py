@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# Generates aiss_cmd_trampolines.inc for aiss_layer.c from vulkan_core.h: one trampoline per command-buffer entry point
-# (every PFN whose first parameter is a VkCommandBuffer), which forwards to the real command buffer currently being
-# recorded for the game's command buffer (see "Command buffer split" in aiss_layer.c).
+# Generates cmd_trampolines.inc for deckyupscaler_layer.c from vulkan_core.h: one trampoline per command-buffer entry
+# point (every PFN whose first parameter is a VkCommandBuffer), which forwards to the real command buffer currently being
+# recorded for the game's command buffer (see "Command buffer split" in deckyupscaler_layer.c).
 #
 # usage: gen_cmd_trampolines.py <vulkan_core.h> <out.inc>
 # SPDX-License-Identifier: MIT
 import re
 import sys
 
-# Handled by hand in aiss_layer.c.
+# Handled by hand in deckyupscaler_layer.c.
 MANUAL = {"vkBeginCommandBuffer", "vkEndCommandBuffer", "vkResetCommandBuffer", "vkCmdFillBuffer"}
 # Render-pass scope tracking (a split inside a render pass is refused).
 RP_BEGIN = {"vkCmdBeginRenderPass", "vkCmdBeginRenderPass2", "vkCmdBeginRenderPass2KHR", "vkCmdBeginRendering",

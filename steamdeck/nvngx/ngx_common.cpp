@@ -207,8 +207,8 @@ UpscalerCreateInfo NgxRemapInterop(const UpscalerCreateInfo& in)
 UpscalerCreateInfo NgxRemapVulkan(const UpscalerCreateInfo& in)
 {
     // Vulkan games run FSR 4 natively through AMD's FSR SDK Vulkan DLL (fsr4_vk.cpp). Without it (or when it refuses
-    // the device) they use the D3D12 interop path, with the AISS layer splitting the game's command buffer at the
-    // evaluate (see fsr4_interop.cpp); once that has failed too, NSS.
+    // the device) they use the D3D12 interop path, with the DeckyUpscaler layer splitting the game's command buffer at
+    // the evaluate (see fsr4_interop.cpp); once that has failed too, NSS.
     UpscalerCreateInfo info = in.backend == kBackendFsr4 && !Fsr4VkUnavailable() ? in : NgxRemapInterop(in);
     if (info.backend == kBackendFsr4)
         info.backend = kBackendFsr4Vk;

@@ -44,7 +44,7 @@ struct Fsr4Gpu
     uint32_t revision = 0;
 };
 
-// The family / revision for this adapter: AISS_FSR4_GPU override, else Van Gogh (144,1) by device id or RADV name.
+// The family / revision for this adapter: DU_FSR4_GPU override, else Van Gogh (144,1) by device id or RADV name.
 Fsr4Gpu Fsr4KnownGpu(uint32_t vendorId, uint32_t deviceId, const char* deviceName);
 // The network AMD's own device checks accept for a family / revision (empirical, from amd*ffx64 4.1.2), or -1.
 int Fsr4ModelForGpu(const Fsr4Gpu& gpu);
@@ -60,7 +60,7 @@ bool Fsr4LoadDriver(const wchar_t* dllName, const Fsr4Gpu& gpu, Fsr4Driver& out)
 uint32_t Fsr4CreateContext(const Fsr4Driver& drv, int wantedModel, void* context, void* createDesc, int* accepted,
                            int* nativeMask);
 
-// Turns on AMD's watermark (MLSR-WATERMARK) when AISS_FSR4_WATERMARK / FSR_WATERMARK is set. Call once per process.
+// Turns on AMD's watermark (MLSR-WATERMARK) when DU_FSR4_WATERMARK / FSR_WATERMARK is set. Call once per process.
 void Fsr4EnableWatermark();
 
 // "FP8" etc.: a comma list of the networks the driver has, for logging.

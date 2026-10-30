@@ -170,7 +170,7 @@ bool XessUpscaler::Init(const VulkanDevice& device, const UpscalerCreateInfo& in
         flags |= XESS_INIT_FLAG_INVERTED_DEPTH;
     if (!info.hdr)
         flags |= XESS_INIT_FLAG_LDR_INPUT_COLOR;
-    // Like NSS: XeSS's own auto exposure when the game asked DLSS for it, unless AISS_EXPOSURE forces a value.
+    // Like NSS: XeSS's own auto exposure when the game asked DLSS for it, unless DU_EXPOSURE forces a value.
     if (info.autoExposure && Config().exposure <= 0.0f)
         flags |= XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE;
 
@@ -286,7 +286,7 @@ bool XessUpscaler::Dispatch(VkCommandBuffer cmd, const UpscalerDispatch& d)
     ep.velocityTexture          = info(1, d.motionVectors, VK_IMAGE_ASPECT_COLOR_BIT);
     ep.depthTexture             = info(2, d.depth, IsDepth(d.depth.format) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
     ep.outputTexture            = info(3, d.output, VK_IMAGE_ASPECT_COLOR_BIT);
-    // DLSS and XeSS share the jitter convention (the sample offset in render pixels); AISS_JITTER_SIGN still applies.
+    // DLSS and XeSS share the jitter convention (the sample offset in render pixels); DU_JITTER_SIGN still applies.
     ep.jitterOffsetX  = d.jitterX * Config().jitterSign[0];
     ep.jitterOffsetY  = d.jitterY * Config().jitterSign[1];
     ep.exposureScale  = d.exposure;
@@ -347,7 +347,7 @@ std::unique_ptr<Upscaler> CreateUpscaler(const VulkanDevice& device, const Upsca
     {
         if (auto native = CreateFsr4VkUpscaler(device, info))
             return native;
-        // The interop way instead (layerSplit, set by the Vulkan front end's remap, keeps the AISS layer's split).
+        // The interop way instead (layerSplit, set by the Vulkan front end's remap, keeps the Vulkan layer's split).
         UpscalerCreateInfo interop = info;
         interop.backend            = kBackendFsr4Interop;
         return CreateUpscaler(device, interop);

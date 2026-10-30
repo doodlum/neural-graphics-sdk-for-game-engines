@@ -1,7 +1,7 @@
-// AISS_DUMP_FRAME=N for the upscalers other than NSS (NSS writes its own): copies the output of evaluation N to a
+// DU_DUMP_FRAME=N for the upscalers other than NSS (NSS writes its own): copies the output of evaluation N to a
 // host-visible buffer, reads it back 16 evaluations later (the proxy never waits on the game's queue) and writes
-// aiss_frame_<N>.ppm next to the game, tone mapped like NSS's dump. AISS_DUMP_FRAME_COUNT=K writes evaluations N..N+K-1
-// (consecutive frames, e.g. to measure temporal stability).
+// deckyupscaler_frame_<N>.ppm next to the game, tone mapped like NSS's dump. DU_DUMP_FRAME_COUNT=K writes evaluations
+// N..N+K-1 (consecutive frames, e.g. to measure temporal stability).
 // SPDX-License-Identifier: MIT
 #include "ngx_common.h"
 
@@ -35,7 +35,7 @@ std::vector<Dump> g_dumps;
 int DumpCount()
 {
     static const int n = [] {
-        const char* v = getenv("AISS_DUMP_FRAME_COUNT");
+        const char* v = getenv("DU_DUMP_FRAME_COUNT");
         return v && atoi(v) > 0 ? atoi(v) : 1;
     }();
     return n;
@@ -68,7 +68,7 @@ void Write(Dump& d)
     if (reinterpret_cast<PFN_vkMapMemory>(fn("vkMapMemory"))(d.dev.device, d.memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS)
     {
         char name[64];
-        snprintf(name, sizeof(name), "aiss_frame_%llu.ppm", (unsigned long long)d.index);
+        snprintf(name, sizeof(name), "deckyupscaler_frame_%llu.ppm", (unsigned long long)d.index);
         if (FILE* f = fopen(name, "wb"))
         {
             const uint32_t w = d.image.width, h = d.image.height;

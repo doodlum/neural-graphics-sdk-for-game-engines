@@ -36,11 +36,11 @@ PFN_vkVoidFunction VKAPI_CALL ExportGipa(VkInstance instance, const char* name)
     return gipa && instance ? gipa(instance, name) : nullptr;
 }
 
-// The instance of a physical device, as the loader shim recorded it (AISS_VK_PHYSDEV, see loader_shim.cpp).
+// The instance of a physical device, as the loader shim recorded it (DU_VK_PHYSDEV, see loader_shim.cpp).
 VkInstance InstanceFor(VkPhysicalDevice pd)
 {
     char list[1024] = {};
-    if (!GetEnvironmentVariableA("AISS_VK_PHYSDEV", list, sizeof(list)))
+    if (!GetEnvironmentVariableA("DU_VK_PHYSDEV", list, sizeof(list)))
         return VK_NULL_HANDLE;
     for (char* entry = list; *entry;)
     {
@@ -119,7 +119,7 @@ UpscalerImage Describe(const FfxApiResource& r, bool& ok)
 }  // namespace
 
 // Creates an upscaler for an FFX upscale context on the game's Vulkan device; returns its handle, 0 on failure.
-extern "C" __declspec(dllexport) uint32_t AISS_FfxCreateUpscaleVK(const ffxCreateContextDescUpscale* desc, VkDevice device,
+extern "C" __declspec(dllexport) uint32_t DU_FfxCreateUpscaleVK(const ffxCreateContextDescUpscale* desc, VkDevice device,
                                                                   VkPhysicalDevice physicalDevice, PFN_vkGetDeviceProcAddr gdpa)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -164,7 +164,7 @@ extern "C" __declspec(dllexport) uint32_t AISS_FfxCreateUpscaleVK(const ffxCreat
     return Registry().Add(std::move(upscaler));
 }
 
-extern "C" __declspec(dllexport) uint32_t AISS_FfxDispatchUpscaleVK(uint32_t id, const ffxDispatchDescUpscale* desc)
+extern "C" __declspec(dllexport) uint32_t DU_FfxDispatchUpscaleVK(uint32_t id, const ffxDispatchDescUpscale* desc)
 {
     if (!desc || !desc->commandList)
         return FFX_API_RETURN_ERROR_PARAMETER;
@@ -202,7 +202,7 @@ extern "C" __declspec(dllexport) uint32_t AISS_FfxDispatchUpscaleVK(uint32_t id,
                                                                                     : FFX_API_RETURN_ERROR;
 }
 
-extern "C" __declspec(dllexport) void AISS_FfxDestroyUpscale(uint32_t id)
+extern "C" __declspec(dllexport) void DU_FfxDestroyUpscale(uint32_t id)
 {
     Registry().Release(id);
 }

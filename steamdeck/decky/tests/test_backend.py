@@ -4,10 +4,11 @@
 
 Everything that writes happens in a temporary fake Steam tree. The real Steam library is only *scanned*
 (test_real_library_scan_readonly), with state and layer paths redirected to the temp dir.
-Set AISS_TEST_BIN to use another bin/ dir (default: ../bin, falling back to the repo build dirs).
+Set DU_TEST_BIN to use another bin/ dir (default: ../bin, falling back to the repo build dirs).
 """
 
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -22,15 +23,15 @@ PLUGIN = HERE.parent
 REPO = PLUGIN.parent.parent
 sys.path.insert(0, str(PLUGIN / "py_modules"))
 
-import aiss_core as core  # noqa: E402
-from aiss_core import (AissCore, build_launch_options, strip_launch_options, reg_set_value,  # noqa: E402
+import deckyupscaler_core as core  # noqa: E402
+from deckyupscaler_core import (UpscalerCore, build_launch_options, strip_launch_options, reg_set_value,  # noqa: E402
                        reg_delete_value, reg_has_value, REG_KEY_PATH, SIG_OVERRIDE_VALUE)
 
 S0 = {"upscaler": 0, "nss_quality": 0, "log": 1}
 
 
 def bin_dir(tmp: Path) -> Path:
-    env = os.environ.get("AISS_TEST_BIN")
+    env = os.environ.get("DU_TEST_BIN")
     if env:
         return Path(env)
     if all((PLUGIN / "bin" / n).is_file() for k, n in core.BIN_FILES.items() if k not in core.OPTIONAL_BIN):
@@ -38,8 +39,8 @@ def bin_dir(tmp: Path) -> Path:
     d = tmp / "bin"
     d.mkdir(exist_ok=True)
     for src in (REPO / "build_win_nvngx/nvngx.dll", REPO / "build_win_loader/dbghelp/dbghelp.dll",
-                REPO / "build_win_loader/dxgi/dxgi.dll", REPO / "build_layer/libVkLayer_aiss_ngx.so",
-                REPO / "build_layer/VkLayer_aiss_ngx.json"):
+                REPO / "build_win_loader/dxgi/dxgi.dll", REPO / "build_layer/libVkLayer_deckyupscaler.so",
+                REPO / "build_layer/VkLayer_deckyupscaler.json"):
         shutil.copy(src, d / src.name)
     xess = REPO.parent / "third_party/xess/sdk"
     if (xess / "bin/libxess.dll").is_file():
@@ -107,15 +108,15 @@ class LaunchOptionTests(unittest.TestCase):
         return new, rec2
 
     def test_empty(self):
-        self.roundtrip("", expect='PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" %command%')
+        self.roundtrip("", expect='PROTON_FORCE_NVAPI=1 DU_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" %command%')
 
     def test_args_without_command(self):
         self.roundtrip("-dx12 -skipintro",
-                       expect='PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" %command% -dx12 -skipintro')
+                       expect='PROTON_FORCE_NVAPI=1 DU_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" %command% -dx12 -skipintro')
 
     def test_wrapper(self):
         self.roundtrip("gamemoderun %command% -foo",
-                       expect='PROTON_FORCE_NVAPI=1 AISS_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" gamemoderun %command% -foo')
+                       expect='PROTON_FORCE_NVAPI=1 DU_LAYER=1 WINEDLLOVERRIDES="dxgi=n,b" gamemoderun %command% -foo')
 
     def test_existing_wdo_framegen_style(self):
         new, _ = self.roundtrip("WINEDLLOVERRIDES=dxgi=n,b SteamDeck=0 %command%", shim="dbghelp")
@@ -143,7 +144,7 @@ class LaunchOptionTests(unittest.TestCase):
         new, rec = build_launch_options("", "dxgi", S0, None)
         s2 = {"log": 2}
         new2, rec2 = build_launch_options(new, "dxgi", s2, rec)
-        self.assertEqual(new2, 'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_LOG=2 '
+        self.assertEqual(new2, 'PROTON_FORCE_NVAPI=1 DU_LAYER=1 DU_LOG=2 '
                                'WINEDLLOVERRIDES="dxgi=n,b" %command%')
         new3, rec3 = build_launch_options(new2, "dxgi", S0, rec2)
         self.assertEqual(new3, new)
@@ -221,7 +222,7 @@ def tree_digest(root: Path) -> dict:
 
 class FakeLibraryTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="aiss-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="deckyupscaler-test-"))
         self.bin = bin_dir(self.tmp)
         self.home = self.tmp / "home"
         self.steam = self.home / ".local/share/Steam"
@@ -281,7 +282,7 @@ class FakeLibraryTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def make_core(self, bin_dir=None):
-        return AissCore(home=self.home, bin_dir=bin_dir or self.bin, state_file=self.tmp / "settings/state.json",
+        return UpscalerCore(home=self.home, bin_dir=bin_dir or self.bin, state_file=self.tmp / "settings/state.json",
                         steam_roots=[self.steam], logger=Quiet(), running_check=lambda a: a in self.running)
 
     # helpers
@@ -344,19 +345,20 @@ class FakeLibraryTests(unittest.TestCase):
             # XeSS (Intel's binary) and FSR 4 (AMD's) go next to the core, unmodified
             self.assertEqual((p / "drive_c/windows/system32/libxess.dll").read_bytes(),
                              (self.bin / "libxess.dll").read_bytes())
-            # AMD's FSR 4 DLL goes in a private system32/aiss subfolder (Proton's own amdxcffx64 in system32 can't
-            # shadow it); the Vulkan DLL is no longer installed
-            dst = p / "drive_c/windows/system32/aiss/amdxcffx64.dll"
+            # AMD's FSR 4 DLL goes in a private system32/deckyupscaler subfolder (Proton's own amdxcffx64 in system32
+            # can't shadow it); the Vulkan DLL is no longer installed
+            dst = p / "drive_c/windows/system32/deckyupscaler/amdxcffx64.dll"
             if (self.bin / "amdxcffx64.dll").is_file():
                 self.assertEqual(sha256_of(dst), sha256_of(self.bin / "amdxcffx64.dll"))
             else:
                 self.assertFalse(dst.exists())
-            self.assertFalse((p / "drive_c/windows/system32/aiss/amdvkffx64.dll").exists())
+            self.assertFalse((p / "drive_c/windows/system32/deckyupscaler/amdvkffx64.dll").exists())
             self.assertTrue(reg_has_value((p / "system.reg").read_text(), REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01"))
-            self.assertEqual((p / "system.reg.aiss-bak").read_text(), REG_SAMPLE)
-        self.assertTrue((self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll.aiss-orig").exists())
-        self.assertTrue((self.layer / "libVkLayer_aiss_ngx.so").exists())
-        self.assertTrue((self.layer / "VkLayer_aiss_ngx.json").exists())
+            self.assertEqual((p / "system.reg.deckyupscaler-bak").read_text(), REG_SAMPLE)
+        self.assertTrue((self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll.deckyupscaler-orig")
+                        .exists())
+        self.assertTrue((self.layer / "libVkLayer_deckyupscaler.so").exists())
+        self.assertTrue((self.layer / "VkLayer_deckyupscaler.json").exists())
         # install again: idempotent
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
         # state survives a restart
@@ -369,17 +371,17 @@ class FakeLibraryTests(unittest.TestCase):
         for k, digest in self.before_games.items():
             self.assertEqual(tree_digest(c / k), digest, f"{k} not restored")
         after = tree_digest(self.steam / "steamapps/compatdata")
-        after = {k: v for k, v in after.items() if not k.endswith(".aiss-bak")}
+        after = {k: v for k, v in after.items() if not k.endswith(".deckyupscaler-bak")}
         self.assertEqual(after, self.before_pfx, "prefixes not restored")
         self.core.remove_layer()
-        self.assertFalse((self.layer / "libVkLayer_aiss_ngx.so").exists())
+        self.assertFalse((self.layer / "libVkLayer_deckyupscaler.so").exists())
 
     def test_xess_dll_foreign_kept_and_old_install_repaired(self):
         sys32 = self.pfx(self.steam, "1001") / "drive_c/windows/system32"
         self.put(sys32 / "libxess.dll", b"MZ a game's own libxess")
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
         self.assertEqual((sys32 / "libxess.dll").read_bytes(), (self.bin / "libxess.dll").read_bytes())
-        self.assertEqual((sys32 / "libxess.dll.aiss-orig").read_bytes(), b"MZ a game's own libxess")
+        self.assertEqual((sys32 / "libxess.dll.deckyupscaler-orig").read_bytes(), b"MZ a game's own libxess")
         # an install from before XeSS was bundled (no libxess.dll recorded) is repaired by verify_all
         gs = self.core.state["games"]["1001"]
         (sys32 / "libxess.dll").unlink()
@@ -394,7 +396,7 @@ class FakeLibraryTests(unittest.TestCase):
 
     def test_fsr4_dll_private_subfolder_optional_and_legacy_removed(self):
         sys32 = self.pfx(self.steam, "1001") / "drive_c/windows/system32"
-        aiss  = sys32 / "aiss"
+        sub   = sys32 / "deckyupscaler"
         # a bundle with the AMD DLL (the build skips it when it cannot find it locally)
         withfsr = self.tmp / "bin_fsr4"
         withfsr.mkdir()
@@ -407,33 +409,36 @@ class FakeLibraryTests(unittest.TestCase):
             (withfsr / "amdxcffx64.dll").write_bytes(b"MZ stand-in for AMD amdxcffx64.dll")
         (withfsr / "amd_fidelityfx_upscaler_vk.dll").write_bytes(b"MZ stand-in for AMD's FSR SDK Vulkan upscaler")
         (withfsr / "amd_fidelityfx-LICENSE.md").write_text("AMD FSR SDK licence stand-in")
-        (withfsr / "fsr4_shaders.bin").write_bytes(b"AISSSPV1\0\0\0\0")
-        (withfsr / "fsr4_shaders_dot2.bin").write_bytes(b"AISSSPV1\0\0\0\0")
-        # Proton's own amdxcffx64 sits in system32; ours must land in the private aiss subfolder, not shadow it
+        (withfsr / "fsr4_shaders.bin").write_bytes(b"DUSPACK1\0\0\0\0")
+        (withfsr / "fsr4_shaders_dot2.bin").write_bytes(b"DUSPACK1\0\0\0\0")
+        # Proton's own amdxcffx64 sits in system32; ours must land in the private deckyupscaler subfolder, not shadow it
         self.put(sys32 / "amdxcffx64.dll", b"MZ proton builtin amdxcffx64 4.1.1")
         self.core = self.make_core(bin_dir=withfsr)
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
-        self.assertEqual(sha256_of(aiss / "amdxcffx64.dll"), sha256_of(withfsr / "amdxcffx64.dll"))
+        self.assertEqual(sha256_of(sub / "amdxcffx64.dll"), sha256_of(withfsr / "amdxcffx64.dll"))
         for name in ("amd_fidelityfx_upscaler_vk.dll", "fsr4_shaders.bin", "fsr4_shaders_dot2.bin"):  # the Vulkan FSR 4 path's files
-            self.assertEqual(sha256_of(aiss / name), sha256_of(withfsr / name))
-        self.assertFalse((aiss / "amd_fidelityfx-LICENSE.md").exists())  # the licence stays with the plugin
+            self.assertEqual(sha256_of(sub / name), sha256_of(withfsr / name))
+        self.assertFalse((sub / "amd_fidelityfx-LICENSE.md").exists())  # the licence stays with the plugin
         self.assertEqual((sys32 / "amdxcffx64.dll").read_bytes(), b"MZ proton builtin amdxcffx64 4.1.1")  # untouched
         self.assertTrue(self.core.bundle_info()["fsr4"])
-        # an earlier build also installed aiss/amdvkffx64.dll: removed on the next install (upgrade) ...
-        old = aiss / "amdvkffx64.dll"
-        old.write_bytes(b"MZ old amdvkffx64")
+        # an earlier build (still named aiss-dlss-nss) also installed aiss/amdvkffx64.dll: removed on the next install
+        # (upgrade) with its folder ...
+        old = sys32 / "aiss/amdvkffx64.dll"
+        self.put(old, b"MZ old amdvkffx64")
         gs = self.core.state["games"]["1001"]
         gs["fsr4_path"], gs["fsr4_hash"] = str(old), sha256_of(old)
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
         self.assertFalse(old.exists())
+        self.assertFalse(old.parent.exists())
         self.assertNotIn("fsr4_path", self.core.state["games"]["1001"])
         # ... and on uninstall
-        old.write_bytes(b"MZ old amdvkffx64")
+        self.put(old, b"MZ old amdvkffx64")
         gs = self.core.state["games"]["1001"]
         gs["fsr4_path"], gs["fsr4_hash"] = str(old), sha256_of(old)
         self.core.uninstall_game("1001")
         self.assertFalse(old.exists())
-        self.assertFalse(aiss.exists())  # the private subfolder is removed on uninstall
+        self.assertFalse(old.parent.exists())
+        self.assertFalse(sub.exists())  # the private subfolder is removed on uninstall
         self.assertEqual((sys32 / "amdxcffx64.dll").read_bytes(), b"MZ proton builtin amdxcffx64 4.1.1")
         (sys32 / "amdxcffx64.dll").unlink()
         # a later bundle without the shader packs (FSR 4 on AMD's own shaders): reinstalling removes the packs it had put
@@ -446,12 +451,12 @@ class FakeLibraryTests(unittest.TestCase):
                 os.symlink(f.resolve(), nopacks / f.name)
         self.core = self.make_core(bin_dir=nopacks)
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
-        self.assertFalse((aiss / "fsr4_shaders.bin").exists())
-        self.assertFalse((aiss / "fsr4_shaders_dot2.bin").exists())
-        self.assertTrue((aiss / "amd_fidelityfx_upscaler_vk.dll").exists())
+        self.assertFalse((sub / "fsr4_shaders.bin").exists())
+        self.assertFalse((sub / "fsr4_shaders_dot2.bin").exists())
+        self.assertTrue((sub / "amd_fidelityfx_upscaler_vk.dll").exists())
         self.assertNotIn("fsr4_shaders_path", self.core.state["games"]["1001"])
         self.core.uninstall_game("1001")
-        self.assertFalse(aiss.exists())
+        self.assertFalse(sub.exists())
         # a bundle built without the AMD DLL: not reported missing, nothing installed for it, games still "installed"
         nofsr = self.tmp / "bin_nofsr4"
         nofsr.mkdir()
@@ -462,7 +467,7 @@ class FakeLibraryTests(unittest.TestCase):
         self.assertEqual(self.core.bundle_missing(), [])
         self.assertFalse(self.core.bundle_info()["fsr4"])
         self.assertEqual(self.core.install_game("1001")["status"], "installed")
-        self.assertFalse(aiss.exists())
+        self.assertFalse(sub.exists())
         self.assertEqual(self.view("1001")["status"], "installed")
         self.core.uninstall_game("1001")
         self.assertFalse((sys32 / "_nvngx.dll").exists())
@@ -508,7 +513,7 @@ class FakeLibraryTests(unittest.TestCase):
                      "amd_fidelityfx_upscaler_dx12.original.dll", "helixsr-install.json", "amd_fidelityfx_vk.dll.b"):
             self.assertFalse((g / name).exists(), name)
         self.assertEqual((g / "amd_fidelityfx_vk.dll").read_bytes(), b"MZ game original")
-        archived = list((g / ".aiss-optiscaler-removed").iterdir())  # moved aside, not deleted
+        archived = list((g / ".deckyupscaler-optiscaler-removed").iterdir())  # moved aside, not deleted
         self.assertEqual(len(archived), 1)
         self.assertEqual((archived[0] / "winmm.dll").read_bytes(), b"MZ OptiScaler injector")
         self.assertEqual((archived[0] / "libxess.dll").read_bytes(), b"MZ framegen copy")
@@ -538,23 +543,38 @@ class FakeLibraryTests(unittest.TestCase):
         b.mkdir()
         for f in self.bin.iterdir():
             os.symlink(f.resolve(), b / f.name)
-        shutil.copy(fwd, b / "aiss_ffx_vk.dll")
+        shutil.copy(fwd, b / "deckyupscaler_ffx_vk.dll")
         self.core = self.make_core(bin_dir=b)
         ffx = self.steam / "steamapps/common/DoomLike/amd-ffx"
         self.put(ffx / "amd_fidelityfx_vk.dll", b"MZ AMD ffx")
         r = self.core.install_game("1006")
         self.assertTrue(r["ok"], r)
         self.assertEqual((ffx / "amd_fidelityfx_vk.dll").read_bytes(), fwd.read_bytes())
-        self.assertEqual((ffx / "amd_fidelityfx_vk.aiss-orig.dll").read_bytes(), b"MZ AMD ffx")
+        self.assertEqual((ffx / "amd_fidelityfx_vk.deckyupscaler-orig.dll").read_bytes(), b"MZ AMD ffx")
         self.assertEqual(self.view("1006")["status"], "installed")
         # a game update brings a new AMD DLL under the forwarder's name: it becomes the kept original
         (ffx / "amd_fidelityfx_vk.dll").write_bytes(b"MZ AMD ffx v2")
         self.core.verify_all()
         self.assertEqual((ffx / "amd_fidelityfx_vk.dll").read_bytes(), fwd.read_bytes())
-        self.assertEqual((ffx / "amd_fidelityfx_vk.aiss-orig.dll").read_bytes(), b"MZ AMD ffx v2")
+        self.assertEqual((ffx / "amd_fidelityfx_vk.deckyupscaler-orig.dll").read_bytes(), b"MZ AMD ffx v2")
         self.core.uninstall_game("1006")
         self.assertEqual((ffx / "amd_fidelityfx_vk.dll").read_bytes(), b"MZ AMD ffx v2")
-        self.assertFalse((ffx / "amd_fidelityfx_vk.aiss-orig.dll").exists())
+        self.assertFalse((ffx / "amd_fidelityfx_vk.deckyupscaler-orig.dll").exists())
+
+    def test_id_tech_launcher_bypassed(self):
+        g = self.steam / "steamapps/common/DoomLike"
+        self.put(g / "idTechLauncher.exe")
+        self.assertTrue(self.core.install_game("1006")["ok"])
+        lo = self.core.launch_options("1006", "-skipintro", True)
+        self.assertTrue(lo["ok"])
+        self.assertIn("""bash -c 'exec "${@/idTechLauncher.exe/DoomLike.exe}"' -- %command% -skipintro""", lo["options"])
+        again = self.core.launch_options("1006", lo["options"], True)  # idempotent
+        self.assertEqual(again["options"], lo["options"])
+        off = self.core.launch_options("1006", lo["options"], False)
+        self.assertEqual(off["options"], "-skipintro")
+        # games without a launcher get no wrapper
+        self.assertTrue(self.core.install_game("1002")["ok"])
+        self.assertNotIn("bash -c", self.core.launch_options("1002", "", True)["options"])
 
     def test_prefix_created_later(self):
         r = self.core.install_game("1004")
@@ -628,11 +648,11 @@ class FakeLibraryTests(unittest.TestCase):
 
     def test_layer_not_ours_untouched(self):
         self.layer.mkdir(parents=True)
-        (self.layer / "libVkLayer_aiss_ngx.so").write_bytes(b"dev build")
+        (self.layer / "libVkLayer_deckyupscaler.so").write_bytes(b"dev build")
         r = self.core.install_game("1002")
         self.assertIn("left untouched", r["message"])
-        self.assertEqual((self.layer / "libVkLayer_aiss_ngx.so").read_bytes(), b"dev build")
-        self.assertTrue((self.layer / "VkLayer_aiss_ngx.json").exists())
+        self.assertEqual((self.layer / "libVkLayer_deckyupscaler.so").read_bytes(), b"dev build")
+        self.assertTrue((self.layer / "VkLayer_deckyupscaler.json").exists())
 
     def test_streamline_game_importing_dxgi_gets_dxgi(self):
         # Unreal + Streamline (e.g. STAR WARS Galactic Racer): Unreal preloads its own dbghelp.dll, so the shim must
@@ -661,9 +681,9 @@ class FakeLibraryTests(unittest.TestCase):
 
     def test_launch_options_flow_and_settings(self):
         self.core.install_game("1002")
-        control = self.home / ".local/share/aiss-dlss-nss/control"
+        control = self.home / ".local/share/deckyupscaler/control"
         lo = self.core.launch_options("1002", "-novid", True)
-        self.assertEqual(lo["options"], f'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_CONTROL={control} '
+        self.assertEqual(lo["options"], f'PROTON_FORCE_NVAPI=1 DU_LAYER=1 DU_CONTROL={control} '
                                         'WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
         # The control file: a legacy first line "<upscaler> <fast_math> <capture>", then key=value lines. Old proxies
         # read the first line; new ones also read the keys. Everything switches live, not through the launch options.
@@ -735,14 +755,171 @@ class FakeLibraryTests(unittest.TestCase):
         (cap / "000_output.raw").write_bytes(b"x")
         self.assertEqual(self.core.latest_capture()["frames"], 1)
         self.core.set_settings({"upscaler": 0, "watermark": 0, "gpu_timing": 0, "xess_quality": 0})
-        # AISS_RATIO / AISS_NSS_QUALITY left over from older plugin versions are removed on the next sync.
-        old = lo["options"].replace("AISS_LAYER=1", "AISS_LAYER=1 AISS_RATIO=2.0 AISS_NSS_QUALITY=0")
+        # What the plugin wrote under its former name (AISS_RATIO / AISS_NSS_QUALITY in early versions) is removed on
+        # the next sync; the user's own DU_ variables stay.
+        old = lo["options"].replace("DU_LAYER=1", "AISS_LAYER=1 AISS_RATIO=2.0 AISS_NSS_QUALITY=0 DU_RATIO=1.5")
         lo2 = self.core.launch_options("1002", old, True)
-        self.assertEqual(lo2["options"], f'PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_CONTROL={control} '
-                                         'AISS_LOG=0 WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
+        self.assertEqual(lo2["options"], f'PROTON_FORCE_NVAPI=1 DU_LAYER=1 DU_CONTROL={control} '
+                                         'DU_LOG=0 WINEDLLOVERRIDES="dbghelp=n,b" DU_RATIO=1.5 %command% -novid')
         self.core = self.make_core()  # ownership record persisted
         off = self.core.launch_options("1002", lo2["options"], False)
-        self.assertEqual(off["options"], "-novid")
+        self.assertEqual(off["options"], "DU_RATIO=1.5 %command% -novid")
+
+    # ---- the plugin's former name (aiss-dlss-nss) -----------------------------------------------------------------
+    def old_install(self) -> dict:
+        """Games 1002 and 1006 as the plugin left them under its former name: its builds under the old names and
+        markers, its backups with the old suffixes, its FSR 4 files in system32/aiss, its layer, and its state file in
+        <settings>/aiss-dlss-nss/. Returns the old state."""
+        c = self.steam / "steamapps/common"
+        games = {g["appid"]: g for g in self.core.scan(force=True)}
+        old_shim = b"MZ old shim " + "AISS_SIGNED_DLL".encode("utf-16-le")
+        state = {"version": 1, "games": {}, "layer": {"files": {}},
+                 "settings": {"upscaler": 3, "nss_quality": 2, "fsr4_model": 1, "log": 2}}
+        for appid in ("1002", "1006"):
+            sys32 = self.pfx(self.steam, appid) / "drive_c/windows/system32"
+            gs = {"enabled": True, "name": games[appid]["name"], "shim": "dbghelp", "targets": games[appid]["targets"],
+                  "install_path": games[appid]["install_path"], "files": {}, "message": ""}
+            for t in games[appid]["targets"]:
+                self.put(Path(t) / "dbghelp.dll", old_shim)
+                gs["files"][str(Path(t) / "dbghelp.dll")] = sha256_of(Path(t) / "dbghelp.dll")
+            for sk, rel, data in (("core", "_nvngx.dll", b"MZ old core AISS_RATIO"),
+                                  ("xess", "libxess.dll", b"MZ old libxess"),
+                                  ("fsr4_dx12", "aiss/amdxcffx64.dll", b"MZ old amdxcffx64"),
+                                  ("fsr4_shaders", "aiss/fsr4_shaders.bin", b"AISSSPV1 old pack")):
+                if sk == "core" and (sys32 / rel).exists():  # 1002's own core, kept by the old plugin
+                    os.replace(sys32 / rel, sys32 / (rel + ".aiss-orig"))
+                    gs["core_backup"] = str(sys32 / (rel + ".aiss-orig"))
+                self.put(sys32 / rel, data)
+                gs[f"{sk}_path"], gs[f"{sk}_hash"] = str(sys32 / rel), sha256_of(sys32 / rel)
+            reg = self.pfx(self.steam, appid) / "system.reg"
+            (reg.parent / "system.reg.aiss-bak").write_text(REG_SAMPLE)
+            reg.write_text(reg_set_value(REG_SAMPLE, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01")[0])
+            gs.update(reg_added=True, reg_created_key=True, reg_pending=False, reg_path=str(reg))
+            state["games"][appid] = gs
+        # 1006 also has a game FSR (amd_fidelityfx_vk.dll): the old forwarder, AMD's DLL kept under the old name
+        ffx = c / "DoomLike/amd-ffx"
+        self.put(ffx / "amd_fidelityfx_vk.dll", b"MZ old forwarder AISS_FfxForwarderVersion")
+        self.put(ffx / "amd_fidelityfx_vk.aiss-orig.dll", b"MZ AMD ffx")
+        state["games"]["1006"]["ffx_files"] = {str(ffx / "amd_fidelityfx_vk.dll"): "0" * 64}
+        state["games"]["1002"]["launch"] = {
+            "shim": "dbghelp", "command_added": True, "nvapi_added": True, "wdo_changed": True,
+            "wdo_new_value": "dbghelp=n,b", "wdo_orig_token": None, "wdo_prev_present": False, "wdo_prev_mode": None}
+        # the old layer: the .so as recorded, the manifest recognised by its layer name only
+        self.put(self.layer / "libVkLayer_aiss_ngx.so", b"\x7fELF old layer VK_LAYER_AISS_ngx")
+        self.put(self.layer / "VkLayer_aiss_ngx.json", b'{"layer": {"name": "VK_LAYER_AISS_ngx"}}')
+        state["layer"]["files"][str(self.layer / "libVkLayer_aiss_ngx.so")] = \
+            sha256_of(self.layer / "libVkLayer_aiss_ngx.so")
+        old_state = self.tmp / "aiss-dlss-nss/state.json"
+        old_state.parent.mkdir(parents=True)
+        old_state.write_text(json.dumps(state))
+        return state
+
+    def migration_bundle(self) -> Path:
+        """This bundle plus a stand-in FFX forwarder (with the current marker)."""
+        b = self.tmp / "bin_migration"
+        b.mkdir()
+        for f in self.bin.iterdir():
+            os.symlink(f.resolve(), b / f.name)
+        (b / "deckyupscaler_ffx_vk.dll").write_bytes(b"MZ new forwarder " + core.FFX_MARKER)
+        return b
+
+    def test_migration_from_old_plugin(self):
+        old_state = self.old_install()
+        old_text = (self.tmp / "aiss-dlss-nss/state.json").read_bytes()
+        bundle = self.migration_bundle()
+        c = self.steam / "steamapps/common"
+        self.core = self.make_core(bin_dir=bundle)
+        # 1. the old state is imported on the first start (and saved as ours), the old file left as it was
+        self.assertTrue((self.tmp / "settings/state.json").is_file())
+        self.assertEqual((self.tmp / "aiss-dlss-nss/state.json").read_bytes(), old_text)
+        st = self.core.state
+        self.assertEqual(sorted(a for a, g in st["games"].items() if g["enabled"]), ["1002", "1006"])
+        self.assertEqual((st["settings"]["upscaler"], st["settings"]["nss_quality"], st["settings"]["log"]), (3, 2, 2))
+        self.assertEqual(st["games"]["1002"]["launch"], old_state["games"]["1002"]["launch"])
+        self.assertEqual(st["games"]["1002"]["core_backup"], old_state["games"]["1002"]["core_backup"])
+        gs = st["games"]["1006"]
+        self.assertNotIn("fsr4_dx12_path", gs)  # system32/aiss paths became legacy records
+        self.assertEqual(sorted(Path(p).name for p in gs["legacy_files"]), ["amdxcffx64.dll", "fsr4_shaders.bin"])
+        self.assertEqual(st["layer"]["files"], {})
+        self.assertIn(str(self.layer / "libVkLayer_aiss_ngx.so"), st["layer"]["legacy_files"])
+        # 2. the old builds count as ours: an upgrade to repair, not a conflict
+        for a in ("1002", "1006"):
+            self.assertEqual(self.view(a)["status"], "needs_repair")
+        res = self.core.verify_all()
+        self.assertEqual(sorted((r["appid"], r["status"]) for r in res), [("1002", "installed"), ("1006", "installed")])
+        for a in ("1002", "1006"):
+            self.assertEqual(self.view(a)["status"], "installed")
+            sys32 = self.pfx(self.steam, a) / "drive_c/windows/system32"
+            self.assertEqual(sha256_of(sys32 / "_nvngx.dll"), sha256_of(bundle / "nvngx.dll"))
+            self.assertEqual(sha256_of(sys32 / "libxess.dll"), sha256_of(bundle / "libxess.dll"))
+            # 3. the old FSR 4 folder is gone, the files are in the new one
+            self.assertFalse((sys32 / "aiss").exists())
+            if (bundle / "amdxcffx64.dll").is_file():
+                self.assertEqual(sha256_of(sys32 / "deckyupscaler/amdxcffx64.dll"), sha256_of(bundle / "amdxcffx64.dll"))
+            # the old backups are reused, not doubled
+            self.assertFalse((sys32 / "_nvngx.dll.deckyupscaler-orig").exists())
+            self.assertFalse((sys32.parent.parent.parent / "system.reg.deckyupscaler-bak").exists())
+        self.assertEqual((self.pfx(self.steam, "1002") / "drive_c/windows/system32/_nvngx.dll.aiss-orig").read_bytes(),
+                         b"MZ someone else's core")
+        for t in self.core.state["games"]["1006"]["targets"]:
+            self.assertEqual(sha256_of(Path(t) / "dbghelp.dll"), sha256_of(bundle / "dbghelp.dll"))
+        ffx = c / "DoomLike/amd-ffx"
+        self.assertEqual((ffx / "amd_fidelityfx_vk.dll").read_bytes(), (bundle / "deckyupscaler_ffx_vk.dll").read_bytes())
+        self.assertEqual((ffx / "amd_fidelityfx_vk.deckyupscaler-orig.dll").read_bytes(), b"MZ AMD ffx")
+        self.assertFalse((ffx / "amd_fidelityfx_vk.aiss-orig.dll").exists())
+        self.assertFalse((self.layer / "libVkLayer_aiss_ngx.so").exists())
+        self.assertFalse((self.layer / "VkLayer_aiss_ngx.json").exists())
+        self.assertTrue((self.layer / "libVkLayer_deckyupscaler.so").exists())
+        self.assertNotIn("legacy_files", self.core.state["layer"])
+        self.assertNotIn("legacy_files", self.core.state["games"]["1006"])
+        self.assertEqual(self.core.verify_all(), [])  # done: nothing more to repair
+        # 4. launch options: the old managed variables give way to the new ones
+        old_lo = ('PROTON_FORCE_NVAPI=1 AISS_LAYER=1 AISS_CONTROL=/home/deck/.local/share/aiss-dlss-nss/control '
+                  'AISS_LOG=2 WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
+        lo = self.core.launch_options("1002", old_lo, True)["options"]
+        control = self.home / ".local/share/deckyupscaler/control"
+        self.assertEqual(lo, f'PROTON_FORCE_NVAPI=1 DU_LAYER=1 DU_CONTROL={control} DU_LOG=2 '
+                             'WINEDLLOVERRIDES="dbghelp=n,b" %command% -novid')
+        self.assertEqual(self.core.launch_options("1002", lo, False)["options"], "-novid")
+        # uninstall puts back what the old plugin backed up, under its old names
+        self.core.uninstall_game("1002")
+        sys32 = self.pfx(self.steam, "1002") / "drive_c/windows/system32"
+        self.assertEqual((sys32 / "_nvngx.dll").read_bytes(), b"MZ someone else's core")
+        self.assertFalse((sys32 / "_nvngx.dll.aiss-orig").exists())
+        self.assertEqual((self.pfx(self.steam, "1002") / "system.reg").read_text(), REG_SAMPLE)
+        self.core.uninstall_game("1006")
+        self.assertEqual((ffx / "amd_fidelityfx_vk.dll").read_bytes(), b"MZ AMD ffx")
+        # the import happens once: the next start reads its own state
+        self.core = self.make_core(bin_dir=bundle)
+        self.assertFalse(self.core.state["games"]["1002"]["enabled"])
+        self.assertEqual((self.tmp / "aiss-dlss-nss/state.json").read_bytes(), old_text)
+
+    def test_migration_leaves_what_is_not_the_old_plugins(self):
+        self.old_install()
+        bundle = self.migration_bundle()
+        sys32 = self.pfx(self.steam, "1002") / "drive_c/windows/system32"
+        # changed since the old plugin installed them: someone else's now
+        (sys32 / "aiss/amdxcffx64.dll").write_bytes(b"MZ hand-copied amdxcffx64")
+        self.put(sys32 / "aiss/readme.txt", b"user notes")
+        (self.layer / "VkLayer_aiss_ngx.json").write_text('{"layer": {"name": "VK_LAYER_other"}}')
+        self.core = self.make_core(bin_dir=bundle)
+        self.assertEqual(self.core.install_game("1002")["status"], "installed")
+        self.assertEqual((sys32 / "aiss/amdxcffx64.dll").read_bytes(), b"MZ hand-copied amdxcffx64")
+        self.assertEqual((sys32 / "aiss/readme.txt").read_bytes(), b"user notes")
+        self.assertFalse((sys32 / "aiss/fsr4_shaders.bin").exists())  # still as recorded: removed
+        self.core.verify_all()
+        self.assertTrue((self.layer / "VkLayer_aiss_ngx.json").exists())
+        self.assertFalse((self.layer / "libVkLayer_aiss_ngx.so").exists())
+        # an old-suffix backup the state does not record is restored on uninstall too
+        self.core.state["games"]["1002"].pop("core_backup")
+        self.core.uninstall_game("1002")
+        self.assertEqual((sys32 / "_nvngx.dll").read_bytes(), b"MZ someone else's core")
+        # without the old plugin's state nothing is imported
+        shutil.rmtree(self.tmp / "settings")
+        shutil.rmtree(self.tmp / "aiss-dlss-nss")
+        self.core = self.make_core(bin_dir=bundle)
+        self.assertEqual(self.core.state["games"], {})
+        self.assertFalse((self.tmp / "settings/state.json").exists())
 
     def test_settings_migration(self):
         # Saved settings from older plugins: NSS Balanced / Performance were upscaler 1 / 2, fast maths was a setting,
@@ -765,7 +942,7 @@ class FakeLibraryTests(unittest.TestCase):
         stub.logger = Quiet()
         sys.modules["decky"] = stub
         import importlib.util
-        spec = importlib.util.spec_from_file_location("aiss_main", PLUGIN / "main.py")
+        spec = importlib.util.spec_from_file_location("deckyupscaler_main", PLUGIN / "main.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         import asyncio
@@ -785,9 +962,9 @@ class RealLibraryReadOnly(unittest.TestCase):
         home = Path("/home/deck")
         if not (home / ".local/share/Steam/steamapps/libraryfolders.vdf").exists():
             self.skipTest("no Steam library")
-        tmp = Path(tempfile.mkdtemp(prefix="aiss-real-"))
+        tmp = Path(tempfile.mkdtemp(prefix="deckyupscaler-real-"))
         try:
-            c = AissCore(home=home, bin_dir=bin_dir(tmp), state_file=tmp / "state.json",
+            c = UpscalerCore(home=home, bin_dir=bin_dir(tmp), state_file=tmp / "state.json",
                          layer_dir=tmp / "layer", logger=Quiet())
             games = c.scan(force=True)
             self.assertFalse((tmp / "state.json").exists(), "scan must not write")

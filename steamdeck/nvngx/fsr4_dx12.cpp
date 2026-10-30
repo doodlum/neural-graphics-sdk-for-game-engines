@@ -48,11 +48,11 @@ Fsr4Gpu GpuForDevice(ID3D12Device* device)
     // amdxcffx64's own GPU query is what fsr4_common answers; here we only need the family for the auto-model fallback.
     // vkd3d-proton reports the adapter's real vendor/device through DXGI, but the simplest reliable source on a Steam
     // Deck is the DRM query fsr4_common does by name, so pass the adapter description's vendor/device and let
-    // Fsr4KnownGpu map Van Gogh (its RADV-name match does not apply on D3D12, so AISS_FSR4_GPU can override).
+    // Fsr4KnownGpu map Van Gogh (its RADV-name match does not apply on D3D12, so DU_FSR4_GPU can override).
     Fsr4Gpu gpu;
     LUID     luid = device->GetAdapterLuid();
     (void)luid;
-    // Default to Van Gogh on a Steam Deck; AISS_FSR4_GPU overrides inside Fsr4KnownGpu.
+    // Default to Van Gogh on a Steam Deck; DU_FSR4_GPU overrides inside Fsr4KnownGpu.
     return Fsr4KnownGpu(0x1002, 0x1435, "VANGOGH");
 }
 
@@ -75,7 +75,7 @@ uint32_t ResourceState(bool uav)
     return uav ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS : FFX_API_RESOURCE_STATE_COMPUTE_READ;
 }
 
-// AISS_GPU_TIMING=N for the D3D12 path: a pair of GPU timestamps around the FFX dispatch on the game's command list,
+// DU_GPU_TIMING=N for the D3D12 path: a pair of GPU timestamps around the FFX dispatch on the game's command list,
 // resolved to a readback buffer and read back kSlots dispatches later (never waiting on the game's queue), averaged
 // over N dispatches. D3D12 counterpart of gpu_timing.cpp (which works on VkCommandBuffer).
 struct Dx12Timer
@@ -164,7 +164,7 @@ struct Dx12Timer
 std::mutex g_timerMutex;
 Dx12Timer  g_timer;
 
-// AISS_FSR4_DX12_PROFILE=N: GPU time of each Dispatch AMD's DLL records, averaged over N evaluations (diagnostics).
+// DU_FSR4_DX12_PROFILE=N: GPU time of each Dispatch AMD's DLL records, averaged over N evaluations (diagnostics).
 // The game's command list vtable entry for Dispatch is swapped only while the DLL records.
 struct DxPassProfiler
 {
@@ -205,7 +205,7 @@ void STDMETHODCALLTYPE ProfDxDispatch(ID3D12GraphicsCommandList* cl, UINT x, UIN
 
 void ProfDxBegin(ID3D12Device* device, ID3D12GraphicsCommandList* cmd)
 {
-    static const int every = getenv("AISS_FSR4_DX12_PROFILE") ? atoi(getenv("AISS_FSR4_DX12_PROFILE")) : 0;
+    static const int every = getenv("DU_FSR4_DX12_PROFILE") ? atoi(getenv("DU_FSR4_DX12_PROFILE")) : 0;
     if (every <= 0)
         return;
     DxPassProfiler& p = g_dxProf;
@@ -309,18 +309,18 @@ Fsr4Dx12* Fsr4Dx12::Create(ID3D12Device* device, uint32_t maxRenderW, uint32_t m
     }
 
     uint64_t backendType = kBackendDx12;
-    if (const char* v = getenv("AISS_FSR4_DX12_BACKEND"))
+    if (const char* v = getenv("DU_FSR4_DX12_BACKEND"))
         backendType = strtoull(v, nullptr, 0);
     BackendDx12Desc backend = {};
     backend.header.type     = backendType;
     backend.device          = device;
     // amdxcffx64 rejects the upscaler version desc (createContext returns
-    // ERROR_PARAMETER); on DX12 it is left out unless AISS_FSR4_DX12_VER forces a value.
+    // ERROR_PARAMETER); on DX12 it is left out unless DU_FSR4_DX12_VER forces a value.
     UpscaleVersionDesc version = {};
     version.header.type        = kUpscaleVersionDesc;
     version.version            = kUpscaleVersion;
     bool chainVersion = false;
-    if (const char* v = getenv("AISS_FSR4_DX12_VER"))
+    if (const char* v = getenv("DU_FSR4_DX12_VER"))
     {
         version.version = uint32_t(strtoul(v, nullptr, 0));
         chainVersion    = version.version != 0;

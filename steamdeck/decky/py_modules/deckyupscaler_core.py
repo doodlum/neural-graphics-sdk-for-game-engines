@@ -1,24 +1,27 @@
-"""Core logic of the AISS DLSS->NSS Decky plugin.
+"""Core logic of the DeckyUpscaler Decky plugin.
 
 Nothing here imports `decky`, so the module can be exercised standalone (see tests/test_backend.py). main.py wraps an
-`AissCore` in the Decky `Plugin` class.
+`UpscalerCore` in the Decky `Plugin` class.
 
 Per enabled game the plugin owns:
   * pfx/drive_c/windows/system32/_nvngx.dll        the NSS NGX core (a foreign file there is backed up and restored)
   * pfx/drive_c/windows/system32/libxess.dll       Intel XeSS (unmodified Intel binary), loaded by the core when the
                                                    XeSS upscaler is selected (same backup/restore rules)
-  * pfx/drive_c/windows/system32/aiss/amd_fidelityfx_upscaler_vk.dll, fsr4_shaders.bin   AMD's FSR SDK 2.4 Vulkan
-                                                   upscaler (unmodified) and replacement Lite shaders: FSR 4 for every API
-  * pfx/drive_c/windows/system32/aiss/amdxcffx64.dll   AMD FSR 4 (unmodified D3D12 driver DLL), loaded by the core for
-                                                   FSR 4 (native on D3D12 games, D3D12 interop on D3D11 games). It lives
-                                                   in a private "aiss" subfolder so Proton's own older amdxcffx64.dll in
-                                                   system32 cannot shadow it; installed only when the bundle has it.
-                                                   (Older builds also installed aiss/amdvkffx64.dll; it is removed.)
+  * pfx/drive_c/windows/system32/deckyupscaler/amd_fidelityfx_upscaler_vk.dll, fsr4_shaders.bin   AMD's FSR SDK 2.4
+                                                   Vulkan upscaler (unmodified) and replacement Lite shaders: FSR 4 for
+                                                   every API
+  * pfx/drive_c/windows/system32/deckyupscaler/amdxcffx64.dll   AMD FSR 4 (unmodified D3D12 driver DLL), loaded by the
+                                                   core for FSR 4 (native on D3D12 games, D3D12 interop on D3D11 games).
+                                                   It lives in a private "deckyupscaler" subfolder so Proton's own older
+                                                   amdxcffx64.dll in system32 cannot shadow it; installed only when the
+                                                   bundle has it.
   * <exe dir>/dbghelp.dll or <exe dir>/dxgi.dll   the loader shim (never overwrites a file that is not ours)
   * HKLM\\Software\\NVIDIA Corporation\\Global {41FCC608-...}=hex:01 in pfx/system.reg (only while the game is not
     running, with a one-time backup of system.reg)
   * its share of the Steam launch options (computed here, applied by the frontend through SteamClient)
-and once, globally, the Vulkan layer in ~/.local/share/vulkan/implicit_layer.d (inert unless AISS_LAYER=1).
+and once, globally, the Vulkan layer in ~/.local/share/vulkan/implicit_layer.d (inert unless DU_LAYER=1).
+
+The plugin was called "AISS DLSS-NSS" (aiss-dlss-nss) before; it takes over that plugin's installs (see LEGACY_*).
 """
 
 from __future__ import annotations
@@ -42,8 +45,8 @@ BIN_FILES = {
     "core": "nvngx.dll",
     "dbghelp": "dbghelp.dll",
     "dxgi": "dxgi.dll",
-    "layer_so": "libVkLayer_aiss_ngx.so",
-    "layer_json": "VkLayer_aiss_ngx.json",
+    "layer_so": "libVkLayer_deckyupscaler.so",
+    "layer_json": "VkLayer_deckyupscaler.json",
     "xess": "libxess.dll",                  # Intel XeSS SDK binary, redistributed unmodified
     "xess_license": "libxess-LICENSE.txt",  # its licence (Intel Simplified Software License), shipped with it
     "fsr4_dx12": "amdxcffx64.dll",          # AMD FSR 4 (D3D12 driver component), redistributed unmodified
@@ -51,14 +54,14 @@ BIN_FILES = {
     "fsr4_vk_license": "amd_fidelityfx-LICENSE.md",  # the FSR SDK licence, shipped with it
     "fsr4_shaders": "fsr4_shaders.bin",     # replacement FSR 4 Lite shader modules for the Vulkan path (not in the repo)
     "fsr4_shaders_dot2": "fsr4_shaders_dot2.bin",  # their v_dot2 variants, used when the device has the VALVE extension
-    "ffx_vk": "aiss_ffx_vk.dll",            # FFX forwarder: takes the place of a game's amd_fidelityfx_vk.dll
+    "ffx_vk": "deckyupscaler_ffx_vk.dll",   # FFX forwarder: takes the place of a game's amd_fidelityfx_vk.dll
 }
 # Bundle files the plugin works without (the build skips them when they are not available locally).
 OPTIONAL_BIN = ("fsr4_dx12", "fsr4_vk", "fsr4_vk_license", "fsr4_shaders", "fsr4_shaders_dot2", "ffx_vk")
 CORE_DEST_NAME = "_nvngx.dll"
 XESS_DEST_NAME = "libxess.dll"
 # AMD's FSR 4 DLLs go in a private subfolder so Proton's own amdxcffx64.dll in system32 cannot shadow them.
-FSR4_SUBDIR = "aiss"
+FSR4_SUBDIR = "deckyupscaler"
 # Files installed into each prefix's system32: (bundle key, dest path relative to system32, marker or None, state key).
 PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME, None, "xess"),
                 ("fsr4_dx12", f"{FSR4_SUBDIR}/amdxcffx64.dll", None, "fsr4_dx12"),
@@ -67,19 +70,35 @@ PREFIX_FILES = (("core", CORE_DEST_NAME, None, "core"), ("xess", XESS_DEST_NAME,
                 ("fsr4_shaders_dot2", f"{FSR4_SUBDIR}/fsr4_shaders_dot2.bin", None, "fsr4_shaders_dot2"))
 # Files earlier builds installed and this one no longer does: (state key, dest path relative to system32). They are
 # removed on install (upgrade) and uninstall when they still match what was installed.
-LEGACY_PREFIX_FILES = (("fsr4", f"{FSR4_SUBDIR}/amdvkffx64.dll"),)
-CORE_BACKUP_SUFFIX = ".aiss-orig"
-REG_BACKUP_SUFFIX = ".aiss-bak"
+LEGACY_PREFIX_FILES = (("fsr4", "aiss/amdvkffx64.dll"),)
+CORE_BACKUP_SUFFIX = ".deckyupscaler-orig"
+REG_BACKUP_SUFFIX = ".deckyupscaler-bak"
 
 # Strings every build of our binaries contains; used to recognise an older/newer build of ours that is not in the
 # manifest (e.g. one copied by hand during development) so it can be replaced instead of being reported as a conflict.
-SHIM_MARKER = "AISS_SIGNED_DLL".encode("utf-16-le")
-CORE_MARKER = b"AISS_RATIO"
-FFX_MARKER = b"AISS_FfxForwarderVersion"
+SHIM_MARKER = "DU_SIGNED_DLL".encode("utf-16-le")
+CORE_MARKER = b"DU_RATIO"
+FFX_MARKER = b"DU_FfxForwarderVersion"
 # A game's FSR (AMD FidelityFX API, Vulkan): the forwarder takes the DLL's name and sends upscaling to the proxy;
 # AMD's DLL stays next to it under FFX_VK_ORIG for everything else (and is put back on uninstall).
 FFX_VK_NAME = "amd_fidelityfx_vk.dll"
-FFX_VK_ORIG = "amd_fidelityfx_vk.aiss-orig.dll"
+FFX_VK_ORIG = "amd_fidelityfx_vk.deckyupscaler-orig.dll"
+
+# The plugin's former name. Its installs are taken over: its state is imported once (never written), files of its
+# builds count as ours (their markers), the backups it made are restored on uninstall, and the files it put under its
+# old names are removed while they are still what it installed.
+LEGACY_PLUGIN = "aiss-dlss-nss"
+LEGACY_FSR4_SUBDIR = "aiss"
+LEGACY_CORE_BACKUP_SUFFIX = ".aiss-orig"
+LEGACY_REG_BACKUP_SUFFIX = ".aiss-bak"
+LEGACY_FFX_VK_ORIG = "amd_fidelityfx_vk.aiss-orig.dll"
+LEGACY_LAYER_FILES = ("libVkLayer_aiss_ngx.so", "VkLayer_aiss_ngx.json")
+LEGACY_LAYER_NAME = b"VK_LAYER_AISS_ngx"  # in both of its layer files
+LEGACY_PROXY_LOG = "aiss_nvngx.log"
+# Every marker (current build first) that identifies a build of ours.
+SHIM_MARKERS = (SHIM_MARKER, "AISS_SIGNED_DLL".encode("utf-16-le"))
+CORE_MARKERS = (CORE_MARKER, b"AISS_RATIO")
+FFX_MARKERS = (FFX_MARKER, b"AISS_FfxForwarderVersion")
 
 SIG_OVERRIDE_VALUE = "{41FCC608-8496-4DEF-B43E-7D9BD675A6FF}"
 REG_KEY_PATH = "Software\\NVIDIA Corporation\\Global"  # relative to HKLM, as Wine stores it in system.reg
@@ -99,9 +118,10 @@ BAD_EXE_SUBSTRINGS = (
 )
 
 # Launch options
-MANAGED_ENV = ("AISS_LAYER", "AISS_RATIO", "AISS_NSS_QUALITY", "AISS_LOG", "AISS_CONTROL")  # always owned by the plugin
-# AISS_RATIO and AISS_NSS_QUALITY are no longer written (the model is chosen live through AISS_CONTROL); they stay
-# managed so older launch options lose them on the next sync.
+MANAGED_ENV = ("DU_LAYER", "DU_LOG", "DU_CONTROL",  # always owned by the plugin
+               # what the plugin wrote under its former name (AISS_RATIO and AISS_NSS_QUALITY only in early versions:
+               # the model is chosen live through the control file), so older launch options lose them on the next sync
+               "AISS_LAYER", "AISS_RATIO", "AISS_NSS_QUALITY", "AISS_LOG", "AISS_CONTROL")
 NVAPI_ENV = "PROTON_FORCE_NVAPI"
 WDO_ENV = "WINEDLLOVERRIDES"
 COMMAND = "%command%"
@@ -115,8 +135,8 @@ DEFAULT_SETTINGS = {
     "watermark": 0,      # 1 = draw AMD's FSR 4 version/network banner on the output
     "dilate_mv": 0,      # 1 = dilate motion vectors by nearest depth ahead of FSR 4 / FSR 3.1
     "xess_quality": 0,   # XeSS preset override: 0 = from the render scale, else 100-105 (Ultra Perf .. AA)
-    "gpu_timing": 0,     # 1 = log the GPU time of each upscale (AISS_GPU_TIMING)
-    "log": 1,            # AISS_LOG level 0-4; 1 is the core's default
+    "gpu_timing": 0,     # 1 = log the GPU time of each upscale (DU_GPU_TIMING)
+    "log": 1,            # DU_LOG level 0-4; 1 is the core's default
 }
 # FSR 4 model (setting value) -> control-file upscaler code (4 Lite, 5 INT8, 6 INT8 RDNA 2, 8 Auto).
 FSR4_MODEL_TO_CODE = {0: 8, 1: 4, 2: 5, 3: 6}
@@ -163,13 +183,13 @@ STATUS_PARTIAL = "needs_repair"
 
 class Logger:
     def info(self, msg):  # pragma: no cover - replaced by decky.logger
-        print("[aiss] " + msg)
+        print("[deckyupscaler] " + msg)
 
     def warning(self, msg):  # pragma: no cover
-        print("[aiss] WARN " + msg)
+        print("[deckyupscaler] WARN " + msg)
 
     def error(self, msg):  # pragma: no cover
-        print("[aiss] ERROR " + msg)
+        print("[deckyupscaler] ERROR " + msg)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -184,12 +204,15 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def file_contains(path: Path, marker: bytes, limit: int = 64 << 20) -> bool:
+def file_contains(path: Path, marker: bytes | tuple[bytes, ...], limit: int = 64 << 20) -> bool:
+    """Whether the file holds the marker (or any of several)."""
+    markers = (marker,) if isinstance(marker, bytes) else marker
     try:
         if path.stat().st_size > limit:
             return False
         with open(path, "rb") as f:
-            return marker in f.read()
+            data = f.read()
+        return any(m in data for m in markers)
     except OSError:
         return False
 
@@ -197,7 +220,7 @@ def file_contains(path: Path, marker: bytes, limit: int = 64 << 20) -> bool:
 def atomic_copy(src: Path, dst: Path) -> None:
     """Copy via a temp file in the destination folder + rename, so a running game never sees a half-written DLL."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".aiss-", dir=str(dst.parent))
+    fd, tmp = tempfile.mkstemp(prefix=".deckyupscaler-", dir=str(dst.parent))
     os.close(fd)
     try:
         shutil.copyfile(src, tmp)
@@ -212,7 +235,7 @@ def atomic_copy(src: Path, dst: Path) -> None:
 
 
 def atomic_write_text(path: Path, text: str) -> None:
-    fd, tmp = tempfile.mkstemp(prefix=".aiss-", dir=str(path.parent))
+    fd, tmp = tempfile.mkstemp(prefix=".deckyupscaler-", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
             f.write(text)
@@ -458,11 +481,11 @@ OPTI_SUPPORT = ("libxess.dll", "libxess_dx11.dll", "libxess_fg.dll", "libxell.dl
                 "amd_fidelityfx_framegeneration_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_vk.dll",
                 "amdxcffx64.dll", "amdxc64.dll", "d3dcompiler_47.dll")
 OPTI_BACKUP = ".b"  # Decky Framegen's suffix for the game files it replaced
-OPTI_ARCHIVE = ".aiss-optiscaler-removed"  # per game folder, one timestamped subfolder per removal
+OPTI_ARCHIVE = ".deckyupscaler-optiscaler-removed"  # per game folder, one timestamped subfolder per removal
 
 
 def _is_optiscaler(path: Path) -> bool:
-    return path.is_file() and not file_contains(path, SHIM_MARKER) and file_contains(path, OPTI_MARKER)
+    return path.is_file() and not file_contains(path, SHIM_MARKERS) and file_contains(path, OPTI_MARKER)
 
 
 def remove_optiscaler(folders, log) -> list[str]:
@@ -541,19 +564,23 @@ def remove_optiscaler(folders, log) -> list[str]:
     return done
 
 
-PROXY_LOG = "aiss_nvngx.log"  # written by the proxy next to the running exe, rewritten on every launch
+PROXY_LOG = "deckyupscaler.log"  # written by the proxy next to the running exe, rewritten on every launch
 
 
 def last_run(exe_dir: str | None) -> dict | None:
     """Summary of the proxy's log from the game's last launch, or None if it never loaded there."""
     if not exe_dir:
         return None
-    path = os.path.join(exe_dir, PROXY_LOG)
-    try:
-        with open(path, errors="replace") as f:
-            lines = f.read().splitlines()
-        when = int(os.path.getmtime(path))
-    except OSError:
+    for name in (PROXY_LOG, LEGACY_PROXY_LOG):  # the old plugin's proxy until the game runs with the new one
+        path = os.path.join(exe_dir, name)
+        try:
+            with open(path, errors="replace") as f:
+                lines = f.read().splitlines()
+            when = int(os.path.getmtime(path))
+            break
+        except OSError:
+            continue
+    else:
         return None
     api, size, error, upscaling = None, None, None, False
     for line in lines:
@@ -567,7 +594,7 @@ def last_run(exe_dir: str | None) -> dict | None:
             upscaling = True
         for bad in ("only runs under Proton", "failed", "missing or foreign", "not found"):
             if bad in line:
-                error = line.replace("[aiss] ", "").strip()
+                error = re.sub(r"^\[(deckyupscaler|aiss)\] ", "", line).strip()
     if error:
         state, text = "error", error
     elif upscaling:
@@ -597,14 +624,24 @@ def _join_options(lead, wrappers, post, with_cmd: bool) -> str:
     return " ".join(lead + wrappers + [COMMAND] + post).strip()
 
 
+# id Tech games start through idTechLauncher.exe, whose GPU check (hardware ray tracing and 8 GB of dedicated VRAM for
+# DOOM: The Dark Ages) stops at an error dialog on a Steam Deck, which Game Mode may not even show. The game's own exe
+# runs fine, so the launch options swap the launcher's name for it in Steam's command line.
+LAUNCHERS = ("idTechLauncher.exe",)
+
+
+def launcher_wrapper(launcher: str, exe: str) -> list[str]:
+    return ["bash", "-c", f"'exec \"${{@/{launcher}/{exe}}}\"'", "--"]
+
+
 def settings_env(settings: dict) -> list[str]:
-    env = ["AISS_LAYER=1"]
+    env = ["DU_LAYER=1"]
     control = str(settings.get("control") or "")
     if control:
-        env.append(f'AISS_CONTROL="{control}"' if " " in control else f"AISS_CONTROL={control}")
+        env.append(f'DU_CONTROL="{control}"' if " " in control else f"DU_CONTROL={control}")
     log = int(settings.get("log", 1))
     if log != 1:
-        env.append(f"AISS_LOG={log}")
+        env.append(f"DU_LOG={log}")
     return env
 
 
@@ -613,6 +650,12 @@ def strip_launch_options(current: str, rec: dict) -> str:
     if not rec:
         return current
     lead, wrappers, post, has_cmd = _split_options(current)
+    added = rec.get("wrapper") or []
+    if added:
+        for i in range(len(wrappers) - len(added) + 1):
+            if wrappers[i:i + len(added)] == added:
+                wrappers = wrappers[:i] + wrappers[i + len(added):]
+                break
     shim = rec.get("shim")
     new_lead = []
     for tok in lead:
@@ -643,11 +686,16 @@ def strip_launch_options(current: str, rec: dict) -> str:
     return _join_options(new_lead, wrappers, post, has_cmd)
 
 
-def build_launch_options(current: str, shim: str, settings: dict, rec: dict | None) -> tuple[str, dict]:
-    """Merge the plugin's options into `current`. Idempotent; returns (new options, new ownership record)."""
+def build_launch_options(current: str, shim: str, settings: dict, rec: dict | None,
+                         launcher: tuple[str, str] | None = None) -> tuple[str, dict]:
+    """Merge the plugin's options into `current`. Idempotent; returns (new options, new ownership record).
+    `launcher`: (launcher exe, game exe) to start the game exe instead (LAUNCHERS)."""
     base = strip_launch_options(current, rec or {})
     lead, wrappers, post, has_cmd = _split_options(base)
     new_rec: dict = {"shim": shim, "command_added": not has_cmd}
+    if launcher:
+        new_rec["wrapper"] = launcher_wrapper(*launcher)
+        wrappers = new_rec["wrapper"] + wrappers
 
     ours = []
     if any(_env_name(t) == NVAPI_ENV for t in lead):
@@ -764,13 +812,16 @@ def reg_delete_value(text: str, key: str, name: str, drop_empty_key: bool) -> st
 # Core
 # --------------------------------------------------------------------------------------------------------------------
 
-class AissCore:
+class UpscalerCore:
     def __init__(self, *, home: Path, bin_dir: Path, state_file: Path, steam_roots: list[Path] | None = None,
                  layer_dir: Path | None = None, logger=None, proc_dir: Path = Path("/proc"),
-                 running_check: Callable[[str], bool] | None = None):
+                 running_check: Callable[[str], bool] | None = None, legacy_state_file: Path | None = None):
         self.home = Path(home)
         self.bin_dir = Path(bin_dir)
         self.state_file = Path(state_file)
+        # Decky keeps each plugin's settings in <settings>/<plugin folder>/: the old plugin's are beside ours.
+        self.legacy_state_file = Path(legacy_state_file) if legacy_state_file else \
+            self.state_file.parent.parent / LEGACY_PLUGIN / self.state_file.name
         self.steam_roots = steam_roots or [
             self.home / ".local/share/Steam",
             self.home / ".steam/steam",
@@ -782,23 +833,68 @@ class AissCore:
         self._running_check = running_check
         self._bundle_hash: dict[str, str] = {}
         self._scan_cache: dict[str, tuple[str, dict]] = {}
+        self._imported = False
         self.state = self._load_state()
+        if self._imported:
+            self.log.info(f"imported the state of {LEGACY_PLUGIN} ({len(self.state['games'])} game(s))")
+            try:
+                self.save_state()
+            except OSError as e:
+                self.log.error(f"cannot save the imported state: {e}")
 
     # ---- state ----------------------------------------------------------------------------------------------------
 
     def _load_state(self) -> dict:
         state = {"version": 1, "settings": dict(DEFAULT_SETTINGS), "games": {}, "layer": {}}
+        loaded = None
         try:
             with open(self.state_file, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            if isinstance(loaded, dict):
-                state.update({k: v for k, v in loaded.items() if k in state})
-                state["settings"] = migrate_settings({**DEFAULT_SETTINGS, **(loaded.get("settings") or {})})
         except FileNotFoundError:
-            pass
+            loaded = self._legacy_state()  # first start: take over the old plugin's installs, if any
+            self._imported = loaded is not None
         except Exception as e:
             self.log.error(f"state file unreadable ({e}); starting fresh")
+        if isinstance(loaded, dict):
+            state.update({k: v for k, v in loaded.items() if k in state})
+            state["settings"] = migrate_settings({**DEFAULT_SETTINGS, **(loaded.get("settings") or {})})
         return state
+
+    def _legacy_state(self) -> dict | None:
+        """The old plugin's state (only read), converted: the FSR 4 files it put in system32/aiss and its layer files
+        become legacy records, removed by install / verify while they still match; the rest carries over as is (its
+        backups keep their old suffix, which uninstall restores)."""
+        try:
+            with open(self.legacy_state_file, "r", encoding="utf-8") as f:
+                old = json.load(f)
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            self.log.error(f"{self.legacy_state_file} unreadable ({e}); not imported")
+            return None
+        if not isinstance(old, dict):
+            return None
+        games = {}
+        for appid, gs in (old.get("games") or {}).items():
+            if not isinstance(gs, dict):
+                continue
+            legacy = {}
+            for _, _, _, sk in PREFIX_FILES:
+                path = gs.get(f"{sk}_path")
+                if path and Path(path).parent.name == LEGACY_FSR4_SUBDIR:
+                    legacy[path] = gs.pop(f"{sk}_hash", None)
+                    for k in (f"{sk}_path", f"{sk}_backup"):
+                        gs.pop(k, None)
+            if legacy:
+                gs["legacy_files"] = legacy
+            games[str(appid)] = gs
+        layer = dict(old.get("layer") or {})
+        files = dict(layer.get("files") or {})
+        legacy_layer = {p: h for p, h in files.items() if Path(p).name in LEGACY_LAYER_FILES}
+        layer["files"] = {p: h for p, h in files.items() if p not in legacy_layer}
+        if legacy_layer:
+            layer["legacy_files"] = legacy_layer
+        return {"settings": old.get("settings") or {}, "games": games, "layer": layer}
 
     def save_state(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -923,7 +1019,7 @@ class AissCore:
                         found["dlss"].append(e.path)
                     elif low == SL_INTERPOSER:
                         found["sl"].append(e.path)
-                    elif low in (FFX_VK_NAME, FFX_VK_ORIG):
+                    elif low in (FFX_VK_NAME, FFX_VK_ORIG, LEGACY_FFX_VK_ORIG):
                         found["ffx"].append(e.path)
                     elif low.endswith(".exe"):
                         found["exes"].append(e.path)
@@ -1035,7 +1131,7 @@ class AissCore:
 
     # ---- file ownership -------------------------------------------------------------------------------------------
 
-    def _classify(self, path: Path, bundle_key: str, recorded: str | None, marker: bytes) -> str:
+    def _classify(self, path: Path, bundle_key: str, recorded: str | None, markers: tuple[bytes, ...]) -> str:
         """'missing' | 'current' (identical to bundle) | 'ours' (other build of ours) | 'foreign'."""
         if not path.exists():
             return "missing"
@@ -1047,7 +1143,7 @@ class AissCore:
                 return "ours"
         except OSError:
             return "foreign"
-        return "ours" if marker and file_contains(path, marker) else "foreign"
+        return "ours" if markers and file_contains(path, markers) else "foreign"
 
     # ---- per-game status ------------------------------------------------------------------------------------------
 
@@ -1067,7 +1163,7 @@ class AissCore:
         shim_ok = True
         for t in info["targets"]:
             c = self._classify(Path(t) / f"{info['shim']}.dll", info["shim"],
-                               (gs.get("files") or {}).get(str(Path(t) / f"{info['shim']}.dll")), SHIM_MARKER)
+                               (gs.get("files") or {}).get(str(Path(t) / f"{info['shim']}.dll")), SHIM_MARKERS)
             if c == "foreign":
                 conflicts.append(str(Path(t) / f"{info['shim']}.dll"))
             if c != "current":
@@ -1135,7 +1231,32 @@ class AissCore:
             files[str(dst)] = self.bundle_hash(key)
         return result
 
+    def remove_legacy_layer(self) -> bool:
+        """Removes the old plugin's layer files (inert: nothing sets AISS_LAYER=1 any more) when they are what it
+        recorded installing or recognisably its layer; returns whether the state changed."""
+        rec = self.state.setdefault("layer", {})
+        recorded = rec.get("legacy_files") or {}
+        changed = False
+        for name in LEGACY_LAYER_FILES:
+            p = self.layer_dir / name
+            try:
+                if p.is_file() and ((recorded.get(str(p)) and sha256_file(p) == recorded[str(p)]) or
+                                    file_contains(p, LEGACY_LAYER_NAME)):
+                    p.unlink()
+                    self.log.info(f"removed the old layer file {p}")
+            except OSError as e:
+                self.log.warning(f"cannot remove old {p}: {e}")
+                continue
+            if str(p) in recorded:
+                recorded.pop(str(p))
+                changed = True
+        if "legacy_files" in rec and not recorded:
+            rec.pop("legacy_files")
+            changed = True
+        return changed
+
     def remove_layer(self) -> None:
+        self.remove_legacy_layer()
         files = self.state.get("layer", {}).get("files", {})
         for path, h in list(files.items()):
             p = Path(path)
@@ -1147,11 +1268,12 @@ class AissCore:
             files.pop(path, None)
 
     @staticmethod
-    def _marker(key: str) -> bytes | None:
-        return CORE_MARKER if key == "core" else None
+    def _marker(key: str) -> tuple[bytes, ...]:
+        return CORE_MARKERS if key == "core" else ()
 
-    def _remove_legacy(self, gs: dict) -> None:
+    def _remove_legacy(self, gs: dict, pfx: Path | None = None) -> None:
         """Remove files earlier builds installed (e.g. aiss/amdvkffx64.dll) if they are still what was installed."""
+        self._remove_legacy_subdir(gs, pfx)
         for sk, _ in LEGACY_PREFIX_FILES:
             path, digest = gs.pop(f"{sk}_path", None), gs.pop(f"{sk}_hash", None)
             gs.pop(f"{sk}_backup", None)
@@ -1161,21 +1283,48 @@ class AissCore:
             try:
                 if p.is_file() and (not digest or sha256_file(p) == digest):
                     p.unlink()
-                if p.parent.name == FSR4_SUBDIR and p.parent.is_dir() and not any(p.parent.iterdir()):
+                if p.parent.name in (FSR4_SUBDIR, LEGACY_FSR4_SUBDIR) and p.parent.is_dir() and \
+                        not any(p.parent.iterdir()):
                     p.parent.rmdir()
             except OSError as e:
                 self.log.warning(f"cannot remove old {p}: {e}")
 
+    def _remove_legacy_subdir(self, gs: dict, pfx: Path | None) -> None:
+        """The old plugin's private system32/aiss folder: the AMD files and shader packs in it go when they match its
+        record (legacy_files, from the imported state) or this bundle's identical copy, then the folder if empty."""
+        recorded = gs.get("legacy_files") or {}
+        dirs = {Path(p).parent for p in recorded}
+        if pfx:
+            dirs.add(pfx / "drive_c/windows/system32" / LEGACY_FSR4_SUBDIR)
+        known = {Path(name).name: key for key, name, _, _ in PREFIX_FILES if key in OPTIONAL_BIN}
+        for d in dirs:
+            if not d.is_dir():
+                continue
+            try:
+                for p in d.iterdir():
+                    if not p.is_file() or (p.name not in known and str(p) not in recorded):
+                        continue
+                    h, key = sha256_file(p), known.get(p.name)
+                    if h == recorded.get(str(p)) or \
+                            (key and self.bundle_path(key).is_file() and h == self.bundle_hash(key)):
+                        p.unlink()
+                if not any(d.iterdir()):
+                    d.rmdir()
+            except OSError as e:
+                self.log.warning(f"cannot clean up {d}: {e}")
+        gs.pop("legacy_files", None)
+
     def _install_core(self, gs: dict, pfx: Path) -> None:
-        """_nvngx.dll and libxess.dll into system32, and (when bundled) AMD's FSR 4 DLL into system32/aiss."""
-        self._remove_legacy(gs)
+        """_nvngx.dll and libxess.dll into system32, and (when bundled) AMD's FSR 4 DLLs into system32/deckyupscaler."""
+        self._remove_legacy(gs, pfx)
         for key, name, _, sk in self.prefix_files():
             dst = pfx / "drive_c/windows/system32" / name
-            dst.parent.mkdir(parents=True, exist_ok=True)  # the aiss subfolder for the FSR 4 DLLs
+            dst.parent.mkdir(parents=True, exist_ok=True)  # the deckyupscaler subfolder for the FSR 4 DLLs
             c = self._classify(dst, key, gs.get(f"{sk}_hash"), self._marker(key))
             if c != "current":
                 backup = dst.with_name(dst.name + CORE_BACKUP_SUFFIX)
-                if c == "foreign" and not backup.exists():
+                if c == "foreign" and not backup.exists() and \
+                        not dst.with_name(dst.name + LEGACY_CORE_BACKUP_SUFFIX).exists():
                     # first time we take over this file: keep whatever was there, restored on uninstall
                     shutil.copy2(dst, backup)
                     gs[f"{sk}_backup"] = str(backup)
@@ -1214,15 +1363,16 @@ class AissCore:
                 dst.unlink()
             elif c == "foreign":
                 warnings.append(f"{dst} was replaced by something else; left in place")
-            backup = gs.get(f"{sk}_backup")
-            if backup and Path(backup).exists() and not dst.exists():
-                os.replace(backup, dst)
+            # the recorded backup, else one the old plugin made (recorded under the old suffix when imported)
+            for backup in (gs.get(f"{sk}_backup"), str(dst) + LEGACY_CORE_BACKUP_SUFFIX):
+                if backup and Path(backup).exists() and not dst.exists():
+                    os.replace(backup, dst)
             if dst.parent.name == FSR4_SUBDIR:
                 subdirs.add(dst.parent)
             gs.pop(f"{sk}_path", None)
             gs.pop(f"{sk}_hash", None)
             gs.pop(f"{sk}_backup", None)
-        for d in subdirs:  # remove the private aiss folder once its DLLs are gone
+        for d in subdirs:  # remove the private deckyupscaler folder once its DLLs are gone
             try:
                 if d.is_dir() and not any(d.iterdir()):
                     d.rmdir()
@@ -1241,7 +1391,7 @@ class AissCore:
             gs["reg_pending"] = True
             return
         backup = reg.with_name(reg.name + REG_BACKUP_SUFFIX)
-        if not backup.exists():
+        if not backup.exists() and not reg.with_name(reg.name + LEGACY_REG_BACKUP_SUFFIX).exists():
             shutil.copy2(reg, backup)
         new_text, created = reg_set_value(text, REG_KEY_PATH, SIG_OVERRIDE_VALUE, "hex:01")
         atomic_write_text(reg, new_text)
@@ -1269,12 +1419,18 @@ class AissCore:
             gs.pop(k, None)
         return True
 
+    @staticmethod
+    def _ffx_orig(d: Path) -> Path:
+        """Where AMD's DLL is kept beside the forwarder: FFX_VK_ORIG, or the old plugin's name for it."""
+        orig, legacy = d / FFX_VK_ORIG, d / LEGACY_FFX_VK_ORIG
+        return legacy if not orig.exists() and legacy.is_file() else orig
+
     def _ffx_state(self, info: dict) -> list[tuple[Path, Path, str]]:
         """(the game's amd_fidelityfx_vk.dll path, AMD's original kept beside it, its classification)."""
         out = []
         for d in info.get("ffx_dirs") or []:
             p = Path(d) / FFX_VK_NAME
-            out.append((p, Path(d) / FFX_VK_ORIG, self._classify(p, "ffx_vk", None, FFX_MARKER)))
+            out.append((p, self._ffx_orig(Path(d)), self._classify(p, "ffx_vk", None, FFX_MARKERS)))
         return out
 
     def _install_ffx(self, gs: dict, info: dict) -> None:
@@ -1282,6 +1438,9 @@ class AissCore:
             return
         files = gs.setdefault("ffx_files", {})
         for p, orig, c in self._ffx_state(info):
+            if orig.name != FFX_VK_ORIG:  # kept by the old plugin: the forwarder loads it under the new name
+                os.replace(orig, p.with_name(FFX_VK_ORIG))
+                orig = p.with_name(FFX_VK_ORIG)
             if c == "foreign":
                 os.replace(p, orig)  # AMD's DLL (first install, or a game update brought a new one): keep it beside
             elif c == "missing" and not orig.is_file():
@@ -1294,8 +1453,8 @@ class AissCore:
         warnings = []
         for path in list((gs.get("ffx_files") or {})):
             p = Path(path)
-            orig = p.with_name(FFX_VK_ORIG)
-            c = self._classify(p, "ffx_vk", None, FFX_MARKER)
+            orig = self._ffx_orig(p.parent)
+            c = self._classify(p, "ffx_vk", None, FFX_MARKERS)
             if c in ("current", "ours"):
                 p.unlink()
             elif c == "foreign":
@@ -1331,14 +1490,14 @@ class AissCore:
         shim_src = self.bundle_path(info["shim"])
         dsts = [Path(t) / f"{info['shim']}.dll" for t in info["targets"]]
         conflicts = [str(d) for d in dsts
-                     if self._classify(d, info["shim"], files.get(str(d)), SHIM_MARKER) == "foreign"]
+                     if self._classify(d, info["shim"], files.get(str(d)), SHIM_MARKERS) == "foreign"]
         if conflicts:
             gs["message"] = "Existing file is not ours: " + ", ".join(conflicts)
             self.save_state()
             return {"ok": False, "status": STATUS_CONFLICT, "message": gs["message"], "conflicts": conflicts}
 
         for d in dsts:
-            if self._classify(d, info["shim"], files.get(str(d)), SHIM_MARKER) != "current":
+            if self._classify(d, info["shim"], files.get(str(d)), SHIM_MARKERS) != "current":
                 atomic_copy(shim_src, d)
             files[str(d)] = self.bundle_hash(info["shim"])
         self._install_ffx(gs, info)
@@ -1371,7 +1530,7 @@ class AissCore:
             p = Path(path)
             shim = p.stem.lower() if p.stem.lower() in ("dbghelp", "dxgi") else None
             if shim and p.exists():
-                c = self._classify(p, shim, h, SHIM_MARKER)
+                c = self._classify(p, shim, h, SHIM_MARKERS)
                 if c in ("current", "ours"):
                     p.unlink()
                 else:
@@ -1414,13 +1573,14 @@ class AissCore:
         if self._has_optiscaler(info):
             return True
         if self.bundle_path("ffx_vk").is_file() and \
-                any(c == "foreign" or (c != "current" and orig.is_file()) for _, orig, c in self._ffx_state(info)):
+                any(c == "foreign" or (c != "current" and orig.is_file()) or orig.name != FFX_VK_ORIG
+                    for _, orig, c in self._ffx_state(info)):
             return True
         if gs.get("shim") != info["shim"] or sorted(gs.get("targets") or []) != sorted(info["targets"]):
             return True
         for t in info["targets"]:
             d = Path(t) / f"{info['shim']}.dll"
-            if self._classify(d, info["shim"], (gs.get("files") or {}).get(str(d)), SHIM_MARKER) != "current":
+            if self._classify(d, info["shim"], (gs.get("files") or {}).get(str(d)), SHIM_MARKERS) != "current":
                 return True  # missing (game update), older build of ours, or a conflict to report
         pfx = self.find_prefix(app["appid"], app["library"])
         if pfx is None:
@@ -1429,7 +1589,8 @@ class AissCore:
             if self._classify(pfx / "drive_c/windows/system32" / name, key, gs.get(f"{sk}_hash"),
                               self._marker(key)) != "current":
                 return True
-        return bool(gs.get("reg_pending")) or not all(gs.get(f"{sk}_path") for _, _, _, sk in self.prefix_files())
+        return bool(gs.get("reg_pending") or gs.get("legacy_files")) or \
+            not all(gs.get(f"{sk}_path") for _, _, _, sk in self.prefix_files())
 
     def verify_all(self) -> list[dict]:
         """Repair enabled games (a game update can delete the shim, the prefix may exist by now, a newer plugin
@@ -1438,6 +1599,8 @@ class AissCore:
             self.write_control()
         except OSError as e:
             self.log.warning(f"cannot write {self.control_path}: {e}")
+        if self.remove_legacy_layer():
+            self.save_state()
         results = []
         apps = {a["appid"]: a for a in self.installed_apps()}
         for appid, gs in list(self.state["games"].items()):
@@ -1476,7 +1639,7 @@ class AissCore:
             shim = gs.get("shim")
             if not shim:
                 return {"ok": False, "options": current, "message": "game not set up"}
-            new, new_rec = build_launch_options(current or "", shim, self.env_settings(), rec)
+            new, new_rec = build_launch_options(current or "", shim, self.env_settings(), rec, self._launcher(str(appid)))
             gs["launch"] = new_rec
         else:
             new = strip_launch_options(current or "", rec)
@@ -1484,10 +1647,22 @@ class AissCore:
         self.save_state()
         return {"ok": True, "options": new, "changed": new != (current or "")}
 
+    def _launcher(self, appid: str) -> tuple[str, str] | None:
+        """(launcher, game exe) when the game starts through a launcher in LAUNCHERS next to its exe."""
+        app = self._app(appid)
+        info = self.analyse_game(app) if app else None
+        if not info or not info.get("exe"):
+            return None
+        exe = Path(info["exe"])
+        for name in LAUNCHERS:
+            if (exe.parent / name).is_file() and exe.name.lower() != name.lower():
+                return name, exe.name
+        return None
+
     # The proxy re-reads this file while the game runs, so a model change applies without restarting the game.
     @property
     def control_path(self) -> Path:
-        return self.home / ".local/share/aiss-dlss-nss/control"
+        return self.home / ".local/share/deckyupscaler/control"
 
     def env_settings(self) -> dict:
         return {**self.state["settings"], "control": str(self.control_path)}

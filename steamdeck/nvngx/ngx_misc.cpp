@@ -21,6 +21,6 @@ NGX_EXPORT unsigned int NVSDK_NGX_GetSnippetVersion()
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
-        LOGI("aiss nvngx proxy loaded (DLSS -> Arm NSS, Steam Deck / Proton)");
+        LOGI("DeckyUpscaler nvngx proxy loaded (DLSS -> Arm NSS, Steam Deck / Proton)");
     return TRUE;
 }

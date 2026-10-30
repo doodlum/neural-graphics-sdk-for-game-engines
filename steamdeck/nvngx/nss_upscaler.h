@@ -44,7 +44,7 @@ struct UpscalerCreateInfo
     int      backend       = 0;      // UpscalerBackend
     int      fsr4Model     = 0;      // Fsr4Model, for kBackendFsr4: the one asked for
     int      fsr4Active    = -1;     // the FSR 4 network that runs (set by the upscaler)
-    bool     layerSplit    = false;  // FSR 4 interop on a Vulkan game: the AISS layer splits the game's command buffer
+    bool     layerSplit    = false;  // FSR 4 interop on a Vulkan game: our Vulkan layer splits the game's command buffer
 };
 
 enum UpscalerBackend : int
@@ -60,8 +60,8 @@ enum UpscalerBackend : int
 
 // Lets an upscaler split its work over several submissions on the front end's queue: Begin() starts a command buffer,
 // Submit() submits it, optionally waiting for and/or signalling a timeline semaphore value. The D3D11 front end submits
-// its own command buffers; for Vulkan games the interop upscaler implements it with the AISS layer's command buffer
-// split (one game command buffer, cut where Submit() is called).
+// its own command buffers; for Vulkan games the interop upscaler implements it with the DeckyUpscaler layer's command
+// buffer split (one game command buffer, cut where Submit() is called).
 struct SplitSubmitter
 {
     virtual VkCommandBuffer Begin() = 0;
@@ -216,7 +216,7 @@ private:
     float*                m_aeResults     = nullptr;  // kRing x {sum log2 lum, count, tag, 0}
     float                 m_exposure      = 0.0f;     // 0 until the first readback
 
-    // AISS_DUMP_INPUTS: raw copies of the dispatch inputs and output, read back a few frames later.
+    // DU_DUMP_INPUTS: raw copies of the dispatch inputs and output, read back a few frames later.
     struct RawDump
     {
         VkBuffer       buffer = VK_NULL_HANDLE;
@@ -229,7 +229,7 @@ private:
     void RecordRaw(VkCommandBuffer cmd, const UpscalerImage& img, VkImageAspectFlags aspect, const char* name);
     void WriteRawDumps(bool all);
 
-    // AISS_DUMP_FRAME readback of one output frame.
+    // DU_DUMP_FRAME readback of one output frame.
     VkBuffer       m_dumpBuffer = VK_NULL_HANDLE;
     VkDeviceMemory m_dumpMemory = VK_NULL_HANDLE;
     UpscalerImage  m_dumpImage;
@@ -260,7 +260,7 @@ private:
 
 UpscalerRegistry& Registry();
 
-// Maps the game's DLSS quality mode to an NSS shader quality, honouring AISS_NSS_QUALITY.
+// Maps the game's DLSS quality mode to an NSS shader quality, honouring DU_NSS_QUALITY.
 int NssQualityForDlss(int perfQualityValue);
 
 // Fast maths (FFX_ML_RESCALE_FLOAT) for new upscalers: the control file's value, else the launch environment.

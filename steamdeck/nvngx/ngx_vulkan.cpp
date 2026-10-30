@@ -51,13 +51,13 @@ NVSDK_NGX_Result InitDevice(VkInstance instance, VkPhysicalDevice pd, VkDevice d
     if (!vk.gipa)
         return NVSDK_NGX_Result_FAIL_PlatformError;
     vk.gdpa = gdpa ? gdpa : reinterpret_cast<PFN_vkGetDeviceProcAddr>(vk.gipa(instance, "vkGetDeviceProcAddr"));
-    // A Vulkan device's enabled features cannot be queried. The aiss Vulkan layer (AISS_LAYER=1) enables every ML
-    // feature the GPU has on every device; without it only the scalar ML path is safe.
+    // A Vulkan device's enabled features cannot be queried. The DeckyUpscaler Vulkan layer (DU_LAYER=1) enables every
+    // ML feature the GPU has on every device; without it only the scalar ML path is safe.
     vk.mlFeatures = Config().mlFeaturesForced ? ffxQueryMlDeviceFeaturesVK(instance, pd, vk.gipa, nullptr, nullptr) : 0;
     g_vk          = vk;
     g_inited      = true;
     LOGI("Vulkan init: VkDevice %p, ML features 0x%x%s", reinterpret_cast<void*>(device), vk.mlFeatures,
-         Config().mlFeaturesForced ? "" : " (set AISS_LAYER=1 for the fast ML path)");
+         Config().mlFeaturesForced ? "" : " (set DU_LAYER=1 for the fast ML path)");
     return NVSDK_NGX_Result_Success;
 }
 
@@ -111,12 +111,12 @@ UpscalerImage Describe(const NgxParams& p, const char* name, VkImageLayout layou
     return img;
 }
 
-// Layout contract for NGX on Vulkan: inputs are shader-readable, the output is a storage image. AISS_VK_INPUT_LAYOUT
+// Layout contract for NGX on Vulkan: inputs are shader-readable, the output is a storage image. DU_VK_INPUT_LAYOUT
 // overrides the input layout (the VkImageLayout number) for titles that keep inputs in GENERAL.
 VkImageLayout InputLayout()
 {
     static const VkImageLayout layout = [] {
-        const char* v = getenv("AISS_VK_INPUT_LAYOUT");
+        const char* v = getenv("DU_VK_INPUT_LAYOUT");
         return v && *v ? static_cast<VkImageLayout>(atoi(v)) : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }();
     return layout;
