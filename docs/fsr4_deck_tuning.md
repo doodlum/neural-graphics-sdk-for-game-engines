@@ -15,9 +15,9 @@ FSR 4 Lite, 2x (render half the output size per axis), GPU time per upscale:
 
 | API | AMD's shaders | Replacement shaders | Change |
 | --- | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.26 ms | −25% |
-| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 2.09 ms | −25% |
-| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.39 ms | −28% |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.13 ms | −29% |
+| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 1.96 ms | −30% |
+| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.30 ms | −30% |
 
 Quality against AMD's own shaders: 69.1–72.7 dB tonemapped PSNR on all 16 combinations of the context flags (below);
 the largest differences are single pixels in a dithered shadow edge, invisible at 1:1. Frame-to-frame flicker on static
@@ -130,6 +130,29 @@ dot4 work now hides behind memory: the three output stores (100), the 9-tap filt
 Same session, the round-3 set against round 4: Vulkan 2.39 → 2.26 ms, D3D12 sample 2.19 → 2.09, D3D11 replay
 2.50 → 2.39, D3D12 replay 2.48 → 2.40 and 2.72 → 2.63 (two captured scenes).
 
+## Round 5: 2.26 → 2.13 ms (output unchanged)
+
+All three changes leave the output bit-identical to round 4 (16 flag combinations, the replay dumps with and without
+auto exposure, D3D11 and D3D12), and the Inf / NaN replay dumps give the same frames.
+
+| Change | µs (Vulkan) |
+| --- | --- |
+| Prepass with 2×2 pixels per lane: 64-lane workgroups for the same 16×16 tile, so the convolution needs no workgroup barrier; each lane runs the per-pixel stage on four pixels of a contiguous 8×4 block, then computes all 16 channels itself (one pixel of each 2×2 block per iteration, with stride-2 memory access, was 338 µs slower) | −50 |
+| The proxy's colour clean-up for auto exposure moved into the shaders that read the colour: the prepass's colour transform is monotone and already maps NaN to the value of 0, so cleaning is one `v_min` per channel against the transform of 65504; AMD's exposure pass gets an Inf clamp (its luminance already goes through a NaN-ignoring max; a NaN select there changed finite results) | −35 net (pass 49) |
+| Four of the five small `*_post` dispatches only zero a one-cell border ring around tensors that share memory: two rings are never read, two are zeroed by their producers (prepass, pass 2); the fifth stays (pass 1 has no binding with that tensor's size). The DLL records them, so the proxy drops them (pack options) | −23 |
+| (the rest: barriers around the dropped dispatches) | ≈ −20 |
+
+The DLL's command stream is 11 dispatches and 12 barriers, no copies or clears. Same session: round 4 2.26 → 2.13 ms
+on Vulkan, 2.08 → 1.96 ms on the D3D12 sample, 2.45 → 2.32 ms on the D3D11 replay with auto exposure.
+
+Lossy options measured on top (not in the shipped set), quality as the minimum over the 16 flag combinations:
+
+| Change | µs | dB | Note |
+| --- | --- | --- | --- |
+| Postpass filter on 5 of the network's 9 taps (cross) | −82 | 65.6 | flicker within AMD's spread, static edges 0.35% sharper |
+| …and no depth dilation in the prepass | −128 | 63.0 | Vulkan 2.00 ms, D3D12 1.85 ms |
+| Prepass colour taps reduced to one | −25 alone | 64.8 | worst µs per dB |
+
 ## What did not work (and why)
 
 | Idea | Result |
@@ -148,13 +171,16 @@ Same session, the round-3 set against round 4: Vulkan 2.39 → 2.26 ms, D3D12 sa
 | No depth dilation in the prepass | −70 µs, 65.1 dB worst case |
 | Fusing pass3 into the postpass | Each pass reads a 3×3 neighbourhood of the previous one's output, so a fused shader must recompute a halo of pass3 per tile: at least +130 µs against a −47 µs ceiling |
 | Fusing pass2 and pass3 | Ceiling only −7 µs before any halo recompute |
+| Narrower intermediate formats | History and reprojected colour are RGBA16F holding three channels (no 3-channel half format exists; R11G11B10 is too coarse for log colour), the recurrent state is already 4 bytes per pixel; DCC off: 0 to −9 µs |
+| Recomputing the reprojected colour in the postpass instead of storing it | The postpass's descriptor layout (the DLL's) has no history, velocity or depth bindings, and it would read as many bytes as it saves |
+| Exact de-duplication of depth taps at exactly 2x | The sample's odd height (785) makes the y scale 0.4994, so the fast path never runs (+3 µs) |
 
 ## Limits
 
 The int8 dot4 instructions fixed by the network are 65–73% of the executed VALU in pass1–3 and 41% in the postpass;
 the dot-only floors are about pass1 300, pass2 120, pass3 160 and postpass 300 µs. What remains above them is
 requantisation, residual shifts and address maths, close to minimal per output, plus the postpass's float colour maths.
-The prepass sits above a ~360 µs memory floor; one larger exact rewrite is untried (each lane handling a 2×2 pixel
-block, dropping the LDS exchange and sharing taps, estimated −50 to −90 µs). Without a driver change exposing `v_dot8`
-(and an int4-activation network), the remaining exact gains on Van Gogh/RADV are a few percent, that rewrite being the
-largest known.
+The prepass (now 2×2 pixels per lane, ~515 µs) sits above a ~360 µs memory floor. Pass 1 and pass 3 remain issue-bound
+near their dot4 floors, and the int8 weights are dense, so pruning would remove almost no dot4s. Without a driver change
+exposing `v_dot8` (and an int4-activation network), the remaining gains on Van Gogh/RADV are lossy ones (the round-5
+table above).

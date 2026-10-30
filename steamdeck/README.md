@@ -240,6 +240,10 @@ the original SPIR-V, so a replacement only ever applies to the exact module it w
   LDS sharing, unrolled loops, integer requantisation and output tails, cheaper packing and addressing) plus small
   precision changes: the prepass convolution accumulates exact f16 products in f32, the history reprojection uses one
   bilinear fetch instead of a 9-tap Catmull-Rom, and requantisation rounds half up (only exact ties differ, by one step).
+  The set also takes over two jobs, declared in an options entry in the pack: its colour readers clean Inf / NaN
+  colour themselves (so the proxy skips its clean-up pass below), and its prepass and pass 2 zero the tensor border
+  rings that four small DLL dispatches otherwise clear (so the proxy does not record those dispatches). Older proxies
+  ignore the entry; a pack without it keeps both.
 - `fsr4_shaders_dot2.bin`: the prepass variants with that convolution on `v_dot2_f32_f16`
   (`SPV_VALVE_mixed_float_dot_product`), the instruction AMD's own D3D12 build of this network compiles to. Used only
   when the device has `VK_VALVE_shader_mixed_float_dot_product` enabled: vkd3d-proton enables it itself, and the Vulkan
@@ -254,9 +258,9 @@ limits: [`docs/fsr4_deck_tuning.md`](../docs/fsr4_deck_tuning.md).
 
 | FSR 4 Lite, 2x | AMD's shaders | Replacement shaders |
 | --- | --- | --- |
-| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.26 ms |
-| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 2.09 ms |
-| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.39 ms |
+| Vulkan (Streamline sample, 640x392 → 1280x785) | 3.00 ms | 2.13 ms |
+| D3D12 (Streamline sample, 640x361 → 1280x722) | 2.79 ms | 1.96 ms |
+| D3D11 (replay harness, 640x361 → 1280x722) | 3.30 ms | 2.30 ms |
 
 For comparison, the D3D12 interop that Vulkan games used before cost 4.6 ms plus about 2.8 ms of cross-queue idle
 per frame, and AMD's D3D12 DLL natively 2.8 ms.
@@ -326,7 +330,10 @@ the SDK Vulkan path first copies the colour to an owned image in the game's own 
 B10G11R11) with Inf clamped to the format's largest finite value and NaN set to 0 (`color_sanitize.comp`); UNORM
 colour cannot hold either and skips the pass. Finite input gives bit-identical output; the pass costs about 43 µs at
 853x533 → 1280x800 with B10G11R11 colour (a straight read and write of the colour; an RGBA16F intermediate cost 91).
-FSR 3.1 and NSS are unaffected (the proxy's NSS auto exposure already skips non-finite pixels).
+FSR 3.1 and NSS are unaffected (the proxy's NSS auto exposure already skips non-finite pixels). With the shipped shader
+pack the pass is skipped: the replacement shaders clamp Inf where they read the colour (at the half-float maximum
+for every format, so RGBA32F colour above 65504 is clamped too) and map NaN to the same value as 0, for no extra cost
+(same output on finite input, and the same frames on the Inf / NaN replay dumps).
 
 ### D3D12 interop for D3D11 games
 

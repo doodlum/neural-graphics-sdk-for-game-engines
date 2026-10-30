@@ -175,7 +175,7 @@ VkResult VKAPI_CALL ProbeUpdateProvider(uint64_t a, uint64_t b, uint64_t c, uint
     return g_probeMode == 2 ? VK_SUCCESS : VK_ERROR_FEATURE_NOT_PRESENT;
 }
 
-void ProfRememberModule(VkShaderModule mod, const VkShaderModuleCreateInfo* ci);
+void ProfRememberModule(VkShaderModule mod, const VkShaderModuleCreateInfo* ci, uint64_t originalHash);
 
 // Shader modules the DLL creates, keyed by a 64-bit FNV-1a hash of the original SPIR-V: a module is replaced with
 // its replacement from Shaders() when there is one, so a replacement only ever applies to the exact module it was made
@@ -229,12 +229,42 @@ std::vector<uint32_t> ReadSpirv(const char* path)
 //    VK_VALVE_shader_mixed_float_dot_product enabled (see Dot2Enabled). Format: "AISSSPV1", u32 count, then per module
 //    u64 hash, u32 word count and the SPIR-V words.
 // AISS_FSR4_VK_SHADERS=0 turns replacement off; AISS_FSR4_VK_DOT2=0 keeps to fsr4_shaders.bin.
+//
+// A set can also take over work the proxy or the DLL otherwise does, declared in an options entry under the reserved
+// hash 0 (dir\0000000000000000.spv in a shader dir). It has a SPIR-V header so older proxies load it as a module no
+// hash matches; after the 5 header words: u32 flags, u32 count, then count u64 module hashes whose dispatches are not
+// recorded (the set's shaders do their work). Flag 1: the set's colour readers clean Inf / NaN colour themselves, so
+// the proxy's clean-up pass for auto exposure is skipped.
 using ShaderPack = std::vector<std::pair<uint64_t, std::vector<uint32_t>>>;
+
+struct PackOptions
+{
+    static constexpr uint32_t kCleansColour = 1;
+    uint32_t              flags = 0;
+    std::vector<uint64_t> skipDispatch;
+    bool operator==(const PackOptions& o) const { return flags == o.flags && skipDispatch == o.skipDispatch; }
+};
+
+PackOptions ParseOptions(const ShaderPack& pack)
+{
+    PackOptions o;
+    for (const auto& m : pack)
+    {
+        const std::vector<uint32_t>& w = m.second;
+        if (m.first != 0 || w.size() < 7 || w.size() < 7 + size_t(w[6]) * 2)
+            continue;
+        o.flags = w[5];
+        for (uint32_t i = 0; i < w[6]; ++i)
+            o.skipDispatch.push_back(w[7 + i * 2] | uint64_t(w[8 + i * 2]) << 32);
+    }
+    return o;
+}
 
 struct ShaderSource
 {
     std::string dir;
     ShaderPack  pack, dot2;
+    PackOptions options, dot2Options;
 };
 
 ShaderPack ReadPack(const wchar_t* name)
@@ -277,11 +307,18 @@ const ShaderSource& Shaders()
         if (const char* env = getenv("AISS_FSR4_VK_SHADER_DIR"); env && *env)
         {
             s.dir = env;
+            std::vector<uint32_t> opts = ReadSpirv((s.dir + "\\0000000000000000.spv").c_str());
+            if (!opts.empty())
+                s.options = ParseOptions({{0, std::move(opts)}});
             return s;
         }
-        s.pack = ReadPack(L"fsr4_shaders.bin");
+        s.pack    = ReadPack(L"fsr4_shaders.bin");
+        s.options = ParseOptions(s.pack);
         if (const char* off = getenv("AISS_FSR4_VK_DOT2"); !(off && !strcmp(off, "0")))
-            s.dot2 = ReadPack(L"fsr4_shaders_dot2.bin");
+        {
+            s.dot2        = ReadPack(L"fsr4_shaders_dot2.bin");
+            s.dot2Options = ParseOptions(s.dot2);
+        }
         return s;
     }();
     return src;
@@ -307,6 +344,19 @@ bool Dot2Enabled(const VulkanDevice& dev, CostApi api)
         if (!strcmp(e.extensionName, "VK_VALVE_shader_mixed_float_dot_product"))
             return true;
     return false;
+}
+
+// Modules replaced so far: a set's options only hold when its modules are in use (not for another DLL build).
+std::atomic<uint32_t> g_replacedModules{0};
+
+// The options of the set in use: the dot2 set's must match, as its modules stand in for some of the first set's.
+const PackOptions& ActiveOptions()
+{
+    static const PackOptions none;
+    const ShaderSource& src = Shaders();
+    if (!g_replacedModules || (g_dot2 && !src.dot2.empty() && !(src.dot2Options == src.options)))
+        return none;
+    return src.options;
 }
 
 PFN_vkCreateShaderModule g_realCreateShaderModule = nullptr;
@@ -350,18 +400,21 @@ VkResult VKAPI_CALL HookedCreateShaderModule(VkDevice device, const VkShaderModu
     {
         replaced.pCode    = code.data();
         replaced.codeSize = code.size() * 4;
+        ++g_replacedModules;
         LOGI("FSR 4 Vulkan: %s (%016llx) replaced from %s", entry, (unsigned long long)hash, path);
     }
     const VkResult r = g_realCreateShaderModule(device, &replaced, alloc, out);
     if (r == VK_SUCCESS)
-        ProfRememberModule(*out, &replaced);
+        ProfRememberModule(*out, &replaced, hash);
     else
         LOGI("FSR 4 Vulkan: vkCreateShaderModule for %s failed (%d)", entry, r);
     return r;
 }
 
-// AISS_FSR4_VK_PROFILE=N: GPU time of each compute dispatch the DLL records, by shader entry point, averaged over N
-// evaluations (diagnostics). Pipelines are named from the entry point of the module they were created from.
+// The DLL's compute pipelines and dispatches. Dispatches of pipelines made from a module in the set's skip list are not
+// recorded (ActiveOptions). AISS_FSR4_VK_PROFILE=N: GPU time of each compute dispatch the DLL records, by shader entry
+// point, averaged over N evaluations (diagnostics). Pipelines are named from the entry point of the module they were
+// created from.
 struct PassProfiler
 {
     static constexpr uint32_t kMaxPerEval = 48, kRing = 6;
@@ -377,7 +430,10 @@ struct PassProfiler
     std::mutex                 m;
     std::vector<std::pair<VkShaderModule, std::string>> moduleNames;
     std::vector<std::pair<VkPipeline, std::string>>     pipeNames;
+    std::vector<VkShaderModule> skipModules;
+    std::vector<VkPipeline>     skipPipes;
     std::string                current;
+    bool                       currentSkipped = false;
     uint64_t                   eval = 0;
     uint32_t                   used[kRing] = {};
     std::vector<std::string>   names[kRing];
@@ -387,8 +443,14 @@ struct PassProfiler
 };
 PassProfiler g_prof;
 
-void ProfRememberModule(VkShaderModule mod, const VkShaderModuleCreateInfo* ci)
+void ProfRememberModule(VkShaderModule mod, const VkShaderModuleCreateInfo* ci, uint64_t originalHash)
 {
+    const std::vector<uint64_t>& skip = Shaders().options.skipDispatch;  // whether it holds is decided per dispatch
+    if (std::find(skip.begin(), skip.end(), originalHash) != skip.end())
+    {
+        std::lock_guard<std::mutex> l(g_prof.m);
+        g_prof.skipModules.push_back(mod);
+    }
     // Entry point name from the SPIR-V OpEntryPoint (opcode 15): word 3 onwards is the literal string.
     std::string name = "?";
     const uint32_t* w = ci->pCode;
@@ -421,6 +483,8 @@ VkResult VKAPI_CALL ProfCreateComputePipelines(VkDevice d, VkPipelineCache c, ui
             if (mn.first == ci[i].stage.module)
                 name = mn.second;
         g_prof.pipeNames.push_back({out[i], name});
+        if (std::find(g_prof.skipModules.begin(), g_prof.skipModules.end(), ci[i].stage.module) != g_prof.skipModules.end())
+            g_prof.skipPipes.push_back(out[i]);
     }
     return r;
 }
@@ -434,6 +498,7 @@ void VKAPI_CALL ProfBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint bp, Vk
         for (auto& pn : g_prof.pipeNames)
             if (pn.first == p)
                 g_prof.current = pn.second;
+        g_prof.currentSkipped = std::find(g_prof.skipPipes.begin(), g_prof.skipPipes.end(), p) != g_prof.skipPipes.end();
     }
     g_prof.realBind(cmd, bp, p);
 }
@@ -443,6 +508,8 @@ void VKAPI_CALL ProfDispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32
     uint32_t q = UINT32_MAX;
     {
         std::lock_guard<std::mutex> l(g_prof.m);
+        if (g_prof.currentSkipped && !ActiveOptions().skipDispatch.empty())
+            return;
         const uint32_t ring = uint32_t(g_prof.eval % PassProfiler::kRing);
         if (g_prof.active && g_prof.pool && g_prof.used[ring] < PassProfiler::kMaxPerEval)
         {
@@ -554,7 +621,7 @@ PFN_vkVoidFunction VKAPI_CALL HookedGdpa(VkDevice device, const char* name)
     if (name && !strcmp(name, "vkAllocateMemory"))
         return g_realAllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(g_gameGdpa(device, name)),
                reinterpret_cast<PFN_vkVoidFunction>(&LogAllocateMemory);
-    if (name && getenv("AISS_FSR4_VK_PROFILE"))
+    if (name && (getenv("AISS_FSR4_VK_PROFILE") || !Shaders().options.skipDispatch.empty()))
     {
         if (!strcmp(name, "vkCmdDispatch"))
             return g_prof.realDispatch = reinterpret_cast<PFN_vkCmdDispatch>(g_gameGdpa(device, name)),
@@ -826,7 +893,16 @@ private:
         }
         // FSR 4's auto exposure turns one Inf / NaN colour pixel into a black frame (and black history): clean the
         // colour first, in its own format. UNORM colour cannot hold either; FSR 3.1's auto exposure is unaffected.
-        const VkFormat cleanFormat = m_autoExposure && !m_fsr3 ? MvDilator::SanitizeFormat(in.color.format) : VK_FORMAT_UNDEFINED;
+        // A shader set that cleans the colour itself makes the pass unnecessary (known once the DLL has created its
+        // modules, during the first evaluate).
+        const bool setCleans = (ActiveOptions().flags & PackOptions::kCleansColour) != 0;
+        if (setCleans && m_autoExposure && !m_setCleansLogged)
+        {
+            m_setCleansLogged = true;
+            LOGI("FSR 4 Vulkan: colour clean-up for auto exposure done by the replacement shaders");
+        }
+        const VkFormat cleanFormat = m_autoExposure && !m_fsr3 && !setCleans ? MvDilator::SanitizeFormat(in.color.format)
+                                                                              : VK_FORMAT_UNDEFINED;
         if (cleanFormat != VK_FORMAT_UNDEFINED && cleanFormat != m_sanitizerFormat)
         {
             m_sanitizer       = MvDilator::Create(m_dev, m_info.renderWidth, m_info.renderHeight,
@@ -882,6 +958,7 @@ private:
     bool                       m_dilatorFailed = false;
     std::unique_ptr<MvDilator> m_sanitizer;  // colour clean-up (MvDilator::Pass::SanitizeColor)
     VkFormat                   m_sanitizerFormat = VK_FORMAT_UNDEFINED;  // m_sanitizer's format (tried, even if null)
+    bool                       m_setCleansLogged = false;
     VkDeviceContext m_dc            = {};
     ffxContext      m_ctx           = nullptr;
     uint64_t        m_dispatchCount = 0;
