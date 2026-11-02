@@ -8302,9 +8302,13 @@ namespace
         }
 
         uint32_t slot = 0;
+        uint64_t collected = 0;
 
-        void Begin(VkCommandBuffer cmd, uint32_t jobCount)
+        uint32_t context = 0;  // effect context of the jobs being recorded: labels are per context
+
+        void Begin(VkCommandBuffer cmd, uint32_t jobCount, uint32_t effectContextId)
         {
+            context = effectContextId;
             slot = uint32_t(executions++ % kSlots);
             Collect(slot);
             labels[slot].clear();
@@ -8329,8 +8333,13 @@ namespace
             if (slot == ~0u)
                 return;
             static const char* typeNames[] = {"clear_float", "copy", "compute", "barrier", "discard", "fragment", "data_graph", "clear_uint"};
-            // Job labels only exist in debug builds; name each job by its type and position instead.
-            std::string label = std::to_string(labels[slot].size()) + "_" + (job.jobType < 8 ? typeNames[job.jobType] : "job");
+            // Named by effect context, position and type, plus the pipeline's name (job labels only exist in debug builds).
+            std::string label = "c" + std::to_string(context) + "_" + std::to_string(labels[slot].size()) + "_" +
+                                (job.jobType < 8 ? typeNames[job.jobType] : "job");
+            if (job.jobType == FFX_GPU_JOB_COMPUTE && job.computeJobDescriptor.pipeline.name[0])
+                label += std::string(" ") + job.computeJobDescriptor.pipeline.name;
+            else if (job.jobType == FFX_GPU_JOB_FRAGMENT && job.fragmentJobDescriptor.pipeline.name[0])
+                label += std::string(" ") + job.fragmentJobDescriptor.pipeline.name;
             labels[slot].push_back(label);
             cmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, slot * kMaxQueries + uint32_t(labels[slot].size()));
         }
@@ -8350,10 +8359,10 @@ namespace
                     order.push_back(l[i]);
                 frame[l[i]] += float(ts[i + 1] - ts[i]) * periodNs * 1e-3f;
             }
-            frame["total"] = float(ts[l.size()] - ts[0]) * periodNs * 1e-3f;
+            // Contexts execute a different number of times per frame: Write sums the per-job medians instead.
             for (auto& [k, v] : frame)
                 samples[k].push_back(v);
-            if (samples["total"].size() % 250 == 0)
+            if (++collected % 250 == 0)
                 Write();
         }
 
@@ -8366,10 +8375,15 @@ namespace
                 std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
                 return v[v.size() / 2];
             };
-            fprintf(f, "samples %zu (median us per execution)\n", samples["total"].size());
+            fprintf(f, "executions %llu (median us per job; c<n> = effect context)\n", (unsigned long long)collected);
+            float total = 0;
             for (const std::string& k : order)
-                fprintf(f, "%-24s %8.2f\n", k.c_str(), median(samples[k]));
-            fprintf(f, "%-24s %8.2f\n", "total", median(samples["total"]));
+            {
+                const float m = median(samples[k]);
+                total += m;
+                fprintf(f, "%-56s %8.2f\n", k.c_str(), m);
+            }
+            fprintf(f, "%-56s %8.2f\n", "sum of medians", total);
             fclose(f);
         }
     };
@@ -8388,7 +8402,7 @@ FfxErrorCode ExecuteGpuJobsVK(FfxInterface* backendInterface, FfxCommandList com
     JobProfiler* profiler = JobProfiler::Get(backendContext->device, backendContext->physicalDevice);
     if (profiler)
     {
-        profiler->Begin(vkCommandBuffer, backendContext->gpuJobCount * 2);
+        profiler->Begin(vkCommandBuffer, backendContext->gpuJobCount * 2, effectContextId);
         static const bool splitBarriers = getenv("FFX_PROFILE_BARRIERS") && atoi(getenv("FFX_PROFILE_BARRIERS")) != 0;
         static JobProfiler* active = nullptr;
         active = profiler;

@@ -64,7 +64,8 @@ extern "C" {
 typedef enum FfxOpticalflowPass
 {
     FFX_OPTICALFLOW_PASS_COMPUTE_MOTION_FROM_DEPTH = 0,
-    FFX_OPTICALFLOW_PASS_FLOW_FROM_MOTION_VECTORS,  // without the data graph engine: the flow from the game's motion vectors
+    FFX_OPTICALFLOW_PASS_SCATTER_DEPTH,  // without the data graph engine: the flow from the game's motion vectors, step 1
+    FFX_OPTICALFLOW_PASS_SCATTER_FLOW,   // ... step 2
 
     FFX_OPTICALFLOW_PASS_COUNT
 } FfxOpticalflowPass;

@@ -1,0 +1,61 @@
+// SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+// SPDX-License-Identifier: MIT
+//
+// Flow without the data graph optical flow engine (hints only), step 1 of 2: every TP1 pixel scatters its depth to
+// the optical flow texel it came from in TM1 (game motion vectors); the nearest wins. Step 2
+// (ffx_opticalflow_scatter_flow.glsl) writes the winners' flow. Texels nothing lands on (TM1 content hidden in TP1)
+// keep the camera-motion MV hints.
+
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "ffx_opticalflow_callbacks_glsl.h"
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform Uniforms {
+    FfxFloat32x2 _MotionVectorScale;   // raw motion vector -> display pixels (from TP1 to where the pixel was in TM1)
+    FfxInt32x2   _OutputDims;          // optical flow resolution
+    FfxInt32x2   _MotionVectorDims;
+    FfxInt32x2   _DepthDims;
+    FfxInt32     _DepthInverted;
+    FfxInt32     _Pad;
+}ubo;
+
+layout(set = 0, binding = 1) uniform texture2D r_game_motion_vectors;  // display resolution | RG
+layout(set = 0, binding = 2) uniform texture2D r_depth;                // TP1 depth | R32F
+
+// Where this TP1 pixel was in TM1, as an optical flow texel (false off screen), and its depth key: nearer is smaller.
+bool Source(FfxInt32x2 p, out FfxInt32x2 cell, out FfxFloat32x2 flow, out FfxUInt32 key)
+{
+    const FfxFloat32x2 mv = texelFetch(r_game_motion_vectors, p, 0).xy * ubo._MotionVectorScale;
+    const FfxFloat32x2 q  = FfxFloat32x2(p) + 0.5f + mv;
+    flow = -mv;
+    cell = FfxInt32x2(floor(q * FfxFloat32x2(ubo._OutputDims) / FfxFloat32x2(ubo._MotionVectorDims)));
+    const FfxInt32x2 d = clamp(p * ubo._DepthDims / ubo._MotionVectorDims, FfxInt32x2(0), ubo._DepthDims - FfxInt32x2(1));
+    const FfxFloat32 z = clamp(texelFetch(r_depth, d, 0).r, 0.0f, 1.0f);
+    key = floatBitsToUint(ubo._DepthInverted != 0 ? 1.0f - z : z);  // non-negative floats order like their bits
+    return all(greaterThanEqual(q, FfxFloat32x2(0.0f))) && all(lessThan(q, FfxFloat32x2(ubo._MotionVectorDims))) &&
+           all(lessThan(cell, ubo._OutputDims));
+}
+
+layout(set = 0, binding = 3, r32ui) uniform coherent uimage2D rw_scatter_depth;  // optical flow resolution, cleared to ~0
+
+void main()
+{
+    const FfxInt32x2 p = FfxInt32x2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ubo._MotionVectorDims)))
+        return;
+    FfxInt32x2   cell;
+    FfxFloat32x2 flow;
+    FfxUInt32    key;
+    if (Source(p, cell, flow, key))
+        imageAtomicMin(rw_scatter_depth, cell, key);
+}

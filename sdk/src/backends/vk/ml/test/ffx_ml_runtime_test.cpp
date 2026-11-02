@@ -12,6 +12,7 @@
 
 #include <nss_v1_0_1_high_int8.h>
 #include <nss_v1_0_1_mid_low_int8.h>
+#include <nfru_v1_int8.h>
 
 #include <algorithm>
 #include <cinttypes>
@@ -498,11 +499,15 @@ int main(int argc, char** argv)
     std::vector<Model> models;
     models.push_back(MakeModel("nss_v1_0_1_high_int8", g_nss_v1_0_1_high_int8_Info, height, width));
     models.push_back(MakeModel("nss_v1_0_1_mid_low_int8", g_nss_v1_0_1_mid_low_int8_Info, height / 2, width / 2));
+    // NFRU's graph runs at a quarter of the display size per axis (rounded up to 8): 320x184 for 1280x720/785.
+    models.push_back(MakeModel("nfru_v1_int8", g_nfru_v1_int8_Info, getenv("FFX_ML_NFRU_H") ? atoi(getenv("FFX_ML_NFRU_H")) : 184,
+                               getenv("FFX_ML_NFRU_W") ? atoi(getenv("FFX_ML_NFRU_W")) : 320));
     for (Model& m : models)
         m.desc.spirv = m.words.data();  // re-point after the copies into the vector
-    // FFX_ML_TEST_MODELS=high|mid_low runs one model only (tuning loops).
+    // FFX_ML_TEST_MODELS=high|mid_low|nfru runs one model only (tuning loops).
     if (const char* only = getenv("FFX_ML_TEST_MODELS"))
-        models.erase(std::remove_if(models.begin(), models.end(), [&](const Model& m) { return !strstr(m.name, (std::string("v1_0_1_") + only + "_int8").c_str()); }),
+        models.erase(std::remove_if(models.begin(), models.end(),
+                                    [&](const Model& m) { return !strstr(m.name, only); }),
                      models.end());
 
     const Config configs[] = {

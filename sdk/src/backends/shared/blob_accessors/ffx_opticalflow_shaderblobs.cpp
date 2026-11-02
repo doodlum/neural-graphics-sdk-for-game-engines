@@ -8,7 +8,8 @@
 #include <ffx_opticalflow_mv_hints_permutations.h>
 #include <ffx_opticalflow_mv_hints_fs_permutations.h>
 #include <ffx_opticalflow_mv_hints_vs_permutations.h>
-#include <ffx_opticalflow_flow_from_mv_permutations.h>
+#include <ffx_opticalflow_scatter_depth_permutations.h>
+#include <ffx_opticalflow_scatter_flow_permutations.h>
 #include <string.h>  // for memset
 
 #if defined(POPULATE_PERMUTATION_KEY)
@@ -63,12 +64,19 @@ FfxErrorCode opticalflowGetPermutationBlobByIndex(FfxOpticalflowPass passId, uin
         return FFX_OK;
     }
 
-    case FFX_OPTICALFLOW_PASS_FLOW_FROM_MOTION_VECTORS:
+    case FFX_OPTICALFLOW_PASS_SCATTER_DEPTH:
     {
-        ffx_opticalflow_flow_from_mv_PermutationKey key;
+        ffx_opticalflow_scatter_depth_PermutationKey key;
         POPULATE_PERMUTATION_KEY(permutationOptions, key);
-        const int32_t tableIndex = g_ffx_opticalflow_flow_from_mv_IndirectionTable[key.index];
-        FfxShaderBlob blob       = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_flow_from_mv_PermutationInfo, tableIndex);
+        FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_scatter_depth_PermutationInfo, g_ffx_opticalflow_scatter_depth_IndirectionTable[key.index]);
+        memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
+        return FFX_OK;
+    }
+    case FFX_OPTICALFLOW_PASS_SCATTER_FLOW:
+    {
+        ffx_opticalflow_scatter_flow_PermutationKey key;
+        POPULATE_PERMUTATION_KEY(permutationOptions, key);
+        FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_scatter_flow_PermutationInfo, g_ffx_opticalflow_scatter_flow_IndirectionTable[key.index]);
         memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
         return FFX_OK;
     }
