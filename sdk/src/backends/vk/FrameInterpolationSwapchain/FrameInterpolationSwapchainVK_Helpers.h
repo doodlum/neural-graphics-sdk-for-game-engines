@@ -27,6 +27,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cmath>
+
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
 #include <FidelityFX/host/ffx_assert.h>
 #include <FidelityFX/host/backends/vk/vk_wrapper.h>

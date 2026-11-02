@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -126,6 +127,7 @@ namespace ffx_ml
         std::vector<StoredTensor> tensors;
         std::vector<FusedConv>    convs;
         uint32_t                  internalTensorCount = 0;
+        std::deque<tosa::Node>    synthetic;  // identity convs that pre-concatenate sources (stable addresses)
     };
 
     bool Lower(const tosa::Graph& graph, LoweredGraph& out, std::string* error);

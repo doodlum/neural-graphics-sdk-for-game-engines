@@ -636,12 +636,54 @@ namespace ffx_ml
             fc.conv = &node;
             if (!resolve(node.inputs[0], fc.sources))
                 return false;
-            if (fc.sources.size() > 2)
-                return LowerFail(error, "convolutions over more than two concatenated tensors are not supported");
             for (const ConvSource& s : fc.sources)
             {
                 if (out.tensors[s.tensor].c % 4 != 0)
                     return LowerFail(error, "conv source channels must be a multiple of 4");
+            }
+            // The kernel reads at most two sources. More are folded pairwise, from the end (keeping the channel order),
+            // into stored tensors by identity 1x1 convolutions on the same kernel: weight 1 on the matching channel, an
+            // exact x 2^30 >> 30 rescale and the consumer's zero point in and out reproduce every int8 value.
+            while (fc.sources.size() > 2)
+            {
+                const Value&     vin = graph.values[node.inputs[0]];
+                const ConvSource a   = fc.sources[fc.sources.size() - 2];
+                const ConvSource b   = fc.sources[fc.sources.size() - 1];
+                const int32_t    c   = out.tensors[a.tensor].c + out.tensors[b.tensor].c;
+
+                Node& idConv   = out.synthetic.emplace_back();
+                idConv.op      = OP_CONV2D;
+                idConv.kernelH = 1, idConv.kernelW = 1;
+                idConv.inputZp = node.inputZp;
+                idConv.weights.assign(size_t(c) * size_t(c), 0);
+                for (int32_t k = 0; k < c; ++k)
+                    idConv.weights[size_t(k) * size_t(c) + size_t(k)] = 1;
+                idConv.bias.assign(size_t(c), 0);
+                Node& idRescale        = out.synthetic.emplace_back();
+                idRescale.op           = OP_RESCALE;
+                idRescale.scale32      = true;
+                idRescale.multiplier   = {1 << 30};
+                idRescale.shift        = {30};
+                idRescale.rescaleInZp  = 0;
+                idRescale.rescaleOutZp = node.inputZp;
+
+                FusedConv merge;
+                merge.sources = {a, b};
+                merge.inH = vin.h, merge.inW = vin.w, merge.inC = c;
+                merge.outH = vin.h, merge.outW = vin.w, merge.outC = c;
+                merge.conv    = &idConv;
+                merge.rescale = &idRescale;
+                StoredTensor t;
+                t.h = vin.h, t.w = vin.w, t.c = c, t.channelStride = c;
+                t.internalIndex = out.internalTensorCount++;
+                merge.output    = uint32_t(out.tensors.size());
+                out.tensors.push_back(t);
+                out.convs.push_back(merge);
+
+                ConvSource merged;
+                merged.tensor = merge.output;
+                fc.sources.pop_back();
+                fc.sources.back() = merged;
             }
             if (node.weightZp != 0)
                 return LowerFail(error, "non-zero weight zero point is not supported");

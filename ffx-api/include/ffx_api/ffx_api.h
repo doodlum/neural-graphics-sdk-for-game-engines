@@ -26,8 +26,8 @@
 extern "C" {
 #endif  // #if defined(__cplusplus)
 
-#if defined(_MSC_VER)
-#define FFX_API_ENTRY __declspec(dllexport)  // Microsoft
+#if defined(_MSC_VER) || defined(_WIN32)
+#define FFX_API_ENTRY __declspec(dllexport)  // Microsoft, and mingw (visibility does not export from a PE DLL)
 #elif defined(__GNUC__)
 #define FFX_API_ENTRY __attribute__((visibility("default")))  // GCC
 #else

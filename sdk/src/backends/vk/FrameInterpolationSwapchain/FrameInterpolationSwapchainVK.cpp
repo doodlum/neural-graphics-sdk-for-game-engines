@@ -1408,7 +1408,8 @@ DWORD WINAPI composeAndPresent_presenterThread(LPVOID pParam)
                     // if no frame was presented, we still need to update the semaphore
                     if (toWait.count > 0)
                     {
-                        presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());
+                        SubmissionSemaphores none;  // a named object: the parameter is a non-const reference
+                        presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, none);
                     }
 
                     numFramesSentForPresentation = entry.numFramesSentForPresentationBase + entry.numFramesToPresent;

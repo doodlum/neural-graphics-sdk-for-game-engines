@@ -46,6 +46,7 @@ typedef struct OpticalFlowContext_Private
     FfxPipelineState                   pipelineComputeMVHints;
     FfxPipelineState                   pipelineFragmentMVHints;
     bool                               useMVHintsFragment;
+    bool                               hintsOnly;  // no data graph optical flow engine: the MV hints are the flow
     FfxResourceInternal                srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT];
     FfxResourceInternal                uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT];
     FfxConstantBuffer                  constantBuffers[FFX_OPTICALFLOW_CONSTANTBUFFER_COUNT];

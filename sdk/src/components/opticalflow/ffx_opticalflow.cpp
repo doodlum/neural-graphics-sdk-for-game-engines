@@ -210,10 +210,13 @@ static FfxErrorCode createPipelineStates(OpticalFlowContext_Private* context)
 
     // TODO: add more validation on the connection type with device caps like costSupported, hintSupported
 
-    FFX_VALIDATE(context->contextDescription.backendInterface.fpCreateOpticalFlowPipeline(
-        &context->contextDescription.backendInterface, "ARM-OpticalFlow", ofDesc, context->effectContextId, &context->pipelineOpticalflow));
+    if (!context->hintsOnly)
+    {
+        FFX_VALIDATE(context->contextDescription.backendInterface.fpCreateOpticalFlowPipeline(
+            &context->contextDescription.backendInterface, "ARM-OpticalFlow", ofDesc, context->effectContextId, &context->pipelineOpticalflow));
 
-    patchResourceBindings(&context->pipelineOpticalflow);
+        patchResourceBindings(&context->pipelineOpticalflow);
+    }
 
     context->useMVHintsFragment = !!(context->contextDescription.flags & FFX_OPTICALFLOW_ENABLE_MV_HINTS_FRAGMENT);
     if (context->useMVHintsFragment)
@@ -318,12 +321,12 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
     // call out for device caps.
     FfxDeviceCapabilities capabilities;
     FFX_VALIDATE(context->contextDescription.backendInterface.fpGetDeviceCapabilities(&context->contextDescription.backendInterface, &capabilities));
-    if (!capabilities.dataGraphOFSupported)
-    {
-        return FFX_ERROR_NULL_DEVICE;
-    }
-
-    const bool outputGridSizeSupported = (contextDescription->gridSize & capabilities.supportedOutputGridSizes) != 0;
+    // Without the data graph optical flow engine (it is not emulated on the native compute ML path, for example on
+    // RADV), the flow is the camera-motion field the MV hints pass computes from depth: the engine's refinement of
+    // object and non-geometric motion is missing, but frame interpolation still runs (the networks also get the
+    // game's motion vectors).
+    context->hintsOnly = !capabilities.dataGraphOFSupported;
+    const bool outputGridSizeSupported = context->hintsOnly || (contextDescription->gridSize & capabilities.supportedOutputGridSizes) != 0;
     // TODO: add check on hint grid size when we start using hint.
     // const bool hintGridSizeSupported   = (contextDescription->gridSize & capabilities.supportedHintGridSizes) != 0;
     if (!outputGridSizeSupported)
@@ -331,10 +334,10 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
         return FFX_ERROR_NULL_DEVICE;
     }
 
-    if ((contextDescription->resolution.width < capabilities.dataGraphOFMinWidth) ||
-        (contextDescription->resolution.height < capabilities.dataGraphOFMinHeight) ||
-        (contextDescription->resolution.width > capabilities.dataGraphOFMaxWidth) ||
-        (contextDescription->resolution.height > capabilities.dataGraphOFMaxHeight))
+    if (!context->hintsOnly && ((contextDescription->resolution.width < capabilities.dataGraphOFMinWidth) ||
+                                (contextDescription->resolution.height < capabilities.dataGraphOFMinHeight) ||
+                                (contextDescription->resolution.width > capabilities.dataGraphOFMaxWidth) ||
+                                (contextDescription->resolution.height > capabilities.dataGraphOFMaxHeight)))
     {
         return FFX_ERROR_NULL_DEVICE;
     }
@@ -703,8 +706,17 @@ static FfxErrorCode ArmOpticalFlowDispatch(OpticalFlowContext_Private* context, 
         }
     }
 
-    // Schedule optical flow data graph with computed mv hints
-    scheduleDataGraph(context, &context->pipelineOpticalflow, params->reset);
+    // Schedule optical flow data graph with computed mv hints, or take the hints as the flow without the engine
+    if (context->hintsOnly)
+    {
+        FfxGpuJobDescription copyJob       = {FFX_GPU_JOB_COPY};
+        copyJob.copyJobDescriptor.src      = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS];
+        copyJob.copyJobDescriptor.dst      = context->uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_RESULT];
+        copyJob.copyJobDescriptor.copyMode = FFX_GPU_COPY_SRC_EXTENT;
+        FFX_VALIDATE(context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &copyJob));
+    }
+    else
+        scheduleDataGraph(context, &context->pipelineOpticalflow, params->reset);
 
     // Save current view projection for next frame
     memcpy(context->lastFrameViewProjection, params->viewProjection, sizeof(context->lastFrameViewProjection));
@@ -769,7 +781,7 @@ FfxOpticalFlowGridSize ffxGetDefaultDataGraphOpticalFlowGridSize(FfxInterface& b
     const auto supportedSizes = capabilities.supportedOutputGridSizes;
 
     FfxOpticalFlowGridSize defaultGridSize = FFX_OPTICAL_FLOW_GRID_SIZE_UNKNOWN;
-    if (supportedSizes & FFX_OPTICAL_FLOW_GRID_SIZE_4X4)
+    if (!capabilities.dataGraphOFSupported || (supportedSizes & FFX_OPTICAL_FLOW_GRID_SIZE_4X4))
     {
         defaultGridSize = FFX_OPTICAL_FLOW_GRID_SIZE_4X4;
     }
