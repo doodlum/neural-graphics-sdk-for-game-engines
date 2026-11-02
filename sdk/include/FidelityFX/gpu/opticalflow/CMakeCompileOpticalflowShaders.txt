@@ -51,6 +51,7 @@ set(ARM_OPTICALFLOW_API_COMMON_ARGS
 
 file(GLOB ARM_OPTICALFLOW_SHADERS_COMP
     "shaders/opticalflow/ffx_opticalflow_mv_hints.glsl"
+    "shaders/opticalflow/ffx_opticalflow_flow_from_mv.glsl"
 )
 
 file(GLOB ARM_OPTICALFLOW_SHADERS_FRAG

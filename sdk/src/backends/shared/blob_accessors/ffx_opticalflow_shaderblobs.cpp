@@ -8,6 +8,7 @@
 #include <ffx_opticalflow_mv_hints_permutations.h>
 #include <ffx_opticalflow_mv_hints_fs_permutations.h>
 #include <ffx_opticalflow_mv_hints_vs_permutations.h>
+#include <ffx_opticalflow_flow_from_mv_permutations.h>
 #include <string.h>  // for memset
 
 #if defined(POPULATE_PERMUTATION_KEY)
@@ -58,6 +59,16 @@ FfxErrorCode opticalflowGetPermutationBlobByIndex(FfxOpticalflowPass passId, uin
     case FFX_OPTICALFLOW_PASS_COMPUTE_MOTION_FROM_DEPTH:
     {
         FfxShaderBlob blob = opticalflowGetComputeMotionFromDepthPassPermutationBlobByIndex(permutationOptions);
+        memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
+        return FFX_OK;
+    }
+
+    case FFX_OPTICALFLOW_PASS_FLOW_FROM_MOTION_VECTORS:
+    {
+        ffx_opticalflow_flow_from_mv_PermutationKey key;
+        POPULATE_PERMUTATION_KEY(permutationOptions, key);
+        const int32_t tableIndex = g_ffx_opticalflow_flow_from_mv_IndirectionTable[key.index];
+        FfxShaderBlob blob       = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_flow_from_mv_PermutationInfo, tableIndex);
         memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
         return FFX_OK;
     }

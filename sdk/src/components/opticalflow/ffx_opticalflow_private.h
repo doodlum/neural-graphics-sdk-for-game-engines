@@ -14,7 +14,12 @@
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_DEPTH_2                 8
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COLOR_1                 9
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COLOR_2                 10
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT                   11
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS     11
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_1            12  // the flow from motion vectors, ping-ponged
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_2            13
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_TM1          14  // the previous frame's (one of the two)
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE              15  // this frame's (the other)
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT                   16
 
 #define FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER 0
 #define FFX_OPTICALFLOW_CONSTANTBUFFER_COUNT      1
@@ -36,6 +41,15 @@ typedef struct OpticalFlowComputeMVHintsConstants
     int32_t color_size[2];
 } OpticalFlowComputeMVHintsConstants;
 
+typedef struct OpticalFlowFlowFromMotionVectorsConstants
+{
+    float   motion_vector_scale[2];
+    int32_t output_dims[2];
+    int32_t motion_vector_dims[2];
+    int32_t reset;
+    int32_t pad;
+} OpticalFlowFlowFromMotionVectorsConstants;
+
 // The private implementation of the arm data graph optical flow context.
 typedef struct OpticalFlowContext_Private
 {
@@ -45,6 +59,7 @@ typedef struct OpticalFlowContext_Private
     FfxPipelineState                   pipelineOpticalflow;
     FfxPipelineState                   pipelineComputeMVHints;
     FfxPipelineState                   pipelineFragmentMVHints;
+    FfxPipelineState                   pipelineFlowFromMotionVectors;  // hintsOnly
     bool                               useMVHintsFragment;
     bool                               hintsOnly;  // no data graph optical flow engine: the MV hints are the flow
     FfxResourceInternal                srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT];

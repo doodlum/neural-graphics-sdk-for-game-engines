@@ -64,6 +64,7 @@ extern "C" {
 typedef enum FfxOpticalflowPass
 {
     FFX_OPTICALFLOW_PASS_COMPUTE_MOTION_FROM_DEPTH = 0,
+    FFX_OPTICALFLOW_PASS_FLOW_FROM_MOTION_VECTORS,  // without the data graph engine: the flow from the game's motion vectors
 
     FFX_OPTICALFLOW_PASS_COUNT
 } FfxOpticalflowPass;
@@ -116,6 +117,8 @@ typedef struct FfxOpticalFlowDispatchDescription
              colorTm1;  ///< A <c><i>FfxResource</i></c> containing the output color buffer for the previous frame, used for computing MV hints and motion vectors.
     uint32_t meanFlowL1NormHint;  ///< Optional mean L1 norm flow hint. 0 means backend default.
     bool     reset;               ///< A boolean value which when set to true, indicates the camera has moved discontinuously.
+    FfxResource  motionVectors;      ///< The game's motion vectors (TP1 -> TM1), used for the flow when there is no data graph engine.
+    FfxFloat32x2 motionVectorScale;  ///< Scale of motionVectors to display pixels.
 } FfxOpticalFlowDispatchDescription;
 
 typedef struct FfxOpticalFlowSharedResourceDescriptions

@@ -50,8 +50,10 @@ typedef struct ResourceBinding
     char     name[64];
 } ResourceBinding;
 
-constexpr int                srvTextureCount                         = 5;
+constexpr int                srvTextureCount                         = 7;
 static const ResourceBinding srvTextureBindingTable[srvTextureCount] = {
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS, "r_game_motion_vectors"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_TM1, "r_flow_store_tm1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COLOR, "r_color_tp1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PREV_COLOR, "r_color_tm1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_DEPTH, "r_depth"},
@@ -59,8 +61,9 @@ static const ResourceBinding srvTextureBindingTable[srvTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS, "r_motion_vectors"},
 };
 
-constexpr int                uavTextureCount                         = 4;
+constexpr int                uavTextureCount                         = 5;
 static const ResourceBinding uavTextureBindingTable[uavTextureCount] = {
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE, "rw_flow_store"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_RESULT, "rw_flow"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS, "rw_motion_vectors"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PREV_DEPTH, "rw_depth_tm1"},
@@ -218,6 +221,29 @@ static FfxErrorCode createPipelineStates(OpticalFlowContext_Private* context)
         patchResourceBindings(&context->pipelineOpticalflow);
     }
 
+    if (context->hintsOnly)
+    {
+        ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFlowFromMotionVectors, context->effectContextId);
+        FfxPipelineDescription pipelineDescription = {};
+        pipelineDescription.stage                  = FFX_BIND_COMPUTE_SHADER_STAGE;
+        pipelineDescription.contextFlags           = context->contextDescription.flags;
+        FfxRootConstantDescription rootConstantDescs;
+        rootConstantDescs.size                      = sizeof(OpticalFlowFlowFromMotionVectorsConstants);
+        rootConstantDescs.stage                     = FFX_BIND_COMPUTE_SHADER_STAGE;
+        pipelineDescription.rootConstantBufferCount = 1;
+        pipelineDescription.rootConstants           = &rootConstantDescs;
+        strncpy(pipelineDescription.name, "ARM-OpticalFlow-FlowFromMotionVectors", FFX_RESOURCE_NAME_SIZE - 1);
+        pipelineDescription.name[FFX_RESOURCE_NAME_SIZE - 1] = '\0';
+        FFX_VALIDATE(context->contextDescription.backendInterface.fpCreateComputePipeline(&context->contextDescription.backendInterface,
+                                                                                          ARM_EFFECT_OPTICALFLOW,
+                                                                                          FFX_OPTICALFLOW_PASS_FLOW_FROM_MOTION_VECTORS,
+                                                                                          0,
+                                                                                          &pipelineDescription,
+                                                                                          context->effectContextId,
+                                                                                          &context->pipelineFlowFromMotionVectors));
+        patchResourceBindings(&context->pipelineFlowFromMotionVectors);
+    }
+
     context->useMVHintsFragment = !!(context->contextDescription.flags & FFX_OPTICALFLOW_ENABLE_MV_HINTS_FRAGMENT);
     if (context->useMVHintsFragment)
     {
@@ -322,9 +348,9 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
     FfxDeviceCapabilities capabilities;
     FFX_VALIDATE(context->contextDescription.backendInterface.fpGetDeviceCapabilities(&context->contextDescription.backendInterface, &capabilities));
     // Without the data graph optical flow engine (it is not emulated on the native compute ML path, for example on
-    // RADV), the flow is the camera-motion field the MV hints pass computes from depth: the engine's refinement of
-    // object and non-geometric motion is missing, but frame interpolation still runs (the networks also get the
-    // game's motion vectors).
+    // RADV), the flow is the previous frame's game motion vectors, negated (constant velocity; the FlowFromMotionVectors
+    // pass), or without motion vectors the camera-motion field the MV hints pass computes from depth. The engine's
+    // refinement of non-geometric motion is missing either way.
     context->hintsOnly = !capabilities.dataGraphOFSupported;
     const bool outputGridSizeSupported = context->hintsOnly || (contextDescription->gridSize & capabilities.supportedOutputGridSizes) != 0;
     // TODO: add check on hint grid size when we start using hint.
@@ -368,6 +394,26 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
          1,
          FFX_RESOURCE_FLAGS_NONE,
          {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_1,
+         "ArmOF_Flow_Store_1",
+         FFX_RESOURCE_TYPE_TEXTURE2D,
+         FFX_RESOURCE_USAGE_UAV,
+         FFX_SURFACE_FORMAT_R16G16_FLOAT,
+         context->opticalFlowSize.width,
+         context->opticalFlowSize.height,
+         1,
+         FFX_RESOURCE_FLAGS_NONE,
+         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_2,
+         "ArmOF_Flow_Store_2",
+         FFX_RESOURCE_TYPE_TEXTURE2D,
+         FFX_RESOURCE_USAGE_UAV,
+         FFX_SURFACE_FORMAT_R16G16_FLOAT,
+         context->opticalFlowSize.width,
+         context->opticalFlowSize.height,
+         1,
+         FFX_RESOURCE_FLAGS_NONE,
+         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
     };
 
     // clear the SRV resources to NULL.
@@ -394,6 +440,7 @@ static FfxErrorCode opticalFlowVkRelease(OpticalFlowContext_Private* context)
 
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineOpticalflow, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineComputeMVHints, context->effectContextId);
+    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFlowFromMotionVectors, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFragmentMVHints, context->effectContextId);
 
     // unregister resources not created internally
@@ -402,6 +449,10 @@ static FfxErrorCode opticalFlowVkRelease(OpticalFlowContext_Private* context)
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_RESULT]     = {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PREV_COLOR] = {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PREV_DEPTH] = {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_NULL};
+    // registered, or aliases of FLOW_STORE_1/2
+    context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS] = {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_NULL};
+    context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_TM1]      = {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_NULL};
+    context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE]          = {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_NULL};
 
     // release internal resources
     for (int32_t currentResourceIndex = 0; currentResourceIndex < FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT; ++currentResourceIndex)
@@ -707,7 +758,36 @@ static FfxErrorCode ArmOpticalFlowDispatch(OpticalFlowContext_Private* context, 
     }
 
     // Schedule optical flow data graph with computed mv hints, or take the hints as the flow without the engine
-    if (context->hintsOnly)
+    if (context->hintsOnly && params->motionVectors.resource)
+    {
+        // The flow from the game's motion vectors (see ffx_opticalflow_flow_from_mv.glsl): last frame's store is read,
+        // this frame's written to the other one.
+        context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface,
+                                                                        &params->motionVectors,
+                                                                        context->effectContextId,
+                                                                        &context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS]);
+        const uint32_t tm1 = context->resourceFrameIndex ? FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_2 : FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_1;
+        const uint32_t cur = context->resourceFrameIndex ? FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_1 : FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_2;
+        context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE_TM1] = context->srvResources[tm1];
+        context->uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_STORE]     = context->uavResources[cur];
+
+        OpticalFlowFlowFromMotionVectorsConstants c = {};
+        c.motion_vector_scale[0] = params->motionVectorScale[0];
+        c.motion_vector_scale[1] = params->motionVectorScale[1];
+        c.output_dims[0]         = int32_t(context->opticalFlowSize.width);
+        c.output_dims[1]         = int32_t(context->opticalFlowSize.height);
+        c.motion_vector_dims[0]  = int32_t(params->motionVectors.description.width);
+        c.motion_vector_dims[1]  = int32_t(params->motionVectors.description.height);
+        c.reset                  = params->reset || context->firstExecution ? 1 : 0;
+        FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+            &context->contextDescription.backendInterface, &c, sizeof(c), &context->constantBuffers[FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER]));
+        scheduleMVHintsAndCopyResources(context,
+                                        &context->pipelineFlowFromMotionVectors,
+                                        (context->opticalFlowSize.width + 15) / 16,
+                                        (context->opticalFlowSize.height + 15) / 16,
+                                        "ArmOF_FlowFromMotionVectors");
+    }
+    else if (context->hintsOnly)
     {
         FfxGpuJobDescription copyJob       = {FFX_GPU_JOB_COPY};
         copyJob.copyJobDescriptor.src      = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS];

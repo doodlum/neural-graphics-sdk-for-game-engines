@@ -645,6 +645,10 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             ofDispatchDesc.depth = Convert(prepDesc->depth);
             memcpy(ofDispatchDesc.viewProjection, prepDesc->viewProjection, sizeof(ofDispatchDesc.viewProjection));
             ofDispatchDesc.reset = desc->reset;
+            // Without the data graph engine the flow comes from the game's motion vectors (in display pixels).
+            ofDispatchDesc.motionVectors     = Convert(prepDesc->motionVectors);
+            ofDispatchDesc.motionVectorScale[0] = prepDesc->motionVectorScale.x;
+            ofDispatchDesc.motionVectorScale[1] = prepDesc->motionVectorScale.y;
             // OF texture should already have data graph usage from creation
             ofDispatchDesc.opticalFlowVector = internal_context->backendInterfaceShared.fpGetResource(
                 &internal_context->backendInterfaceShared, internal_context->sharedResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]);
