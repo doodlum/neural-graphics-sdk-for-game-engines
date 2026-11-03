@@ -732,6 +732,9 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
 
         FfxFrameInterpolationPrepareDescription dispatchDesc{};
         dispatchDesc.commandList                = desc->commandList;
+        for (ffxApiHeader* h = desc->header.pNext; h; h = h->pNext)
+            if (auto cam = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationCamera>(h))
+                dispatchDesc.orthographic = cam->orthographic;
         dispatchDesc.jitterOffset.x             = desc->jitterOffset.x;
         dispatchDesc.jitterOffset.y             = desc->jitterOffset.y;
         dispatchDesc.motionVectorScale.x        = desc->motionVectorScale.x;

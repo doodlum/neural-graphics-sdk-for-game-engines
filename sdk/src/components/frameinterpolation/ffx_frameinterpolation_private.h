@@ -85,7 +85,7 @@ typedef struct FrameInterpolationConstants
     int      _Reset;
     float    _Timestep;
     uint32_t _RandomSeed;
-    uint32_t _UiKind;  // bits 0-7: 0 r_ui_source the frame with UI (or presentColor), 1 the UI premultiplied, 2 the frame and r_ui_alpha; bit 8: r_no_warp_mask (also std140 padding)
+    uint32_t _Options;  // bits 0-7 the UI kind: 0 r_ui_source the frame with UI (or presentColor), 1 the UI premultiplied, 2 the frame and r_ui_alpha; bit 8 r_no_warp_mask bound; bit 9 orthographic camera (also std140 padding)
 
     int32_t _MvDepthLaneSize[2];
     float   _MvDepthLaneSizeRcp[2];
@@ -103,6 +103,7 @@ typedef struct FrameInterpolationRenderDescription
     float cameraFar;
     float cameraFovAngleVertical;
     float viewSpaceToMetersFactor;
+    bool  orthographic;
 
     FfxFloatCoords2D motionVectorScale;  ///< The scale factor to apply to motion vectors.
 } FrameInterpolationRenderDescription;

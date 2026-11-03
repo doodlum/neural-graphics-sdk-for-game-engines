@@ -148,6 +148,16 @@ struct ffxApiDispatchDescFrameGenerationNoWarp
     struct FfxApiResource mask;
 };
 
+/// @ingroup ffxFrameGeneration
+#define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_CAMERA 0x00020012u
+/// Chained to ffxApiDispatchDescFrameGenerationPrepare: orthographic 1 when the camera is orthographic (depth linear
+/// between cameraNear and cameraFar).
+struct ffxApiDispatchDescFrameGenerationCamera
+{
+    ffxDispatchDescHeader header;
+    uint32_t              orthographic;
+};
+
 typedef ffxReturnCode_t (*FfxApiCallbackFrameGenerationPresentFunc)(ffxApiCallbackDescFrameGenerationPresent* params, void* pUserCtx);
 typedef ffxReturnCode_t (*FfxApiDispatchFrameGenerationFunc)(ffxApiDispatchDescFrameGeneration* params, void* pUserCtx);
 

@@ -230,6 +230,7 @@ typedef struct FfxFrameInterpolationPrepareDescription
     float cameraFar;
     float viewSpaceToMetersFactor;
     float cameraFovAngleVertical;
+    uint32_t orthographic;  ///< The camera is orthographic: depth is linear between near and far
 
     FfxResource depth;           ///< The depth buffer data
     FfxResource motionVectors;   ///< The motion vector data

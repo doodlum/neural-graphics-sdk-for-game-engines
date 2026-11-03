@@ -78,7 +78,7 @@ layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION,
     FfxInt32     _Reset;
     FfxFloat32   _Timestep;
     FfxUInt32    _RandomSeed;
-    FfxUInt32    _UiKind;
+    FfxUInt32    _Options;
 
     FfxInt32x2   _MvDepthLaneSize;
     FfxFloat32x2 _MvDepthLaneSizeRcp;
@@ -160,12 +160,18 @@ FfxFloat32 Timestep()
 
 FfxUInt32 UiKind()
 {
-    return cbFI._UiKind & 0xffu;
+    return cbFI._Options & 0xffu;
 }
 
 FfxBoolean HasNoWarpMask()
 {
-    return (cbFI._UiKind & 0x100u) != 0u;
+    return (cbFI._Options & 0x100u) != 0u;
+}
+
+// An orthographic camera: view depth is linear in device depth (DeviceToViewSpaceTransformFactors .x + .y x depth).
+FfxBoolean IsOrthographic()
+{
+    return (cbFI._Options & 0x200u) != 0u;
 }
 
 FfxUInt32 RandomSeed()
@@ -226,6 +232,8 @@ FFX_MIN16_F4 QuantParamsSNORM()
 FfxFloat32 ConvertFromDeviceDepthToViewSpace(FfxFloat32 fDeviceDepth)
 {
     const FfxFloat32x4 deviceToViewDepth = DeviceToViewSpaceTransformFactors();
+    if (IsOrthographic())
+        return deviceToViewDepth[0] + deviceToViewDepth[1] * fDeviceDepth;
     return deviceToViewDepth[1] / (fDeviceDepth - deviceToViewDepth[0]);
 }
 

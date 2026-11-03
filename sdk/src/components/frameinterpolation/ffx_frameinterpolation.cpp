@@ -1402,6 +1402,12 @@ static void setupDeviceDepthToViewSpaceDepthParams(FfxArmFrameInterpolationConte
 
     constants->_DeviceToViewDepth[0] = d * matrix_elem_c[bInverted][bInfinite];
     constants->_DeviceToViewDepth[1] = matrix_elem_e[bInverted][bInfinite] * params->viewSpaceToMetersFactor;
+    if (params->orthographic)
+    {
+        // Linear: depth 0 at the near plane (the far one when inverted), 1 at the other.
+        constants->_DeviceToViewDepth[0] = fMin * params->viewSpaceToMetersFactor;
+        constants->_DeviceToViewDepth[1] = (fMax - fMin) * params->viewSpaceToMetersFactor;
+    }
 
     // revert x and y coords
     const float aspect      = params->renderSize.width / float(params->renderSize.height);
@@ -1463,6 +1469,7 @@ FFX_API FfxErrorCode ffxFrameInterpolationPrepare(FfxFrameInterpolationContext* 
     contextPrivate->renderDescription.cameraNear              = params->cameraNear;
     contextPrivate->renderDescription.viewSpaceToMetersFactor = (params->viewSpaceToMetersFactor > 0.0f) ? params->viewSpaceToMetersFactor : 1.0f;
     contextPrivate->renderDescription.cameraFovAngleVertical  = params->cameraFovAngleVertical;
+    contextPrivate->renderDescription.orthographic            = params->orthographic != 0;
     contextPrivate->renderDescription.renderSize  = {(uint32_t)contextPrivate->constants._RenderSize[0], (uint32_t)contextPrivate->constants._RenderSize[1]};
     contextPrivate->renderDescription.upscaleSize = {(uint32_t)contextPrivate->constants._DisplaySize[0], (uint32_t)contextPrivate->constants._DisplaySize[1]};
     setupDeviceDepthToViewSpaceDepthParams(contextPrivate, &contextPrivate->renderDescription, &contextPrivate->constants);
@@ -1546,9 +1553,10 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
 
     // Set constant buffer.
     contextPrivate->constants._Reset = bReset || bDisjointFrameID;
-    contextPrivate->constants._UiKind =
+    contextPrivate->constants._Options =
         (!params->uiSource.resource || (params->uiKind == 2u && !params->uiAlpha.resource) ? 0u : params->uiKind) |
-        (params->noWarpMask.resource ? 0x100u : 0u);  // bit 8: a no-warp mask is bound
+        (params->noWarpMask.resource ? 0x100u : 0u) |
+        (contextPrivate->renderDescription.orthographic ? 0x200u : 0u);  // from the last prepare
 
     FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
         &contextPrivate->contextDescription.backendInterface,
