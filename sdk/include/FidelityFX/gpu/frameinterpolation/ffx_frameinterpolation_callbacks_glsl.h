@@ -493,6 +493,17 @@ FFX_MIN16_F3 SamplePreviousBackbuffer(FFX_PARAMETER_IN FfxFloat32x2 fUv)
 }
 #endif
 
+#ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE
+// The current frame with its UI, when the interpolation sources are the frames without it (HUD-less): the
+// postprocess takes its pixels where the UI is drawn. The current interpolation source itself when there is none.
+layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE) uniform mediump texture2D r_ui_source;
+
+FFX_MIN16_F3 LoadUiSource(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
+{
+    return FFX_MIN16_F3(texelFetch(r_ui_source, iPxPos, 0).rgb);
+}
+#endif
+
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE) uniform mediump texture2D r_current_interpolation_source;
 

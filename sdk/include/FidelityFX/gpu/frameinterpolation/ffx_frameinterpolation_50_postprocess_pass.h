@@ -83,6 +83,16 @@ void postprocess(int32_t2 output_pixel)
     rgb_t += rgb_p1_warp_t_flow * params.w;
 
     // Write alpha composited output
+#ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE
+    // UI: where the frame with UI differs from the one interpolated (HUD-less), its pixel as it is, not warped.
+    {
+        const FFX_MIN16_F3 ui  = LoadUiSource(output_pixel);
+        const FFX_MIN16_F3 cur = LoadCurrentBackbuffer(output_pixel);
+        if (any(greaterThan(abs(ui - cur), FFX_MIN16_F3(2.0f / 255.0f))))
+            rgb_t = ui;
+    }
+#endif
+
     StoreFrameinterpolationOutput(output_pixel, FFX_MIN16_F4(rgb_t, 1.0f));
 
     // When the SDK owns the previous-source ping-pong buffer, persist the current

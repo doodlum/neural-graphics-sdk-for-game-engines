@@ -20,6 +20,7 @@
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FILLED_MOTION_TM1          3
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_PREVIOUS_INTERPOLATION_SOURCE   4
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE    5
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE                       7
 
 //-----------------------------------------------------------------------------
 // Input: RT bindings

@@ -60,6 +60,11 @@ namespace ffx
     };
 
     template <>
+    struct struct_type<ffxApiDispatchDescFrameGenerationUiSource> : std::integral_constant<uint64_t, FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_UI_SOURCE>
+    {
+    };
+
+    template <>
     struct struct_type<ffxApiDispatchDescFrameGenerationPrepare> : std::integral_constant<uint64_t, FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE>
     {
     };

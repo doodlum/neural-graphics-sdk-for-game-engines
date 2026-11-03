@@ -674,6 +674,10 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             // don't dispatch interpolation async for now: use the same commandlist for copy and interpolate
             fiDispatchDesc.commandList       = desc->commandList;
             fiDispatchDesc.currentBackBuffer = Convert(desc->presentColor);
+            // presentColor without UI (HUD-less): the frame with it, chained, for the UI the output keeps.
+            for (ffxApiHeader* h = desc->header.pNext; h; h = h->pNext)
+                if (auto ui = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationUiSource>(h))
+                    fiDispatchDesc.uiSource = Convert(ui->uiSource);
             fiDispatchDesc.reset             = desc->reset;
 
             fiDispatchDesc.output            = Convert(desc->outputs[0]);

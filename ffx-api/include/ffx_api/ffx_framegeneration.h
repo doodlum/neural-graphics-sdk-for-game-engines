@@ -119,6 +119,16 @@ struct ffxApiDispatchDescFrameGeneration
         frameID;  ///< Identifier used to select internal resources when async support is enabled. Must increment by exactly one (1) for each frame. Any non-exactly-one difference will reset the frame generation logic.
 };
 
+/// @ingroup ffxFrameGeneration
+#define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_UI_SOURCE 0x00020010u
+/// Chained to ffxApiDispatchDescFrameGeneration when presentColor is the frame without its UI (HUD-less): the frame
+/// with it. The generated frames are interpolated without UI and keep the UI pixels of this one, not warped.
+struct ffxApiDispatchDescFrameGenerationUiSource
+{
+    ffxDispatchDescHeader header;
+    struct FfxApiResource uiSource;
+};
+
 typedef ffxReturnCode_t (*FfxApiCallbackFrameGenerationPresentFunc)(ffxApiCallbackDescFrameGenerationPresent* params, void* pUserCtx);
 typedef ffxReturnCode_t (*FfxApiDispatchFrameGenerationFunc)(ffxApiDispatchDescFrameGeneration* params, void* pUserCtx);
 

@@ -63,6 +63,7 @@ static const ResourceBinding srvResourceBindingTable[] = {
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_SCENE_CHANGE_DETECTION, "r_optical_flow_scd"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_PREVIOUS_INTERPOLATION_SOURCE, "r_previous_interpolation_source"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE, "r_current_interpolation_source"},
+    {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE, "r_ui_source"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_PRESENT_BACKBUFFER, "r_present_backbuffer"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT, "r_output"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_WARP_MOTION_QDATA_TP1, "r_warped_motion_qdata_tp1"},
@@ -1002,6 +1003,7 @@ static FfxErrorCode frameinterpolationRelease(FfxArmFrameInterpolationContext_Pr
     // unregister resources not created internally
     // ARM_TODO: Release all resources
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE]        = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
+    context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE]                           = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]                 = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_DEPTH]                               = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_MOTION_VECTORS]                      = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
@@ -1554,6 +1556,20 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
         &contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE]));
     contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_PRESENT_BACKBUFFER] =
         contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE];
+    // The frame with its UI when currentBackBuffer is HUD-less; else the same image (no pixel differs: no UI kept).
+    if (params->uiSource.resource)
+    {
+        FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
+            &contextPrivate->contextDescription.backendInterface,
+            &params->uiSource,
+            contextPrivate->effectContextId,
+            &contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE]));
+    }
+    else
+    {
+        contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE] =
+            contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE];
+    }
 
     // Register output as SRV and UAV
     FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
