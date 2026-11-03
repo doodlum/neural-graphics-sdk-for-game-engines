@@ -28,6 +28,9 @@
 #include <cmath>      // for fabs, abs, sinf, sqrt, etc.
 #include <string.h>   // for memset
 #include <cstdlib>    // for getenv
+#if defined(_WIN32)
+#include <windows.h>  // for GetEnvironmentVariableA
+#endif
 
 #include "FidelityFX/host/ffx_opticalflow.h"
 #define FFX_CPU
@@ -131,6 +134,19 @@ static FfxErrorCode patchResourceBindings(FfxPipelineState* inoutPipeline)
     }
 
     return FFX_OK;
+}
+
+// Settings from the process environment. On Windows from the Win32 environment block, not the C runtime's copy, so a
+// value the host sets after this DLL's runtime started (DeckyUpscaler's proxy passes its plugin settings so) counts.
+static const char* SettingEnv(const char* name)
+{
+#if defined(_WIN32)
+    static thread_local char value[64];
+    const DWORD              n = GetEnvironmentVariableA(name, value, sizeof(value));
+    return n && n < sizeof(value) ? value : nullptr;
+#else
+    return getenv(name);
+#endif
 }
 
 static FfxOpticalFlowDescription createOpticalFlowDescription(FfxSurfaceFormat               colorFormat,
@@ -414,7 +430,7 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
     const int32_t fixHeight       = int32_t(displaySize.height + 7) / 8;
     const int32_t lumaPackedWidth = (lumaWidth + 3) / 4 + 1;
     {
-        const char* v   = getenv("FFX_OF_REFINE");
+        const char* v   = SettingEnv("FFX_OF_REFINE");
         context->refine = context->hintsOnly && v && !strcmp(v, "1");
         const char* p1  = getenv("FFX_OF_PENALTY");
         const char* p2  = getenv("FFX_OF_PENALTY_STEP");
