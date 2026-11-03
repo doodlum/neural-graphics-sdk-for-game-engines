@@ -476,5 +476,7 @@ there is wrong). Cost at 1280x720: luma 50, search 116, refine 85, apply 167 us 
 Tried and dropped: correcting the flow only (TM1 side, 13.5 dB at best), one vector per 4x4 pixels written per
 pixel (1.16 ms), joint bilateral upsampling of the corrections by depth (no better, 1.7x the apply cost). ML
 optical flow networks (NeuFlow v2, FastFlowNet, CompactFlowNet, RIFE's IFNet) estimate at 2-50 ms here.
+A distance penalty in the search (SAD + 16/32/64 per texel from the motion vectors' estimate) left the 6 px case at
+7.4 dB and cost the 12 and 20 px cases 0.6-7 dB (reverted).
 Open: the periodic-texture aliasing (prefer the smaller of near-equal matches, or neighbours' vectors), the
 2.4 dB on correct content, and reading the corrections in the consumers instead of the full-resolution apply.
