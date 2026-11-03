@@ -25,6 +25,15 @@ FFX_MIN16_F4 Stable_Softmax(FFX_MIN16_F4 tensor)
     return smax_activated;
 }
 
+// A warp offset under half a pixel samples the pixel itself: static and nearly static content (whose warped motion is
+// zero or a quantisation step or two, about 0.06 px each) is passed through unfiltered, where bilinear filtering at
+// those fractional offsets softened it in every generated frame.
+float2 SnapSmallOffset(float2 uv, float2 offset, float2 size)
+{
+    const float2 px = offset * size;
+    return dot(px, px) < 0.25f ? uv : uv + offset;
+}
+
 void postprocess(int32_t2 output_pixel)
 {
     int32_t2 displaySize = DisplaySize();
@@ -48,13 +57,14 @@ void postprocess(int32_t2 output_pixel)
     FFX_MIN16_F2 mv_t_f30_m1   = LoadWarpedFilledMotionTP1(iMvCoord);
 
     // Calculate warped game mv positions
-    float  timestep = Timestep();
-    float2 uv_m1_mv = uv + float2(mv_t_f30_m1 * timestep);
-    float2 uv_p1_mv = uv - float2(mv_t_f30_m1 * (1.0f - timestep));
+    float        timestep = Timestep();
+    const float2 size     = float2(displaySize);
+    float2       uv_m1_mv = SnapSmallOffset(uv, float2(mv_t_f30_m1 * timestep), size);
+    float2       uv_p1_mv = SnapSmallOffset(uv, -float2(mv_t_f30_m1 * (1.0f - timestep)), size);
 
     // Calculate warped optical flow positions
-    float2 uv_m1_flow = uv - float2(flow_t_f30_p1 * timestep);
-    float2 uv_p1_flow = uv + float2(flow_t_f30_p1 * (1.0f - timestep));
+    float2 uv_m1_flow = SnapSmallOffset(uv, -float2(flow_t_f30_p1 * timestep), size);
+    float2 uv_p1_flow = SnapSmallOffset(uv, float2(flow_t_f30_p1 * (1.0f - timestep)), size);
 
     // Warp colour using gather approach with warped vectors
     FFX_MIN16_F3 rgb_m1_warp_t_mv   = SamplePreviousBackbuffer(uv_m1_mv);
