@@ -100,11 +100,12 @@ void postprocess(int32_t2 output_pixel)
             rgb_t = ui.rgb + (FFX_MIN16_F(1.0f) - ui.a) * rgb_t;
         }
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA
-        else if (UiKind() == 2u)
+        else if (UiKind() == 2u || UiKind() == 3u)
         {
-            // The frame with UI and the UI's opacity (DLSS-G's UI alpha): the UI colour is frame - (1 - a) x HUD-less,
-            // so over the interpolated scene the output is frame - (1 - a) x (HUD-less - interpolated).
-            const FFX_MIN16_F  a   = LoadUiAlpha(output_pixel);
+            // The frame with UI and the UI's opacity (DLSS-G's UI alpha, or a UI layer's alpha): the UI colour is
+            // frame - (1 - a) x HUD-less, so over the interpolated scene the output is frame - (1 - a) x (HUD-less -
+            // interpolated): where nothing moves, the frame exactly.
+            const FFX_MIN16_F  a   = LoadUiAlpha(output_pixel, UiKind() == 3u);
             const FFX_MIN16_F3 cur = LoadCurrentBackbuffer(output_pixel);
             rgb_t = max(ui.rgb - (FFX_MIN16_F(1.0f) - a) * (cur - rgb_t), FFX_MIN16_F3(0.0f));
         }

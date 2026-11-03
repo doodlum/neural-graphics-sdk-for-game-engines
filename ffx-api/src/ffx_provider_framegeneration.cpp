@@ -687,7 +687,7 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
                 {
                     fiDispatchDesc.uiSource = Convert(ui->uiSource);
                     fiDispatchDesc.uiKind   = ui->uiKind;
-                    if (ui->uiKind == FFX_API_FG_UI_KIND_FRAME_AND_ALPHA)
+                    if (ui->uiKind == FFX_API_FG_UI_KIND_FRAME_AND_ALPHA || ui->uiKind == FFX_API_FG_UI_KIND_FRAME_AND_LAYER_ALPHA)
                         fiDispatchDesc.uiAlpha = Convert(ui->uiAlpha);
                 }
             }

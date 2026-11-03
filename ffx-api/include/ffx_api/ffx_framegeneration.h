@@ -130,6 +130,9 @@ struct ffxApiDispatchDescFrameGeneration
 #define FFX_API_FG_UI_KIND_FRAME_WITH_UI 0u
 #define FFX_API_FG_UI_KIND_PREMULTIPLIED_UI 1u
 #define FFX_API_FG_UI_KIND_FRAME_AND_ALPHA 2u
+/// uiKind 3: as 2, the opacity in uiAlpha's alpha channel (a UI layer used for its alpha only: the colour is the frame's,
+/// so where nothing moves the output is the frame exactly, whatever the layer's colour encoding).
+#define FFX_API_FG_UI_KIND_FRAME_AND_LAYER_ALPHA 3u
 struct ffxApiDispatchDescFrameGenerationUiSource
 {
     ffxDispatchDescHeader header;

@@ -1554,7 +1554,8 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
     // Set constant buffer.
     contextPrivate->constants._Reset = bReset || bDisjointFrameID;
     contextPrivate->constants._Options =
-        (!params->uiSource.resource || (params->uiKind == 2u && !params->uiAlpha.resource) ? 0u : params->uiKind) |
+        (!params->uiSource.resource || ((params->uiKind == 2u || params->uiKind == 3u) && !params->uiAlpha.resource) ? 0u
+                                                                                                                  : params->uiKind) |
         (params->noWarpMask.resource ? 0x100u : 0u) |
         (contextPrivate->renderDescription.orthographic ? 0x200u : 0u);  // from the last prepare
 
@@ -1600,7 +1601,7 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
             contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE];
     }
     // The UI's opacity (uiKind 2); else bound to the UI source, which the pass does not read as opacity.
-    if (params->uiSource.resource && params->uiKind == 2u && params->uiAlpha.resource)
+    if (params->uiSource.resource && (params->uiKind == 2u || params->uiKind == 3u) && params->uiAlpha.resource)
     {
         FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
             &contextPrivate->contextDescription.backendInterface,

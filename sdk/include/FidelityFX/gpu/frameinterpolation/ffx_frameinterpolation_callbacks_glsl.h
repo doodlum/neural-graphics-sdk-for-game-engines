@@ -525,9 +525,11 @@ FFX_MIN16_F4 LoadUiSource(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA) uniform mediump texture2D r_ui_alpha;
 
-FFX_MIN16_F LoadUiAlpha(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
+// The UI's opacity: red (UI alpha), or alpha (a UI layer's, uiKind 3).
+FFX_MIN16_F LoadUiAlpha(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FfxBoolean fromAlpha)
 {
-    return FFX_MIN16_F(texelFetch(r_ui_alpha, iPxPos, 0).r);
+    const FFX_MIN16_F4 v = FFX_MIN16_F4(texelFetch(r_ui_alpha, iPxPos, 0));
+    return fromAlpha ? v.a : v.r;
 }
 #endif
 
