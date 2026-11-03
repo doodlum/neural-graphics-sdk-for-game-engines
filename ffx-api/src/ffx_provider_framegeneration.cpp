@@ -681,7 +681,10 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             // presentColor without UI (HUD-less): the frame with it, chained, for the UI the output keeps.
             for (ffxApiHeader* h = desc->header.pNext; h; h = h->pNext)
                 if (auto ui = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationUiSource>(h))
+                {
                     fiDispatchDesc.uiSource = Convert(ui->uiSource);
+                    fiDispatchDesc.uiKind   = ui->uiKind;
+                }
             fiDispatchDesc.reset             = desc->reset;
 
             fiDispatchDesc.output            = Convert(desc->outputs[0]);

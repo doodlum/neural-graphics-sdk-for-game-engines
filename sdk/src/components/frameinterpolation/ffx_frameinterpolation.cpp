@@ -1542,6 +1542,7 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
 
     // Set constant buffer.
     contextPrivate->constants._Reset = bReset || bDisjointFrameID;
+    contextPrivate->constants._UiKind = params->uiSource.resource ? params->uiKind : 0u;
 
     FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
         &contextPrivate->contextDescription.backendInterface,

@@ -121,12 +121,17 @@ struct ffxApiDispatchDescFrameGeneration
 
 /// @ingroup ffxFrameGeneration
 #define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_UI_SOURCE 0x00020010u
-/// Chained to ffxApiDispatchDescFrameGeneration when presentColor is the frame without its UI (HUD-less): the frame
-/// with it. The generated frames are interpolated without UI and keep the UI pixels of this one, not warped.
+/// Chained to ffxApiDispatchDescFrameGeneration when presentColor is the frame without its UI (HUD-less). The
+/// generated frames are interpolated without UI and get this frame's UI, not warped. uiKind 0: uiSource is the frame
+/// with UI, whose pixels that differ from presentColor are kept. uiKind 1: uiSource is the UI alone, colour
+/// premultiplied by alpha (DLSS-G's UI colour and alpha): output = ui.rgb + (1 - ui.a) x interpolated.
+#define FFX_API_FG_UI_KIND_FRAME_WITH_UI 0u
+#define FFX_API_FG_UI_KIND_PREMULTIPLIED_UI 1u
 struct ffxApiDispatchDescFrameGenerationUiSource
 {
     ffxDispatchDescHeader header;
     struct FfxApiResource uiSource;
+    uint32_t              uiKind;
 };
 
 typedef ffxReturnCode_t (*FfxApiCallbackFrameGenerationPresentFunc)(ffxApiCallbackDescFrameGenerationPresent* params, void* pUserCtx);

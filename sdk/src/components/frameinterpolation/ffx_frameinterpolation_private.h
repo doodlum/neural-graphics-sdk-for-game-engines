@@ -85,7 +85,7 @@ typedef struct FrameInterpolationConstants
     int      _Reset;
     float    _Timestep;
     uint32_t _RandomSeed;
-    uint32_t _pad0;  // std140 padding for ivec2 alignment
+    uint32_t _UiKind;  // 0: r_ui_source is the frame with UI (or presentColor itself); 1: the UI premultiplied (also std140 padding)
 
     int32_t _MvDepthLaneSize[2];
     float   _MvDepthLaneSizeRcp[2];

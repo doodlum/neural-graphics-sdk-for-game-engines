@@ -78,7 +78,7 @@ layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION,
     FfxInt32     _Reset;
     FfxFloat32   _Timestep;
     FfxUInt32    _RandomSeed;
-    FfxUInt32    _pad0;
+    FfxUInt32    _UiKind;
 
     FfxInt32x2   _MvDepthLaneSize;
     FfxFloat32x2 _MvDepthLaneSizeRcp;
@@ -156,6 +156,11 @@ FfxBoolean Reset()
 FfxFloat32 Timestep()
 {
     return cbFI._Timestep;
+}
+
+FfxUInt32 UiKind()
+{
+    return cbFI._UiKind;
 }
 
 FfxUInt32 RandomSeed()
@@ -498,9 +503,9 @@ FFX_MIN16_F3 SamplePreviousBackbuffer(FFX_PARAMETER_IN FfxFloat32x2 fUv)
 // postprocess takes its pixels where the UI is drawn. The current interpolation source itself when there is none.
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE) uniform mediump texture2D r_ui_source;
 
-FFX_MIN16_F3 LoadUiSource(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
+FFX_MIN16_F4 LoadUiSource(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 {
-    return FFX_MIN16_F3(texelFetch(r_ui_source, iPxPos, 0).rgb);
+    return FFX_MIN16_F4(texelFetch(r_ui_source, iPxPos, 0));
 }
 #endif
 

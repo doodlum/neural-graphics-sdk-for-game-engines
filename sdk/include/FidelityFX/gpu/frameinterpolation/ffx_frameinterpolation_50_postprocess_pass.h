@@ -84,12 +84,22 @@ void postprocess(int32_t2 output_pixel)
 
     // Write alpha composited output
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE
-    // UI: where the frame with UI differs from the one interpolated (HUD-less), its pixel as it is, not warped.
     {
-        const FFX_MIN16_F3 ui  = LoadUiSource(output_pixel);
-        const FFX_MIN16_F3 cur = LoadCurrentBackbuffer(output_pixel);
-        if (any(greaterThan(abs(ui - cur), FFX_MIN16_F3(2.0f / 255.0f))))
-            rgb_t = ui;
+        const FFX_MIN16_F4 ui = LoadUiSource(output_pixel);
+        if (UiKind() == 1u)
+        {
+            // The UI alone, premultiplied (DLSS-G's UI colour and alpha): blended over the interpolated scene as the
+            // game blends it over the HUD-less frame, so soft edges, shadows and translucent panels keep the scene
+            // behind them interpolated.
+            rgb_t = ui.rgb + (FFX_MIN16_F(1.0f) - ui.a) * rgb_t;
+        }
+        else
+        {
+            // The frame with UI: where it differs from the one interpolated (HUD-less), its pixel as it is, not warped.
+            const FFX_MIN16_F3 cur = LoadCurrentBackbuffer(output_pixel);
+            if (any(greaterThan(abs(ui.rgb - cur), FFX_MIN16_F3(2.0f / 255.0f))))
+                rgb_t = ui.rgb;
+        }
     }
 #endif
 
