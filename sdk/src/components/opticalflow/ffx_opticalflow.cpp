@@ -784,8 +784,9 @@ static FfxErrorCode ArmOpticalFlowDispatch(OpticalFlowContext_Private* context, 
             c.depth_inverted         = (context->contextDescription.flags & FFX_OPTICALFLOW_ENABLE_DEPTH_INVERTED) ? 1 : 0;
             FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
                 &context->contextDescription.backendInterface, &c, sizeof(c), &context->constantBuffers[FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER]));
-            const uint32_t groupsX = (params->motionVectors.description.width + 15) / 16;
-            const uint32_t groupsY = (params->motionVectors.description.height + 15) / 16;
+            // One invocation per 2x2 block of motion vectors.
+            const uint32_t groupsX = (params->motionVectors.description.width + 31) / 32;
+            const uint32_t groupsY = (params->motionVectors.description.height + 31) / 32;
             scheduleMVHintsAndCopyResources(context, &context->pipelineScatterDepth, groupsX, groupsY, "ArmOF_ScatterDepth");
             scheduleMVHintsAndCopyResources(context, &context->pipelineScatterFlow, groupsX, groupsY, "ArmOF_ScatterFlow");
         }

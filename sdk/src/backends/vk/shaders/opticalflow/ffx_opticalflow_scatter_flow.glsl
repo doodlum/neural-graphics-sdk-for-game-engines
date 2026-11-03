@@ -31,16 +31,22 @@ layout(set = 0, binding = 0, std140) uniform Uniforms {
 layout(set = 0, binding = 1) uniform texture2D r_game_motion_vectors;  // display resolution | RG
 layout(set = 0, binding = 2) uniform texture2D r_depth;                // TP1 depth | R32F
 
-// Where this TP1 pixel was in TM1, as an optical flow texel (false off screen), and its depth key: nearer is smaller.
-bool Source(FfxInt32x2 p, out FfxInt32x2 cell, out FfxFloat32x2 flow, out FfxUInt32 key)
+// Each invocation takes one TP1 pixel of a 2x2 block (an optical flow texel is 4x4 pixels or more): a quarter of
+// the atomics and memory traffic.
+FfxUInt32 DepthKey(FfxInt32x2 p)
+{
+    const FfxInt32x2 d = clamp(p * ubo._DepthDims / ubo._MotionVectorDims, FfxInt32x2(0), ubo._DepthDims - FfxInt32x2(1));
+    const FfxFloat32 z = clamp(texelFetch(r_depth, d, 0).r, 0.0f, 1.0f);
+    return floatBitsToUint(ubo._DepthInverted != 0 ? 1.0f - z : z);  // nearer is smaller; non-negative floats order like their bits
+}
+
+// Where this TP1 pixel was in TM1, as an optical flow texel (false off screen).
+bool Source(FfxInt32x2 p, out FfxInt32x2 cell, out FfxFloat32x2 flow)
 {
     const FfxFloat32x2 mv = texelFetch(r_game_motion_vectors, p, 0).xy * ubo._MotionVectorScale;
     const FfxFloat32x2 q  = FfxFloat32x2(p) + 0.5f + mv;
     flow = -mv;
     cell = FfxInt32x2(floor(q * FfxFloat32x2(ubo._OutputDims) / FfxFloat32x2(ubo._MotionVectorDims)));
-    const FfxInt32x2 d = clamp(p * ubo._DepthDims / ubo._MotionVectorDims, FfxInt32x2(0), ubo._DepthDims - FfxInt32x2(1));
-    const FfxFloat32 z = clamp(texelFetch(r_depth, d, 0).r, 0.0f, 1.0f);
-    key = floatBitsToUint(ubo._DepthInverted != 0 ? 1.0f - z : z);  // non-negative floats order like their bits
     return all(greaterThanEqual(q, FfxFloat32x2(0.0f))) && all(lessThan(q, FfxFloat32x2(ubo._MotionVectorDims))) &&
            all(lessThan(cell, ubo._OutputDims));
 }
@@ -50,12 +56,13 @@ layout(set = 0, binding = 4, rg16f) uniform writeonly image2D rw_flow;   // opti
 
 void main()
 {
-    const FfxInt32x2 p = FfxInt32x2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(p, ubo._MotionVectorDims)))
+    const FfxInt32x2 block = FfxInt32x2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(block * 2, ubo._MotionVectorDims)))
         return;
-    FfxInt32x2   cell;
-    FfxFloat32x2 flow;
-    FfxUInt32    key;
-    if (Source(p, cell, flow, key) && texelFetch(r_scatter_depth, cell, 0).r == key)
+    const FfxInt32x2 p   = block * 2;
+    const FfxUInt32  key = DepthKey(p);
+    FfxInt32x2       cell;
+    FfxFloat32x2     flow;
+    if (Source(p, cell, flow) && texelFetch(r_scatter_depth, cell, 0).r == key)
         imageStore(rw_flow, cell, FfxFloat32x4(flow, 0.0f, 0.0f));
 }
