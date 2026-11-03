@@ -86,8 +86,8 @@ void warp_flow(int32_t2 output_pixel)
     // Perform depth-aware forward warp
     int32_t2 outCoord;
     uint32_t outData;
-    Warp(output_pixel, mv_p1_f30_m1, depth_p1, renderSize, FFX_MIN16_F(1.0) - FFX_MIN16_F(Timestep()), FFX_MIN16_F(1.0), outCoord, outData);
-    UpdateWarpMotionQDataTp1(FFX_MIN16_I2(outCoord), outData);
+    if (Warp(output_pixel, mv_p1_f30_m1, depth_p1, renderSize, FFX_MIN16_F(1.0) - FFX_MIN16_F(Timestep()), FFX_MIN16_F(1.0), outCoord, outData))
+        UpdateWarpMotionQDataTp1(FFX_MIN16_I2(outCoord), outData);
 
     /*---------------------------.
     | :: DD mask holes writes :: |
@@ -175,8 +175,8 @@ void warp_flow(int32_t2 output_pixel)
     depth_m1 = FFX_MIN16_F(InvertAndNormalizeDepth(depth_m1, output_pixel_cont, renderSizeAreaRcp));
 
     // Perform depth-aware forward warp
-    Warp(output_pixel, cm_m1_f30_p1, depth_m1, renderSize, FFX_MIN16_F(Timestep()), FFX_MIN16_F(-1.0f), outCoord, outData);
-    UpdateWarpMotionQDataTp1(FFX_MIN16_I2(outCoord), outData);
+    if (Warp(output_pixel, cm_m1_f30_p1, depth_m1, renderSize, FFX_MIN16_F(Timestep()), FFX_MIN16_F(-1.0f), outCoord, outData))
+        UpdateWarpMotionQDataTp1(FFX_MIN16_I2(outCoord), outData);
 }
 
 #endif

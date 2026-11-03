@@ -8,7 +8,8 @@
 #ifndef WARP_FLOW_COMMON
 #define WARP_FLOW_COMMON
 
-void Warp(FfxInt32x2                   dtId,
+// False when the target is off screen: outCoord and outData are then not set, and nothing is to be scattered.
+FfxBoolean Warp(FfxInt32x2                   dtId,
           half2                        motion,
           FfxFloat32                   depth,
           FfxInt32x2                   output_dims,
@@ -27,7 +28,7 @@ void Warp(FfxInt32x2                   dtId,
     FfxInt32x2 coord = dtId + FfxInt32x2(floor(vector * t));
 
     if (!IsOnScreen(coord, output_dims))
-        return;
+        return false;
 
     // Pack data for scattering. This packing has the layout:
     // (MSB->LSB): depth | exponent | signX | signY | mantissaX | mantissaY
@@ -35,6 +36,7 @@ void Warp(FfxInt32x2                   dtId,
 
     outCoord = coord;
     outData  = qdata;
+    return true;
 }
 
 #endif  // WARP_FLOW_COMMON

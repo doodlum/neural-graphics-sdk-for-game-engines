@@ -478,5 +478,27 @@ pixel (1.16 ms), joint bilateral upsampling of the corrections by depth (no bett
 optical flow networks (NeuFlow v2, FastFlowNet, CompactFlowNet, RIFE's IFNet) estimate at 2-50 ms here.
 A distance penalty in the search (SAD + 16/32/64 per texel from the motion vectors' estimate) left the 6 px case at
 7.4 dB and cost the 12 and 20 px cases 0.6-7 dB (reverted).
+#### Smoke: simple or block-matched flow
+
+`fg_vk_test --smoke VX,VY`: a translucent churning plume (up to 75% opaque) drifting over the scene without motion
+vectors or depth, as games draw particles; PSNR over its region (1280x720, 24 frames):
+
+| scene                                          | simple flow | `FFX_OF_REFINE=1` |
+|------------------------------------------------|-------------|-------------------|
+| smoke 6,-4 px/frame                            | 54.6 dB     | 54.6 dB           |
+| smoke 24,-12 px/frame                          | 43.2 dB     | 35.3 dB           |
+| smoke still, camera panning (`--camvx 0.4`)    | 38.2 dB     | 38.0 dB           |
+| smoke 20,-8 px/frame, camera panning           | 35.8 dB     | 31.1 dB           |
+| opaque square without motion vectors (`--nomv`)| 7.6 dB      | 29.0 dB           |
+| square with exact motion vectors               | 39.2 dB     | 36.9 dB           |
+
+Block matching never helps smoke and costs up to 8 dB on fast smoke: a pixel shows smoke and background at once and
+the flow carries one motion, so a correction that follows the smoke drags the background under it. Requiring the
+correction itself to match near exactly (its block SAD below 48-240 of 4080, `FFX_OF_MAX_RESIDUAL`, reverted) gained
+at most 1.5 dB on smoke and lost 0.8 dB on the opaque square: soft smoke matches cleanly, which is why it fools the
+search. Decision: the simple flow stays the default; block matching is for games with opaque content drawn without
+motion vectors. Per frame at 1280x800 the simple path is about 3.5 ms (graph 2.21, warp 0.36, postprocess 0.34,
+flow scatter 0.22, preprocess 0.21 ms), block matching adds 0.46 ms.
+
 Open: the periodic-texture aliasing (prefer the smaller of near-equal matches, or neighbours' vectors), the
 2.4 dB on correct content, and reading the corrections in the consumers instead of the full-resolution apply.

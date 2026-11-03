@@ -32,8 +32,8 @@ void warp_flow_tm1(int32_t2 output_pixel)
     // Perform depth-aware forward warp
     int32_t2 outCoord;
     uint32_t outData;
-    Warp(output_pixel, flow_m1_f30_p1, depth_m1, ofRes, FFX_MIN16_F(Timestep()), FFX_MIN16_F(1.0), outCoord, outData);
-    UpdateWarpFlowQDataTm1(FFX_MIN16_I2(outCoord), outData);
+    if (Warp(output_pixel, flow_m1_f30_p1, depth_m1, ofRes, FFX_MIN16_F(Timestep()), FFX_MIN16_F(1.0), outCoord, outData))
+        UpdateWarpFlowQDataTm1(FFX_MIN16_I2(outCoord), outData);
 }
 
 #endif
