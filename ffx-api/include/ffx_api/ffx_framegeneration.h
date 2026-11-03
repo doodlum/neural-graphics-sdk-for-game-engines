@@ -138,6 +138,16 @@ struct ffxApiDispatchDescFrameGenerationUiSource
     struct FfxApiResource uiAlpha;  ///< uiKind 2 only
 };
 
+/// @ingroup ffxFrameGeneration
+#define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_NO_WARP 0x00020011u
+/// Chained to ffxApiDispatchDescFrameGeneration: pixels not to warp (DLSS-G's no-warp mask, red channel above 0.5):
+/// there the generated frame has presentColor's pixel as it is (any UI is still composited over it).
+struct ffxApiDispatchDescFrameGenerationNoWarp
+{
+    ffxDispatchDescHeader header;
+    struct FfxApiResource mask;
+};
+
 typedef ffxReturnCode_t (*FfxApiCallbackFrameGenerationPresentFunc)(ffxApiCallbackDescFrameGenerationPresent* params, void* pUserCtx);
 typedef ffxReturnCode_t (*FfxApiDispatchFrameGenerationFunc)(ffxApiDispatchDescFrameGeneration* params, void* pUserCtx);
 

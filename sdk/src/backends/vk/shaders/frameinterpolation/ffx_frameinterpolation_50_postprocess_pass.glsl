@@ -22,6 +22,7 @@
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE    5
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE                       9
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA                        10
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_NO_WARP_MASK                    11
 
 //-----------------------------------------------------------------------------
 // Input: UAV bindings

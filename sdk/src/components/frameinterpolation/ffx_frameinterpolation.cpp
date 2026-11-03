@@ -65,6 +65,7 @@ static const ResourceBinding srvResourceBindingTable[] = {
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE, "r_current_interpolation_source"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE, "r_ui_source"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_ALPHA, "r_ui_alpha"},
+    {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NO_WARP_MASK, "r_no_warp_mask"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_PRESENT_BACKBUFFER, "r_present_backbuffer"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT, "r_output"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_WARP_MOTION_QDATA_TP1, "r_warped_motion_qdata_tp1"},
@@ -1006,6 +1007,7 @@ static FfxErrorCode frameinterpolationRelease(FfxArmFrameInterpolationContext_Pr
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE]        = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE]                           = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_ALPHA]                            = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
+    context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NO_WARP_MASK]                        = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]                 = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_DEPTH]                               = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_MOTION_VECTORS]                      = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
@@ -1545,7 +1547,8 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
     // Set constant buffer.
     contextPrivate->constants._Reset = bReset || bDisjointFrameID;
     contextPrivate->constants._UiKind =
-        !params->uiSource.resource || (params->uiKind == 2u && !params->uiAlpha.resource) ? 0u : params->uiKind;
+        (!params->uiSource.resource || (params->uiKind == 2u && !params->uiAlpha.resource) ? 0u : params->uiKind) |
+        (params->noWarpMask.resource ? 0x100u : 0u);  // bit 8: a no-warp mask is bound
 
     FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
         &contextPrivate->contextDescription.backendInterface,
@@ -1573,6 +1576,20 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
     {
         contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE] =
             contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE];
+    }
+    // Pixels not to warp; else bound to the UI source, which the pass does not read then.
+    if (params->noWarpMask.resource)
+    {
+        FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
+            &contextPrivate->contextDescription.backendInterface,
+            &params->noWarpMask,
+            contextPrivate->effectContextId,
+            &contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NO_WARP_MASK]));
+    }
+    else
+    {
+        contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NO_WARP_MASK] =
+            contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE];
     }
     // The UI's opacity (uiKind 2); else bound to the UI source, which the pass does not read as opacity.
     if (params->uiSource.resource && params->uiKind == 2u && params->uiAlpha.resource)

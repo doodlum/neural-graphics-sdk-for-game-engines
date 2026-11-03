@@ -22,6 +22,7 @@
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE    5
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE                       7
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA                        8
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_NO_WARP_MASK                    9
 
 //-----------------------------------------------------------------------------
 // Input: RT bindings

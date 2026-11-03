@@ -82,6 +82,12 @@ void postprocess(int32_t2 output_pixel)
     rgb_t += rgb_m1_warp_t_flow * params.z;
     rgb_t += rgb_p1_warp_t_flow * params.w;
 
+#ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_NO_WARP_MASK
+    // Pixels the game marks not to warp (DLSS-G's no-warp mask): the current frame's, any UI composited over them.
+    if (HasNoWarpMask() && LoadNoWarp(output_pixel))
+        rgb_t = LoadCurrentBackbuffer(output_pixel);
+#endif
+
     // Write alpha composited output
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE
     {

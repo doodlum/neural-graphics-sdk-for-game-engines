@@ -263,6 +263,7 @@ typedef struct FfxFrameInterpolationDispatchDescription
     FfxResource      uiSource;                         ///< When currentBackBuffer is the frame without UI (HUD-less): the frame with it (uiKind 0), or the UI alone premultiplied (uiKind 1)
     uint32_t         uiKind;                           ///< See ffxApiDispatchDescFrameGenerationUiSource
     FfxResource      uiAlpha;                          ///< uiKind 2: the UI's opacity
+    FfxResource      noWarpMask;                       ///< Pixels not to warp (red above 0.5): currentBackBuffer's pixel there
     FfxDimensions2D  opticalFlowBufferSize;            ///< The optical flow motion vector resource dimensions
     FfxFloatCoords2D opticalFlowScale;                 ///< The optical flow motion vector scale factor, used to scale resoure values into [0.0,1.0] range.
 

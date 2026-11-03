@@ -160,7 +160,12 @@ FfxFloat32 Timestep()
 
 FfxUInt32 UiKind()
 {
-    return cbFI._UiKind;
+    return cbFI._UiKind & 0xffu;
+}
+
+FfxBoolean HasNoWarpMask()
+{
+    return (cbFI._UiKind & 0x100u) != 0u;
 }
 
 FfxUInt32 RandomSeed()
@@ -515,6 +520,15 @@ layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA) uniform 
 FFX_MIN16_F LoadUiAlpha(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 {
     return FFX_MIN16_F(texelFetch(r_ui_alpha, iPxPos, 0).r);
+}
+#endif
+
+#ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_NO_WARP_MASK
+layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_NO_WARP_MASK) uniform mediump texture2D r_no_warp_mask;
+
+FfxBoolean LoadNoWarp(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
+{
+    return texelFetch(r_no_warp_mask, iPxPos, 0).r > 0.5f;
 }
 #endif
 

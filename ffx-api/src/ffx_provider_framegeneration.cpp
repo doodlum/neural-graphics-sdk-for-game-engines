@@ -678,8 +678,11 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             // don't dispatch interpolation async for now: use the same commandlist for copy and interpolate
             fiDispatchDesc.commandList       = desc->commandList;
             fiDispatchDesc.currentBackBuffer = Convert(desc->presentColor);
-            // presentColor without UI (HUD-less): the frame with it, chained, for the UI the output keeps.
+            // presentColor without UI (HUD-less): the UI the output gets, chained; pixels not to warp, chained.
             for (ffxApiHeader* h = desc->header.pNext; h; h = h->pNext)
+            {
+                if (auto nw = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationNoWarp>(h))
+                    fiDispatchDesc.noWarpMask = Convert(nw->mask);
                 if (auto ui = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationUiSource>(h))
                 {
                     fiDispatchDesc.uiSource = Convert(ui->uiSource);
@@ -687,6 +690,7 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
                     if (ui->uiKind == FFX_API_FG_UI_KIND_FRAME_AND_ALPHA)
                         fiDispatchDesc.uiAlpha = Convert(ui->uiAlpha);
                 }
+            }
             fiDispatchDesc.reset             = desc->reset;
 
             fiDispatchDesc.output            = Convert(desc->outputs[0]);
