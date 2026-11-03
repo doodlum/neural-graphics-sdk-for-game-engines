@@ -411,6 +411,18 @@ namespace ffx_ml
         }
     }
 
+    bool SubgroupSizeSupported(const DeviceContext& context, uint32_t size)
+    {
+        auto props2 = (PFN_vkGetPhysicalDeviceProperties2)context.getInstanceProcAddr(context.instance, "vkGetPhysicalDeviceProperties2");
+        if (!props2)
+            return false;
+        VkPhysicalDeviceSubgroupSizeControlProperties sizeControl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceProperties2                   props       = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sizeControl};
+        props2(context.physicalDevice, &props);
+        return size >= sizeControl.minSubgroupSize && size <= sizeControl.maxSubgroupSize &&
+               (sizeControl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+
     Selection SelectPath(const DeviceContext& context, Path forcedPath, MatType forcedType)
     {
         Functions fn = {};

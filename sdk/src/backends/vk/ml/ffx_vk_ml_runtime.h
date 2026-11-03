@@ -105,6 +105,8 @@ namespace ffx_ml
     // Pick the fastest supported path for the device. forcedPath / forcedType restrict the choice (used for testing
     // and the FFX_ML_PATH / FFX_ML_MATTYPE environment overrides); an impossible request falls back down the ladder.
     Selection SelectPath(const DeviceContext& context, Path forcedPath = Path::Auto, MatType forcedType = MatType::None);
+    // Whether the device can require this compute subgroup size (subgroup size control).
+    bool SubgroupSizeSupported(const DeviceContext& context, uint32_t size);
 
     // FeatureFlags the physical device supports, plus the device extensions to enable for them.
     uint32_t QueryDeviceFeatures(VkInstance instance, VkPhysicalDevice physicalDevice, PFN_vkGetInstanceProcAddr getInstanceProcAddr, std::vector<const char*>* extensions);

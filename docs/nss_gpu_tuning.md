@@ -402,3 +402,27 @@ filter would save at most ~6 of ~9 accumulate ops per tap (~30 us at 640x400) at
 
 Recommendation: keep exact. The only consistent win is fp32 requantisation, 1.6% (640x400) / 2.4% (853x533) of the
 frame for ~50 dB PSNR after 64 frames; with temporal feedback any perturbation settles around that level.
+
+## NFRU (frame interpolation), Steam Deck
+
+NFRU's graph runs at a quarter of the display size per axis (320x184 for 1280x720). `ffx_ml_runtime_test` now runs it
+(`FFX_ML_TEST_MODELS=nfru`, `FFX_ML_NFRU_W`/`_H`): EXACT on the tiled dot4 path. Its big layers already run near the
+dot4 peak (layer 1, 5x5 32->16: ~2.7 TMAC/s, ~83%; the 7x7 16->16 layers at 92x160: ~2.3 TMAC/s), and barriers cost
+~0.16 of 1.41 ms (`FFX_ML_EXPERIMENT_NO_BARRIERS`).
+
+| Change | NFRU graph, batched |
+| --- | --- |
+| Tiled dot4 kernel, wave64 (as tuned for NSS) | 1.410 ms |
+| wave32 (`FFX_ML_DOT4_SUBGROUP=32`) | **1.333 ms** (-5.5%), in frame (harness) 2.14 -> 2.00 ms |
+| wave32 + `FFX_ML_DOT4_TARGET_THREADS=8192` / 16384, or `PX=1` | 1.35-1.42 ms (worse) |
+| Per layer: wave32 only for <= 16 output channels | 1.375 ms; NSS mid_low +1.5% (reverted) |
+
+Per-layer ML_PROFILE favoured wave32 on the 16-channel 5x5/7x7 layers and wave64 on 16 -> 32, but the whole graph is
+fastest in wave32 throughout, and the NSS graphs stay wave64: the backend requests wave32 for frame interpolation's
+graph only (`CreateDataGraphComputePipelineVK`).
+
+Non-ML passes (`FFX_DUMP_PIPELINES=<dir>` writes every compute pipeline's ACO statistics and ISA, with
+VK_KHR_pipeline_executable_properties enabled): all wave64, 32 waves per SIMD, no spills. The full-resolution warp
+(`WARP_MOTION_TP1`, 355 VALU per pixel) is memory bound, not ALU or atomic bound: staging its 3x3 depth taps in LDS
+and skipping no-op image atomics were both bit exact and no faster. Its cost follows the MV/depth lane area (lane
+capped at 360 instead of 540 lines: -170 us), but large motion then drops from 36 to 24 dB in the known-motion test.

@@ -4507,6 +4507,8 @@ VkSamplerAddressMode FfxGetAddressModeVK(const FfxAddressMode& addressMode)
     }
 }
 
+void DumpPipeline(VkDevice device, VkPipeline pipeline, const char* name, const char* dir);  // FFX_DUMP_PIPELINES, below
+
 FfxErrorCode CreateComputePipelineVK(FfxInterface*                 backendInterface,
                                      FfxEffect                     effect,
                                      FfxPass                       pass,
@@ -4992,12 +4994,17 @@ FfxErrorCode CreateComputePipelineVK(FfxInterface*                 backendInterf
     pipelineCreateInfo.sType                       = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineCreateInfo.stage                       = shaderStageCreateInfo;
     pipelineCreateInfo.layout                      = pPipelineLayout->pipelineLayout;
+    static const char* dumpDir = getenv("FFX_DUMP_PIPELINES");
+    if (dumpDir && *dumpDir)
+        pipelineCreateInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
 
     VkPipeline computePipeline = VK_NULL_HANDLE;
     if (VulkanWrapper().vkCreateComputePipelines(backendContext->device, nullptr, 1, &pipelineCreateInfo, nullptr, &computePipeline) != VK_SUCCESS)
     {
         return FFX_ERROR_BACKEND_API_ERROR;
     }
+    if (dumpDir && *dumpDir)
+        DumpPipeline(backendContext->device, computePipeline, pipelineDescription->name, dumpDir);
 
     // done with shader module, so clean up
     VulkanWrapper().vkDestroyShaderModule(backendContext->device, shaderModule, nullptr);
@@ -5893,6 +5900,7 @@ FfxErrorCode getOrCreateGraphicsPipeline(BackendContext_VK* backendContext, FfxG
 // Native compute replacement for a VK_ARM_data_graph pipeline: the TOSA graph is lowered to compute kernels that use
 // the vendor's ML acceleration (cooperative matrices, int8 dot products) through ffx_ml.
 static FfxErrorCode CreateDataGraphComputePipelineVK(FfxInterface*                      backendInterface,
+                                                     FfxEffect                          effect,
                                                      const FfxDataGraphBlob&            dataGraphBlob,
                                                      const FfxPipelineDescription*      desc,
                                                      FfxUInt32                          effectContextId,
@@ -5956,7 +5964,13 @@ static FfxErrorCode CreateDataGraphComputePipelineVK(FfxInterface*              
     ffx_ml::Path    forcedPath = ffx_ml::Path::Auto;
     ffx_ml::MatType forcedType = ffx_ml::MatType::None;
     ffx_ml::ReadEnvironmentOverrides(forcedPath, forcedType);
-    const ffx_ml::Selection selection = ffx_ml::SelectPath(mlContext, forcedPath, forcedType);
+    ffx_ml::Selection selection = ffx_ml::SelectPath(mlContext, forcedPath, forcedType);
+    // NFRU's graph (frame interpolation) is mostly 16-channel 5x5/7x7 layers: on the tiled dot4 kernel (RDNA2) it runs
+    // 5.5% faster in wave32 than in the wave64 the NSS graphs prefer (Steam Deck, 320x184, bit exact).
+    // FFX_ML_DOT4_SUBGROUP still decides when set.
+    if (effect == ARM_EFFECT_FRAMEINTERPOLATION && selection.path == ffx_ml::Path::Dot4 && selection.dot4Tiled && selection.requireSubgroupSize &&
+        !getenv("FFX_ML_DOT4_SUBGROUP") && ffx_ml::SubgroupSizeSupported(mlContext, 32))
+        selection.subgroupSize = 32;
 
     std::string                    error;
     std::unique_ptr<ffx_ml::Graph> graph = ffx_ml::Graph::Create(mlContext, selection, graphDesc, &error);
@@ -6002,7 +6016,8 @@ FfxErrorCode CreateDataGraphPipelineVK(FfxInterface*                 backendInte
 
     if (backendContext->mlCompute)
     {
-        return CreateDataGraphComputePipelineVK(backendInterface, dataGraphBlob, desc, effectContextId, dataGraphWidth, dataGraphHeight, pPipelineLayout, outPipeline);
+        return CreateDataGraphComputePipelineVK(
+            backendInterface, effect, dataGraphBlob, desc, effectContextId, dataGraphWidth, dataGraphHeight, pPipelineLayout, outPipeline);
     }
 
     // Setup descriptor sets
@@ -8254,6 +8269,65 @@ static FfxErrorCode executeGpuJobClearUint(BackendContext_VK* backendContext, Ff
     }
 
     return FFX_OK;
+}
+
+// FFX_DUMP_PIPELINES=<dir> (tuning, needs VK_KHR_pipeline_executable_properties enabled on the device): each compute
+// pipeline's driver statistics and internal representations (for RADV: NIR, ACO IR and the final ISA) are written to
+// <dir>/<pipeline name>.txt.
+void DumpPipeline(VkDevice device, VkPipeline pipeline, const char* name, const char* dir)
+{
+    auto gdpa  = VulkanWrapper().vkGetDeviceProcAddr;
+    auto execs = (PFN_vkGetPipelineExecutablePropertiesKHR)gdpa(device, "vkGetPipelineExecutablePropertiesKHR");
+    auto stats = (PFN_vkGetPipelineExecutableStatisticsKHR)gdpa(device, "vkGetPipelineExecutableStatisticsKHR");
+    auto irs   = (PFN_vkGetPipelineExecutableInternalRepresentationsKHR)gdpa(device, "vkGetPipelineExecutableInternalRepresentationsKHR");
+    if (!execs || !stats || !irs)
+        return;
+    std::string path = std::string(dir) + "/" + (name && *name ? name : "unnamed") + ".txt";
+    for (char& c : path)
+        if (c == ' ')
+            c = '_';
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f)
+        return;
+    VkPipelineInfoKHR info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
+    uint32_t          n    = 0;
+    execs(device, &info, &n, nullptr);
+    std::vector<VkPipelineExecutablePropertiesKHR> props(n, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+    execs(device, &info, &n, props.data());
+    for (uint32_t e = 0; e < n; ++e)
+    {
+        fprintf(f, "== %s (%s), subgroup size %u\n", props[e].name, props[e].description, props[e].subgroupSize);
+        VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr, pipeline, e};
+        uint32_t                    sn = 0;
+        stats(device, &ei, &sn, nullptr);
+        std::vector<VkPipelineExecutableStatisticKHR> st(sn, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+        stats(device, &ei, &sn, st.data());
+        for (const auto& x : st)
+        {
+            if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR)
+                fprintf(f, "%s: %llu\n", x.name, (unsigned long long)x.value.u64);
+            else if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR)
+                fprintf(f, "%s: %lld\n", x.name, (long long)x.value.i64);
+            else if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR)
+                fprintf(f, "%s: %f\n", x.name, x.value.f64);
+            else
+                fprintf(f, "%s: %d\n", x.name, int(x.value.b32));
+        }
+        uint32_t rn = 0;
+        irs(device, &ei, &rn, nullptr);
+        std::vector<VkPipelineExecutableInternalRepresentationKHR> ir(rn, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+        irs(device, &ei, &rn, ir.data());
+        std::vector<std::vector<char>> text(rn);
+        for (uint32_t r = 0; r < rn; ++r)
+        {
+            text[r].resize(ir[r].dataSize + 1);
+            ir[r].pData = text[r].data();
+        }
+        irs(device, &ei, &rn, ir.data());
+        for (uint32_t r = 0; r < rn; ++r)
+            fprintf(f, "\n---- %s (%s)\n%s\n", ir[r].name, ir[r].description, text[r].data());
+    }
+    fclose(f);
 }
 
 // Optional per-job GPU timing for tuning (FFX_PROFILE_PASSES=<output file>). A timestamp is written after every job;
