@@ -426,3 +426,14 @@ VK_KHR_pipeline_executable_properties enabled): all wave64, 32 waves per SIMD, n
 (`WARP_MOTION_TP1`, 355 VALU per pixel) is memory bound, not ALU or atomic bound: staging its 3x3 depth taps in LDS
 and skipping no-op image atomics were both bit exact and no faster. Its cost follows the MV/depth lane area (lane
 capped at 360 instead of 540 lines: -170 us), but large motion then drops from 36 to 24 dB in the known-motion test.
+
+NFRU non-ML passes, ISA round (all bit exact against the previous build, known-motion test unchanged):
+
+| Change | Effect |
+| --- | --- |
+| Preprocess: the four warped colour fetches unconditional (clamped coordinates; in-bounds ones already land inside) with selects afterwards. A fetch under `if (!oob)` compiled to its own `s_cbranch_execz` block, and ACO does not move loads across blocks, so the four round trips were serialised | 11 -> 7 branches, ACO latency 2589 -> 2123; pass 206 -> 199 us (kept) |
+| Warp (TP1): the 3x3 depth taps, TM1 depth and dynamic mask hoisted above the first warp's atomic branch (they waited for its loads, `s_waitcnt vmcnt(0)`) | ACO latency 1612 -> 1437, VGPRs 32 -> 40; pass unchanged at 388 us: bandwidth bound (reverted) |
+| All compute passes in wave32 | postprocess +37 us, fill holes +15, preprocess/warp -6: worse overall |
+
+A timing stub without the preprocess colour fetches took it from 200 to 112 us: they are quarter-resolution point
+samples of full-resolution images, nearly one cache line per fetch, which the exact algorithm needs.

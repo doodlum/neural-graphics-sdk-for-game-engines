@@ -173,14 +173,18 @@ void preprocess(int32_t2 input_pixel)
     FFX_MIN16_F3 rgb_m1_warp_t_flow = FFX_MIN16_F3(0.0f);
     FFX_MIN16_F3 rgb_p1_warp_t_flow = FFX_MIN16_F3(0.0f);
 
-    if (!uv_m1_mv_oob)
-        rgb_m1_warp_t_mv = LoadPreviousBackbuffer(int32_t2(uv_m1_mv * DisplaySize()));
-    if (!uv_p1_mv_oob)
-        rgb_p1_warp_t_mv = LoadCurrentBackbuffer(int32_t2(uv_p1_mv * DisplaySize()));
-    if (!uv_m1_flow_oob)
-        rgb_m1_warp_t_flow = LoadPreviousBackbuffer(int32_t2(uv_m1_flow * DisplaySize()));
-    if (!uv_p1_flow_oob)
-        rgb_p1_warp_t_flow = LoadCurrentBackbuffer(int32_t2(uv_p1_flow * DisplaySize()));
+    // The four fetches are unconditional (clamped; in-bounds uvs already land inside) and selected afterwards: a load
+    // under `if` compiles to a branch per load, and ACO does not move loads across blocks, so the four round trips ran
+    // one after another in this latency-bound pass. Same values: off-screen taps are still 0 here.
+    const int32_t2 displayMax = DisplaySize() - int32_t2(1);
+    const FFX_MIN16_F3 rgb_m1_mv   = LoadPreviousBackbuffer(clamp(int32_t2(uv_m1_mv * DisplaySize()), int32_t2(0), displayMax));
+    const FFX_MIN16_F3 rgb_p1_mv   = LoadCurrentBackbuffer(clamp(int32_t2(uv_p1_mv * DisplaySize()), int32_t2(0), displayMax));
+    const FFX_MIN16_F3 rgb_m1_flow = LoadPreviousBackbuffer(clamp(int32_t2(uv_m1_flow * DisplaySize()), int32_t2(0), displayMax));
+    const FFX_MIN16_F3 rgb_p1_flow = LoadCurrentBackbuffer(clamp(int32_t2(uv_p1_flow * DisplaySize()), int32_t2(0), displayMax));
+    rgb_m1_warp_t_mv   = uv_m1_mv_oob ? rgb_m1_warp_t_mv : rgb_m1_mv;
+    rgb_p1_warp_t_mv   = uv_p1_mv_oob ? rgb_p1_warp_t_mv : rgb_p1_mv;
+    rgb_m1_warp_t_flow = uv_m1_flow_oob ? rgb_m1_warp_t_flow : rgb_m1_flow;
+    rgb_p1_warp_t_flow = uv_p1_flow_oob ? rgb_p1_warp_t_flow : rgb_p1_flow;
 
     // Randomize OOB RGB values to prevent network from learning spurious correlations
     // Uses spatial hash (y*10000+z) combined with random_seed for temporal variation
