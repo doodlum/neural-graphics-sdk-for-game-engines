@@ -108,6 +108,10 @@ namespace ffx_ml
     // Whether the device can require this compute subgroup size (subgroup size control).
     bool SubgroupSizeSupported(const DeviceContext& context, uint32_t size);
 
+    // FFX_DUMP_PIPELINES=<dir>: a pipeline's driver statistics and internal representations (RADV: NIR, ACO IR, ISA)
+    // to <dir>/<name>.txt; the pipeline needs the CAPTURE_STATISTICS / CAPTURE_INTERNAL_REPRESENTATIONS flags.
+    void DumpPipeline(PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkPipeline pipeline, const char* name, const char* dir);
+
     // FeatureFlags the physical device supports, plus the device extensions to enable for them.
     uint32_t QueryDeviceFeatures(VkInstance instance, VkPhysicalDevice physicalDevice, PFN_vkGetInstanceProcAddr getInstanceProcAddr, std::vector<const char*>* extensions);
 

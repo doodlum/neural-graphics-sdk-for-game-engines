@@ -21,6 +21,64 @@
 
 namespace ffx_ml
 {
+// FFX_DUMP_PIPELINES=<dir> (tuning, needs VK_KHR_pipeline_executable_properties enabled on the device): each compute
+    // pipeline's driver statistics and internal representations (for RADV: NIR, ACO IR and the final ISA) are written to
+    // <dir>/<pipeline name>.txt.
+    void DumpPipeline(PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkPipeline pipeline, const char* name, const char* dir)
+    {
+        auto execs = (PFN_vkGetPipelineExecutablePropertiesKHR)gdpa(device, "vkGetPipelineExecutablePropertiesKHR");
+        auto stats = (PFN_vkGetPipelineExecutableStatisticsKHR)gdpa(device, "vkGetPipelineExecutableStatisticsKHR");
+        auto irs   = (PFN_vkGetPipelineExecutableInternalRepresentationsKHR)gdpa(device, "vkGetPipelineExecutableInternalRepresentationsKHR");
+        if (!execs || !stats || !irs)
+            return;
+        std::string path = std::string(dir) + "/" + (name && *name ? name : "unnamed") + ".txt";
+        for (char& c : path)
+            if (c == ' ')
+                c = '_';
+        FILE* f = fopen(path.c_str(), "w");
+        if (!f)
+            return;
+        VkPipelineInfoKHR info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
+        uint32_t          n    = 0;
+        execs(device, &info, &n, nullptr);
+        std::vector<VkPipelineExecutablePropertiesKHR> props(n, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+        execs(device, &info, &n, props.data());
+        for (uint32_t e = 0; e < n; ++e)
+        {
+            fprintf(f, "== %s (%s), subgroup size %u\n", props[e].name, props[e].description, props[e].subgroupSize);
+            VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr, pipeline, e};
+            uint32_t                    sn = 0;
+            stats(device, &ei, &sn, nullptr);
+            std::vector<VkPipelineExecutableStatisticKHR> st(sn, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+            stats(device, &ei, &sn, st.data());
+            for (const auto& x : st)
+            {
+                if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR)
+                    fprintf(f, "%s: %llu\n", x.name, (unsigned long long)x.value.u64);
+                else if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR)
+                    fprintf(f, "%s: %lld\n", x.name, (long long)x.value.i64);
+                else if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR)
+                    fprintf(f, "%s: %f\n", x.name, x.value.f64);
+                else
+                    fprintf(f, "%s: %d\n", x.name, int(x.value.b32));
+            }
+            uint32_t rn = 0;
+            irs(device, &ei, &rn, nullptr);
+            std::vector<VkPipelineExecutableInternalRepresentationKHR> ir(rn, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+            irs(device, &ei, &rn, ir.data());
+            std::vector<std::vector<char>> text(rn);
+            for (uint32_t r = 0; r < rn; ++r)
+            {
+                text[r].resize(ir[r].dataSize + 1);
+                ir[r].pData = text[r].data();
+            }
+            irs(device, &ei, &rn, ir.data());
+            for (uint32_t r = 0; r < rn; ++r)
+                fprintf(f, "\n---- %s (%s)\n%s\n", ir[r].name, ir[r].description, text[r].data());
+        }
+        fclose(f);
+    }
+
     namespace
     {
         struct Functions
@@ -1111,8 +1169,13 @@ namespace ffx_ml
                         pipeInfo.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
                 }
                 pipeInfo.layout = pipelineLayout;
+                static const char* dumpDir = getenv("FFX_DUMP_PIPELINES");  // ACO statistics and ISA per layer (tuning)
+                if (dumpDir && *dumpDir)
+                    pipeInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
                 if (fn.CreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &layer.pipeline) != VK_SUCCESS)
                     return fail("vkCreateComputePipelines failed for layer " + std::to_string(li));
+                if (dumpDir && *dumpDir)
+                    DumpPipeline(ctx.getDeviceProcAddr, ctx.device, layer.pipeline, ("ML_layer_" + std::to_string(li)).c_str(), dumpDir);
 
                 const uint32_t pixels = uint32_t(fc.outH * fc.outW);
                 if (coop)
