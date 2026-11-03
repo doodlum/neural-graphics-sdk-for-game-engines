@@ -437,3 +437,44 @@ NFRU non-ML passes, ISA round (all bit exact against the previous build, known-m
 
 A timing stub without the preprocess colour fetches took it from 200 to 112 us: they are quarter-resolution point
 samples of full-resolution images, nearly one cache line per fetch, which the exact algorithm needs.
+
+### What flow NFRU needs, and block matching for objects without motion vectors
+
+Without the data graph optical flow engine the flow is built from the game's motion vectors alone (scatter), so
+anything drawn without correct motion vectors (particles, transparencies, effects) is interpolated wrong. Oracle
+runs of `fg_vk_test` (moving square, 12 px/frame, `FFX_OF_PENALTY` large so the motion vectors' flow stays, then
+degraded on purpose):
+
+| flow given to NFRU (exact motion vectors)    | moving region |
+|----------------------------------------------|---------------|
+| exact                                        | 39.3 dB       |
+| zero                                         | 13.6 dB       |
+| +-1 / 2 / 4 / 8 px of noise                  | 39.1 / 38.7 / 39.1 / 39.0 dB |
+| nearest of 8 / 16 / 32 px blocks             | 37.7 / 37.9 / 39.0 dB |
+| square without motion vectors, flow corrected | 13.5 dB      |
+
+NFRU needs the flow, but only roughly (+-8 px, 32 px blocks barely matter). It warps TP1 by the motion vectors and
+TM1 by the flow, and needs both right: correcting only the flow gains nothing. So the correction works on the
+motion vectors, in their direction (TP1 -> TM1), and the flow is scattered from the corrected ones; the
+interpolation takes them too (`ffxOpticalFlowGetFixedMotionVectors`, FI dispatch `motionVectors`).
+
+`FFX_OF_REFINE=1` (off by default): luma at half and a quarter of the resolution, a full +-32 px search per
+32 px block on the quarter seeded by the motion vectors (FSR 3's optical flow kernel, one level instead of seven),
+a 3DRS candidate pick per 8x8 pixels on the half (de Haan et al., IEEE TCSVT 1993), and the corrections applied.
+A correction needs a SAD below `FFX_OF_MATCH_RATIO` (50) percent of the motion vector's, and is refused where
+TM1's depth at the motion vector's target is nearer (just disoccluded content has no match; anything matching
+there is wrong). Cost at 1280x720: luma 50, search 116, refine 85, apply 167 us (about 0.42 ms).
+
+| test (no motion vectors on the square unless exact) | off     | `FFX_OF_REFINE=1` |
+|------------------------------------------------------|---------|-------------------|
+| exact motion vectors                                 | 39.3 dB | 36.9 dB           |
+| 12 px/frame                                          | 7.6 dB  | 28.8 dB           |
+| 20 px/frame                                          | -       | 26.3 dB           |
+| 6 px/frame (texture period 14 px: aliases)           | 14.5 dB | 7.5 dB            |
+| +-2 px noise on every motion vector                  | 26.9 dB | 28.1 dB           |
+
+Tried and dropped: correcting the flow only (TM1 side, 13.5 dB at best), one vector per 4x4 pixels written per
+pixel (1.16 ms), joint bilateral upsampling of the corrections by depth (no better, 1.7x the apply cost). ML
+optical flow networks (NeuFlow v2, FastFlowNet, CompactFlowNet, RIFE's IFNet) estimate at 2-50 ms here.
+Open: the periodic-texture aliasing (prefer the smaller of near-equal matches, or neighbours' vectors), the
+2.4 dB on correct content, and reading the corrections in the consumers instead of the full-resolution apply.
