@@ -983,6 +983,8 @@ static FfxErrorCode ArmOpticalFlowDispatch(OpticalFlowContext_Private* context, 
             c.depth_dims[0]          = int32_t(params->depth.description.width);
             c.depth_dims[1]          = int32_t(params->depth.description.height);
             c.depth_inverted         = (context->contextDescription.flags & FFX_OPTICALFLOW_ENABLE_DEPTH_INVERTED) ? 1 : 0;
+            c.display_dims[0]        = int32_t(context->contextDescription.resolution.width);
+            c.display_dims[1]        = int32_t(context->contextDescription.resolution.height);
             FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
                 &context->contextDescription.backendInterface, &c, sizeof(c), &context->constantBuffers[FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER]));
             // One invocation per 2x2 block of motion vectors.

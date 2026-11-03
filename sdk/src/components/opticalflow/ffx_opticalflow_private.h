@@ -53,6 +53,7 @@ typedef struct OpticalFlowScatterConstants
     int32_t depth_dims[2];
     int32_t depth_inverted;
     int32_t pad;
+    int32_t display_dims[2];
 } OpticalFlowScatterConstants;
 
 typedef struct OpticalFlowRefineConstants

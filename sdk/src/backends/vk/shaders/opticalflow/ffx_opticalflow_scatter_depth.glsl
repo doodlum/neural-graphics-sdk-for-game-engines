@@ -27,6 +27,7 @@ layout(set = 0, binding = 0, std140) uniform Uniforms {
     FfxInt32x2   _DepthDims;
     FfxInt32     _DepthInverted;
     FfxInt32     _Pad;
+    FfxInt32x2   _DisplayDims;         // the flow's pixels (the motion vectors may be at the render size)
 }ubo;
 
 layout(set = 0, binding = 1) uniform texture2D r_game_motion_vectors;  // display resolution | RG
@@ -45,7 +46,8 @@ FfxUInt32 DepthKey(FfxInt32x2 p)
 bool Source(FfxInt32x2 p, out FfxInt32x2 cell, out FfxFloat32x2 flow)
 {
     const FfxFloat32x2 mv = texelFetch(r_game_motion_vectors, p, 0).xy * ubo._MotionVectorScale;
-    const FfxFloat32x2 q  = FfxFloat32x2(p) + 0.5f + mv;
+    // Where it was, in motion vector pixels (the scale gives display pixels).
+    const FfxFloat32x2 q  = FfxFloat32x2(p) + 0.5f + mv * FfxFloat32x2(ubo._MotionVectorDims) / FfxFloat32x2(ubo._DisplayDims);
     flow = -mv;
     cell = FfxInt32x2(floor(q * FfxFloat32x2(ubo._OutputDims) / FfxFloat32x2(ubo._MotionVectorDims)));
     return all(greaterThanEqual(q, FfxFloat32x2(0.0f))) && all(lessThan(q, FfxFloat32x2(ubo._MotionVectorDims))) &&
