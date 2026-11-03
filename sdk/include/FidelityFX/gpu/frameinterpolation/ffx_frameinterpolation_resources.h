@@ -66,8 +66,10 @@
 //
 // The current frame with its UI when the interpolation sources are HUD-less (the postprocess keeps its UI pixels)
 #define FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE 24
+// The UI's opacity, with the frame with UI as the UI source (uiKind 2)
+#define FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_ALPHA 25
 //
-#define FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_COUNT 25
+#define FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_COUNT 26
 //
 #define FFX_FRAMEINTERPOLATION_CONSTANTBUFFER_IDENTIFIER 0
 //

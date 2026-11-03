@@ -64,6 +64,7 @@ static const ResourceBinding srvResourceBindingTable[] = {
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_PREVIOUS_INTERPOLATION_SOURCE, "r_previous_interpolation_source"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE, "r_current_interpolation_source"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE, "r_ui_source"},
+    {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_ALPHA, "r_ui_alpha"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_PRESENT_BACKBUFFER, "r_present_backbuffer"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT, "r_output"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_WARP_MOTION_QDATA_TP1, "r_warped_motion_qdata_tp1"},
@@ -1004,6 +1005,7 @@ static FfxErrorCode frameinterpolationRelease(FfxArmFrameInterpolationContext_Pr
     // ARM_TODO: Release all resources
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE]        = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE]                           = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
+    context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_ALPHA]                            = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]                 = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_DEPTH]                               = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
     context->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_MOTION_VECTORS]                      = {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_NULL};
@@ -1542,7 +1544,8 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
 
     // Set constant buffer.
     contextPrivate->constants._Reset = bReset || bDisjointFrameID;
-    contextPrivate->constants._UiKind = params->uiSource.resource ? params->uiKind : 0u;
+    contextPrivate->constants._UiKind =
+        !params->uiSource.resource || (params->uiKind == 2u && !params->uiAlpha.resource) ? 0u : params->uiKind;
 
     FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
         &contextPrivate->contextDescription.backendInterface,
@@ -1570,6 +1573,20 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
     {
         contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE] =
             contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE];
+    }
+    // The UI's opacity (uiKind 2); else bound to the UI source, which the pass does not read as opacity.
+    if (params->uiSource.resource && params->uiKind == 2u && params->uiAlpha.resource)
+    {
+        FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
+            &contextPrivate->contextDescription.backendInterface,
+            &params->uiAlpha,
+            contextPrivate->effectContextId,
+            &contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_ALPHA]));
+    }
+    else
+    {
+        contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_ALPHA] =
+            contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE];
     }
 
     // Register output as SRV and UAV

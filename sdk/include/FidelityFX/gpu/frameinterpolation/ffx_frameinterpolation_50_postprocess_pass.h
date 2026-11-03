@@ -93,6 +93,16 @@ void postprocess(int32_t2 output_pixel)
             // behind them interpolated.
             rgb_t = ui.rgb + (FFX_MIN16_F(1.0f) - ui.a) * rgb_t;
         }
+#ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA
+        else if (UiKind() == 2u)
+        {
+            // The frame with UI and the UI's opacity (DLSS-G's UI alpha): the UI colour is frame - (1 - a) x HUD-less,
+            // so over the interpolated scene the output is frame - (1 - a) x (HUD-less - interpolated).
+            const FFX_MIN16_F  a   = LoadUiAlpha(output_pixel);
+            const FFX_MIN16_F3 cur = LoadCurrentBackbuffer(output_pixel);
+            rgb_t = max(ui.rgb - (FFX_MIN16_F(1.0f) - a) * (cur - rgb_t), FFX_MIN16_F3(0.0f));
+        }
+#endif
         else
         {
             // The frame with UI: where it differs from the one interpolated (HUD-less), its pixel as it is, not warped.

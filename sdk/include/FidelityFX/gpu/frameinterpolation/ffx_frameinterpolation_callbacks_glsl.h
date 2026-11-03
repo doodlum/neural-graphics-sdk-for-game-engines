@@ -509,6 +509,15 @@ FFX_MIN16_F4 LoadUiSource(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 }
 #endif
 
+#ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA
+layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA) uniform mediump texture2D r_ui_alpha;
+
+FFX_MIN16_F LoadUiAlpha(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
+{
+    return FFX_MIN16_F(texelFetch(r_ui_alpha, iPxPos, 0).r);
+}
+#endif
+
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE) uniform mediump texture2D r_current_interpolation_source;
 
