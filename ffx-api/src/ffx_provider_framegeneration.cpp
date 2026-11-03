@@ -98,6 +98,10 @@ static bool IsBackBufferFormatSupportedByOpticalFlow(uint32_t apiFormat)
     case FFX_API_SURFACE_FORMAT_B8G8R8A8_TYPELESS:
     case FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT:
     case FFX_API_SURFACE_FORMAT_R8_UNORM:
+    // D3D12 games' 10-bit and half-float swapchains (LEGO Batman: Legacy of the Dark Knight). The shaders store through
+    // images declared r11f_g11f_b10f; RADV stores in the image's own format, as it does for the 8-bit ones above.
+    case FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM:
+    case FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT:
         return true;
     default:
         return false;
@@ -260,7 +264,7 @@ ffxReturnCode_t ffxProvider_FrameGeneration::CreateContext(ffxContext* context, 
             {
                 desc->fpMessage(FFX_API_MESSAGE_TYPE_ERROR,
                                 "Unsupported backbuffer format for optical flow. Supported formats are "
-                                "R8G8B8A8_UNORM, B8G8R8A8_UNORM, R11G11B10_FLOAT and R8_UNORM.");
+                                "R8G8B8A8_UNORM, B8G8R8A8_UNORM, R11G11B10_FLOAT, R10G10B10A2_UNORM, R16G16B16A16_FLOAT and R8_UNORM.");
             }
             return FFX_API_RETURN_ERROR_PARAMETER;
         }
