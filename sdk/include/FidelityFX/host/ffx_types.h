@@ -158,7 +158,7 @@
 /// Maximum number of GPU jobs per submission
 ///
 /// @ingroup Defines
-#define FFX_MAX_GPU_JOBS (64)
+#define FFX_MAX_GPU_JOBS (128)  // multi-frame generation: about 8 jobs per generated frame, up to 8 frames a dispatch
 
 /// Maximum number of samplers supported
 ///

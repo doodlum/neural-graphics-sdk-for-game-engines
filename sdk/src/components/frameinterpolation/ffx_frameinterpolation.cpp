@@ -1616,8 +1616,8 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
     }
 
     // Register the outputs (one per generated frame) as SRV and UAV; each is bound in turn as OUTPUT.
-    const uint32_t      numOutputs = 1 + std::min(params->numAdditionalOutputs, 3u);
-    FfxResourceInternal outputs[4] = {};
+    const uint32_t      numOutputs = 1 + std::min(params->numAdditionalOutputs, 7u);
+    FfxResourceInternal outputs[8] = {};
     for (uint32_t i = 0; i < numOutputs; ++i)
     {
         FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(

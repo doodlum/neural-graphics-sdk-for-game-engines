@@ -152,6 +152,16 @@ struct ffxApiDispatchDescFrameGenerationNoWarp
 };
 
 /// @ingroup ffxFrameGeneration
+#define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_MORE_OUTPUTS 0x00020013u
+/// Chained to ffxApiDispatchDescFrameGeneration: the outputs after outputs[3], for numGeneratedFrames above 4 (up to 8,
+/// as DLSS multi-frame generation's x6). With n generated frames, output i (from 0) is the frame at (i + 1) / (n + 1).
+struct ffxApiDispatchDescFrameGenerationMoreOutputs
+{
+    ffxDispatchDescHeader header;
+    struct FfxApiResource outputs[4];
+};
+
+/// @ingroup ffxFrameGeneration
 #define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_CAMERA 0x00020012u
 /// Chained to ffxApiDispatchDescFrameGenerationPrepare: orthographic 1 when the camera is orthographic (depth linear
 /// between cameraNear and cameraFar).

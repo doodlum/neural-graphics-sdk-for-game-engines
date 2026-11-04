@@ -70,6 +70,11 @@ namespace ffx
     };
 
     template <>
+    struct struct_type<ffxApiDispatchDescFrameGenerationMoreOutputs> : std::integral_constant<uint64_t, FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_MORE_OUTPUTS>
+    {
+    };
+
+    template <>
     struct struct_type<ffxApiDispatchDescFrameGenerationCamera> : std::integral_constant<uint64_t, FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_CAMERA>
     {
     };

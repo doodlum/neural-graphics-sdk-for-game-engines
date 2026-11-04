@@ -694,9 +694,14 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             fiDispatchDesc.reset             = desc->reset;
 
             fiDispatchDesc.output            = Convert(desc->outputs[0]);
-            // Multi-frame generation: the optical flow once, a frame for each output at (i + 1) / (n + 1).
-            for (uint32_t i = 1; i < desc->numGeneratedFrames && i < 4; ++i)
-                fiDispatchDesc.additionalOutputs[fiDispatchDesc.numAdditionalOutputs++] = Convert(desc->outputs[i]);
+            // Multi-frame generation: the optical flow once, a frame for each output at (i + 1) / (n + 1); the outputs
+            // after the fourth chained (ffxApiDispatchDescFrameGenerationMoreOutputs).
+            const ffxApiDispatchDescFrameGenerationMoreOutputs* more = nullptr;
+            for (ffxApiHeader* h = desc->header.pNext; h; h = h->pNext)
+                if (auto m = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationMoreOutputs>(h))
+                    more = m;
+            for (uint32_t i = 1; i < desc->numGeneratedFrames && i < 8 && (i < 4 || more); ++i)
+                fiDispatchDesc.additionalOutputs[fiDispatchDesc.numAdditionalOutputs++] = Convert(i < 4 ? desc->outputs[i] : more->outputs[i - 4]);
             fiDispatchDesc.opticalFlowVector = internal_context->backendInterfaceShared.fpGetResource(
                 &internal_context->backendInterfaceShared, internal_context->sharedResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]);
 
