@@ -123,22 +123,26 @@ struct ffxApiDispatchDescFrameGeneration
 #define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_UI_SOURCE 0x00020010u
 /// Chained to ffxApiDispatchDescFrameGeneration when presentColor is the frame without its UI (HUD-less). The
 /// generated frames are interpolated without UI and get this frame's UI, not warped. uiKind 0: uiSource is the frame
-/// with UI, whose pixels that differ from presentColor are kept. uiKind 1: uiSource is the UI alone, colour
-/// premultiplied by alpha (DLSS-G's UI colour and alpha): output = ui.rgb + (1 - ui.a) x interpolated. uiKind 2:
+/// with UI, whose pixels that differ from presentColor are kept. (uiKind 1, a premultiplied UI layer's colour, was
+/// removed: DLSS-G uses only a UI layer's alpha, uiKind 3.) uiKind 2:
 /// uiSource is the frame with UI and uiAlpha the UI's opacity (DLSS-G's UI alpha, red channel); the UI colour is
 /// recovered from the blend the game did, so output = frame - (1 - alpha) x (presentColor - interpolated).
 #define FFX_API_FG_UI_KIND_FRAME_WITH_UI 0u
-#define FFX_API_FG_UI_KIND_PREMULTIPLIED_UI 1u
 #define FFX_API_FG_UI_KIND_FRAME_AND_ALPHA 2u
 /// uiKind 3: as 2, the opacity in uiAlpha's alpha channel (a UI layer used for its alpha only: the colour is the frame's,
 /// so where nothing moves the output is the frame exactly, whatever the layer's colour encoding).
 #define FFX_API_FG_UI_KIND_FRAME_AND_LAYER_ALPHA 3u
+/// uiKind 4: no HUD-less frame: presentColor and uiSource are both the frame with UI, uiAlpha the UI's opacity (red);
+/// the frame is kept as it is where the opacity is above 0.4 (DLSS-G's handling without a HUD-less frame). uiKind 5: as
+/// 4, the opacity in uiAlpha's alpha channel (a UI layer).
+#define FFX_API_FG_UI_KIND_ALPHA_MASK 4u
+#define FFX_API_FG_UI_KIND_LAYER_ALPHA_MASK 5u
 struct ffxApiDispatchDescFrameGenerationUiSource
 {
     ffxDispatchDescHeader header;
     struct FfxApiResource uiSource;
     uint32_t              uiKind;
-    struct FfxApiResource uiAlpha;  ///< uiKind 2 only
+    struct FfxApiResource uiAlpha;  ///< uiKind 2 to 5
 };
 
 /// @ingroup ffxFrameGeneration
