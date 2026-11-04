@@ -1615,14 +1615,22 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
             contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_UI_SOURCE];
     }
 
-    // Register output as SRV and UAV
-    FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
-        &contextPrivate->contextDescription.backendInterface,
-        &params->output,
-        contextPrivate->effectContextId,
-        &contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT]));
-    contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] =
-        contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT];
+    // Register the outputs (one per generated frame) as SRV and UAV; each is bound in turn as OUTPUT.
+    const uint32_t      numOutputs = 1 + std::min(params->numAdditionalOutputs, 3u);
+    FfxResourceInternal outputs[4] = {};
+    for (uint32_t i = 0; i < numOutputs; ++i)
+    {
+        FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
+            &contextPrivate->contextDescription.backendInterface,
+            i ? &params->additionalOutputs[i - 1] : &params->output,
+            contextPrivate->effectContextId,
+            &outputs[i]));
+    }
+    auto bindOutput = [&](uint32_t i) {
+        contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = outputs[i];
+        contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = outputs[i];
+    };
+    bindOutput(0);
 
     if (params->motionVectors.resource)
     {
@@ -1698,15 +1706,29 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
             FFX_VALIDATE(
                 contextPrivate->contextDescription.backendInterface.fpScheduleGpuJob(&contextPrivate->contextDescription.backendInterface, &clearJobs));
 
-            // copy current frame to interpolation output to avoid undefined output when resetting.
-            FfxGpuJobDescription resetcopyJob  = {FFX_GPU_JOB_COPY};
-            resetcopyJob.copyJobDescriptor.src = contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE];
-            resetcopyJob.copyJobDescriptor.dst = contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT];
-            FFX_VALIDATE(
-                contextPrivate->contextDescription.backendInterface.fpScheduleGpuJob(&contextPrivate->contextDescription.backendInterface, &resetcopyJob));
+            // copy current frame to interpolation outputs to avoid undefined output when resetting.
+            for (uint32_t i = 0; i < numOutputs; ++i)
+            {
+                FfxGpuJobDescription resetcopyJob  = {FFX_GPU_JOB_COPY};
+                resetcopyJob.copyJobDescriptor.src = contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE];
+                resetcopyJob.copyJobDescriptor.dst = outputs[i];
+                FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpScheduleGpuJob(&contextPrivate->contextDescription.backendInterface,
+                                                                                                  &resetcopyJob));
+            }
         }
         else
+        // Each generated frame at its own time: everything from the warps to the composite depends on it. What these
+        // passes keep for the next frame (depth, dynamic mask, previous colour) does not, so they run once per output.
+        for (uint32_t outputIndex = 0; outputIndex < numOutputs; ++outputIndex)
         {
+            bindOutput(outputIndex);
+            contextPrivate->constants._Timestep = float(outputIndex + 1) / float(numOutputs + 1);
+            FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+                &contextPrivate->contextDescription.backendInterface,
+                &contextPrivate->constants,
+                sizeof(contextPrivate->constants),
+                &contextPrivate->constantBuffers[FFX_FRAMEINTERPOLATION_CONSTANTBUFFER_IDENTIFIER]));
+
             // Zero-initialise QMVD and MV Holes before warp passes
             {
                 uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(std::max(mvDepthLane.width, flowLane.width), FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH);

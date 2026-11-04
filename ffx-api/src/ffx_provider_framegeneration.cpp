@@ -694,6 +694,9 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             fiDispatchDesc.reset             = desc->reset;
 
             fiDispatchDesc.output            = Convert(desc->outputs[0]);
+            // Multi-frame generation: the optical flow once, a frame for each output at (i + 1) / (n + 1).
+            for (uint32_t i = 1; i < desc->numGeneratedFrames && i < 4; ++i)
+                fiDispatchDesc.additionalOutputs[fiDispatchDesc.numAdditionalOutputs++] = Convert(desc->outputs[i]);
             fiDispatchDesc.opticalFlowVector = internal_context->backendInterfaceShared.fpGetResource(
                 &internal_context->backendInterfaceShared, internal_context->sharedResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]);
 

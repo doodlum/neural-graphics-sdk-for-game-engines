@@ -257,6 +257,8 @@ typedef struct FfxFrameInterpolationDispatchDescription
     FfxCommandList commandList;        ///< The <c><i>FfxCommandList</i></c> to record frame interpolation commands into.
     FfxResource    currentBackBuffer;  ///< The current presentation color.
     FfxResource    output;             ///< The output resource where to store the interpolated result.
+    FfxResource    additionalOutputs[3];  ///< Multi-frame generation: further outputs; with n outputs in all, output i (0 is output) is the frame at time (i + 1) / (n + 1)
+    uint32_t       numAdditionalOutputs;  ///< How many of additionalOutputs are set (0: one frame, at 0.5)
 
     FfxResource      opticalFlowVector;                ///< The optical flow motion vectors (see example computation in the FfxOpticalFlow effect)
     FfxResource      opticalFlowSceneChangeDetection;  ///< The optical flow scene change detection data
