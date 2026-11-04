@@ -104,17 +104,32 @@ void postprocess(int32_t2 output_pixel)
         {
             // The frame with UI and the UI's opacity (DLSS-G's UI alpha, or a UI layer's alpha): the UI colour is
             // frame - (1 - a) x HUD-less, so over the interpolated scene the output is frame - (1 - a) x (HUD-less -
-            // interpolated): where nothing moves, the frame exactly.
+            // interpolated): where nothing moves, the frame exactly. Where that UI colour cannot be right (not
+            // finite, -1 or below, or below frame - 2 x HUD-less) the pixel is taken as opaque UI, as DLSS-G does.
             const FFX_MIN16_F  a   = LoadUiAlpha(output_pixel, UiKind() == 3u);
             const FFX_MIN16_F3 cur = LoadCurrentBackbuffer(output_pixel);
-            rgb_t = max(ui.rgb - (FFX_MIN16_F(1.0f) - a) * (cur - rgb_t), FFX_MIN16_F3(0.0f));
+            const FFX_MIN16_F3 uiColor = ui.rgb - (FFX_MIN16_F(1.0f) - a) * cur;
+            if (any(isnan(uiColor)) || any(isinf(uiColor)) || any(lessThanEqual(uiColor, FFX_MIN16_F3(-1.0f))) ||
+                any(lessThan(uiColor, ui.rgb - FFX_MIN16_F(2.0f) * cur)))
+                rgb_t = ui.rgb;
+            else
+                rgb_t = max(uiColor + (FFX_MIN16_F(1.0f) - a) * rgb_t, FFX_MIN16_F3(0.0f));
         }
 #endif
         else
         {
             // The frame with UI: where it differs from the one interpolated (HUD-less), its pixel as it is, not warped.
-            const FFX_MIN16_F3 cur = LoadCurrentBackbuffer(output_pixel);
-            if (any(greaterThan(abs(ui.rgb - cur), FFX_MIN16_F3(2.0f / 255.0f))))
+            // DLSS-G's test: a channel off by more than 0.07 anywhere in the pixel's 2x2 block, so grain or sharpening
+            // the game adds after its HUD-less copy is not taken for UI, and text's soft edges go with its strokes.
+            const int32_t2 block = output_pixel & ~int32_t2(1);
+            bool           isUi  = false;
+            for (int32_t i = 0; i < 4; ++i)
+            {
+                const int32_t2     q   = min(block + int32_t2(i & 1, i >> 1), displaySize - 1);
+                const FFX_MIN16_F3 d   = abs(LoadUiSource(q).rgb - LoadCurrentBackbuffer(q));
+                isUi = isUi || max(d.r, max(d.g, d.b)) > FFX_MIN16_F(0.07f);
+            }
+            if (isUi)
                 rgb_t = ui.rgb;
         }
     }
