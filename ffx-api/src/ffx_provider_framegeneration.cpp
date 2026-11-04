@@ -683,11 +683,12 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             {
                 if (auto nw = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationNoWarp>(h))
                     fiDispatchDesc.noWarpMask = Convert(nw->mask);
-                if (auto ui = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationUiSource>(h))
+                auto ui = ffx::DynamicCast<ffxApiDispatchDescFrameGenerationUiSource>(h);
+                if (ui && ui->uiKind != 1u && ui->uiKind <= FFX_API_FG_UI_KIND_LAYER_ALPHA_MASK)  // 1 removed: no UI
                 {
                     fiDispatchDesc.uiSource = Convert(ui->uiSource);
                     fiDispatchDesc.uiKind   = ui->uiKind;
-                    if (ui->uiKind == FFX_API_FG_UI_KIND_FRAME_AND_ALPHA || ui->uiKind == FFX_API_FG_UI_KIND_FRAME_AND_LAYER_ALPHA)
+                    if (ui->uiKind >= FFX_API_FG_UI_KIND_FRAME_AND_ALPHA && ui->uiKind <= FFX_API_FG_UI_KIND_LAYER_ALPHA_MASK)
                         fiDispatchDesc.uiAlpha = Convert(ui->uiAlpha);
                 }
             }

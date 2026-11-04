@@ -28,6 +28,12 @@ FFX_MIN16_F4 Stable_Softmax(FFX_MIN16_F4 tensor)
 // A warp offset under half a pixel samples the pixel itself: static and nearly static content (whose warped motion is
 // zero or a quantisation step or two, about 0.06 px each) is passed through unfiltered, where bilinear filtering at
 // those fractional offsets softened it in every generated frame.
+// DLSS-G's UI tests (Kernel_DownsampleRGBAndEstimateUIFused in nvngx_dlssg.dll 310.9.1) decide per block of this
+// many pixels square (it has 2 and 4): a pixel is UI when any pixel of its block is.
+#ifndef FFX_FRAMEINTERPOLATION_UI_BLOCK
+#define FFX_FRAMEINTERPOLATION_UI_BLOCK 2
+#endif
+
 float2 SnapSmallOffset(float2 uv, float2 offset, float2 size)
 {
     const float2 px = offset * size;
@@ -92,15 +98,8 @@ void postprocess(int32_t2 output_pixel)
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE
     {
         const FFX_MIN16_F4 ui = LoadUiSource(output_pixel);
-        if (UiKind() == 1u)
-        {
-            // The UI alone, premultiplied (DLSS-G's UI colour and alpha): blended over the interpolated scene as the
-            // game blends it over the HUD-less frame, so soft edges, shadows and translucent panels keep the scene
-            // behind them interpolated.
-            rgb_t = ui.rgb + (FFX_MIN16_F(1.0f) - ui.a) * rgb_t;
-        }
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA
-        else if (UiKind() == 2u || UiKind() == 3u)
+        if (UiKind() == 2u || UiKind() == 3u)
         {
             // The frame with UI and the UI's opacity (DLSS-G's UI alpha, or a UI layer's alpha): the UI colour is
             // frame - (1 - a) x HUD-less, so over the interpolated scene the output is frame - (1 - a) x (HUD-less -
@@ -113,19 +112,35 @@ void postprocess(int32_t2 output_pixel)
                 any(lessThan(uiColor, ui.rgb - FFX_MIN16_F(2.0f) * cur)))
                 rgb_t = ui.rgb;
             else
-                rgb_t = max(uiColor + (FFX_MIN16_F(1.0f) - a) * rgb_t, FFX_MIN16_F3(0.0f));
+                rgb_t = uiColor + (FFX_MIN16_F(1.0f) - a) * rgb_t;  // not clamped, as DLSS-G (scRGB has negatives)
         }
-#endif
+        else if (UiKind() == 4u || UiKind() == 5u)
+        {
+            // No HUD-less frame, the frame interpolated with its UI, and the UI's opacity (red, or alpha for a UI
+            // layer): the frame as it is where the opacity is above 0.4 anywhere in the block, as DLSS-G does.
+            const int32_t2 block = output_pixel & ~int32_t2(FFX_FRAMEINTERPOLATION_UI_BLOCK - 1);
+            bool           isUi  = false;
+            for (int32_t i = 0; i < FFX_FRAMEINTERPOLATION_UI_BLOCK * FFX_FRAMEINTERPOLATION_UI_BLOCK; ++i)
+            {
+                const int32_t2 q = min(block + int32_t2(i % FFX_FRAMEINTERPOLATION_UI_BLOCK, i / FFX_FRAMEINTERPOLATION_UI_BLOCK),
+                                       displaySize - 1);
+                isUi = isUi || LoadUiAlpha(q, UiKind() == 5u) > FFX_MIN16_F(0.4f);
+            }
+            if (isUi)
+                rgb_t = ui.rgb;
+        }
         else
+#endif
         {
             // The frame with UI: where it differs from the one interpolated (HUD-less), its pixel as it is, not warped.
-            // DLSS-G's test: a channel off by more than 0.07 anywhere in the pixel's 2x2 block, so grain or sharpening
-            // the game adds after its HUD-less copy is not taken for UI, and text's soft edges go with its strokes.
-            const int32_t2 block = output_pixel & ~int32_t2(1);
+            // DLSS-G's test: a channel off by more than 0.07 anywhere in the pixel's block, so grain or sharpening the
+            // game adds after its HUD-less copy is not taken for UI, and text's soft edges go with its strokes.
+            const int32_t2 block = output_pixel & ~int32_t2(FFX_FRAMEINTERPOLATION_UI_BLOCK - 1);
             bool           isUi  = false;
-            for (int32_t i = 0; i < 4; ++i)
+            for (int32_t i = 0; i < FFX_FRAMEINTERPOLATION_UI_BLOCK * FFX_FRAMEINTERPOLATION_UI_BLOCK; ++i)
             {
-                const int32_t2     q   = min(block + int32_t2(i & 1, i >> 1), displaySize - 1);
+                const int32_t2 q = min(block + int32_t2(i % FFX_FRAMEINTERPOLATION_UI_BLOCK, i / FFX_FRAMEINTERPOLATION_UI_BLOCK),
+                                       displaySize - 1);
                 const FFX_MIN16_F3 d   = abs(LoadUiSource(q).rgb - LoadCurrentBackbuffer(q));
                 isUi = isUi || max(d.r, max(d.g, d.b)) > FFX_MIN16_F(0.07f);
             }
