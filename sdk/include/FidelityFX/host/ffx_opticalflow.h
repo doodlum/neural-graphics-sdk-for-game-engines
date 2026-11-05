@@ -70,6 +70,10 @@ typedef enum FfxOpticalflowPass
     FFX_OPTICALFLOW_PASS_SEARCH,         // ... a full search per block around the motion vectors
     FFX_OPTICALFLOW_PASS_REFINE,         // ... the candidate search per texel
     FFX_OPTICALFLOW_PASS_APPLY,          // ... and the corrected motion vectors
+    FFX_OPTICALFLOW_PASS_PYRAMID,        // image optical flow: TP1's luma pyramid
+    FFX_OPTICALFLOW_PASS_FLOW_SEARCH,    // ... block matching per level, coarse to fine
+    FFX_OPTICALFLOW_PASS_FLOW_FILTER,    // ... and its vector median per level
+    FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE,  // ... level 0's search, +-1 texel around level 1's
 
     FFX_OPTICALFLOW_PASS_COUNT
 } FfxOpticalflowPass;

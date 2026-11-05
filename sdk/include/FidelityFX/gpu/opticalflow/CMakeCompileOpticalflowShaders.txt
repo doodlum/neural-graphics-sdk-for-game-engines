@@ -57,6 +57,10 @@ file(GLOB ARM_OPTICALFLOW_SHADERS_COMP
     "shaders/opticalflow/ffx_opticalflow_refine.glsl"
     "shaders/opticalflow/ffx_opticalflow_search.glsl"
     "shaders/opticalflow/ffx_opticalflow_apply.glsl"
+    "shaders/opticalflow/ffx_opticalflow_pyramid.glsl"
+    "shaders/opticalflow/ffx_opticalflow_flow_search.glsl"
+    "shaders/opticalflow/ffx_opticalflow_flow_filter.glsl"
+    "shaders/opticalflow/ffx_opticalflow_flow_search_fine.glsl"
 )
 
 file(GLOB ARM_OPTICALFLOW_SHADERS_FRAG

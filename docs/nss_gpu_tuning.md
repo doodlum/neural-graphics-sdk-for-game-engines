@@ -502,3 +502,77 @@ flow scatter 0.22, preprocess 0.21 ms), block matching adds 0.46 ms.
 
 Open: the periodic-texture aliasing (prefer the smaller of near-equal matches, or neighbours' vectors), the
 2.4 dB on correct content, and reading the corrections in the consumers instead of the full-resolution apply.
+
+### Image optical flow (default on the hints-only path)
+
+Moving shadows have no motion vectors and leave depth unchanged, so the motion-vector flow holds them still and
+the generated frames show them at the rendered rate (LEGO Batman). The flow NFRU blends with its motion-vector
+warps (`rgb_*_warp_t_flow`) is now an image optical flow on the TM1 grid (TM1 -> TP1, one vector per 4x4 pixels),
+in the manner of FSR 3's (`sdk-2.4.0/.../fsr3/include/gpu/opticalflow`) but built over the motion vectors:
+
+- `ffx_opticalflow_pyramid.glsl`: TP1's 8-bit luma, level 0 at the colour's size and 3 halvings (`FFX_OF_LEVELS`,
+  4 levels, about 40 px of reach beyond the seeds), 4 texels a word, all levels in one image, one dispatch (64x64
+  pixel tiles, the coarser levels in LDS; the colour read with adjacent lanes on adjacent pixels: 0.12 -> 0.08 ms).
+- `ffx_opticalflow_flow_search.glsl`, per level from the coarsest: an 8x8 block centred on each 4x4 cell, seeded with
+  the hint (the motion vectors scattered over the camera's flow, as before), zero and the coarser level's four
+  nearest cells (FSR 3's ScaleOpticalFlowAdvanced candidates), then a full +-3 search around the best (+-1 at level
+  0, `_flow_search_fine.glsl`). No msad4 in Vulkan: the cost is SSD = sum a^2 + sum b^2 - 2 sum ab with RDNA 2's
+  `v_dot4_u32_u8` (`GL_EXT_integer_dot_product`, four texels an instruction; the b^2 rows shared by a column's
+  offsets), plus `FFX_OF_LAMBDA_HINT` (256) per texel from the hint and `FFX_OF_LAMBDA_SEED` (64) from the seed, so
+  flat or ambiguous blocks keep the motion vectors' flow. Where the seeds agree and cost at most `FFX_OF_SETTLED` (256)
+  the search is skipped (3DRS convergence; identical results here). Where the hint agrees, its sub-pixel vector is
+  kept (a camera pan). Candidates whose block leaves the image sideways are not taken, and where the hint's does
+  (content scrolling out) the hint stands: without that, a fast pan lost 0.3 dB. The hint also stands where it
+  changes within two cells (an object's edge from the motion vectors and depth): blocks straddling it, and the
+  background the object covers in TP1, took the object's motion (`--dy 8` lost 7.4 dB, 2.8 with one cell).
+- `ffx_opticalflow_flow_filter.glsl`: FSR 3's 3x3 vector median after every level (without the coarse ones the
+  16,6 shadow lost 0.9 dB, at no measurable saving); level 0's is the flow.
+
+`fg_vk_test` (1280x720, 24 frames), new case `--shadow VX,VY` (a soft ellipse shadow over the static background,
+no motion vectors, depth unchanged; "edge": only the pixels its motion changes). b0: the motion vectors' flow (the
+old default), refine: `FFX_OF_REFINE=1`:
+
+| case | b0 | refine | image flow | cross-fade |
+| --- | --- | --- | --- | --- |
+| square, exact motion vectors (moving region) | 39.23 | 36.89 | 39.20 | 7.59 |
+| shadow 10,0 px/frame, edge | 36.25 | 29.82 | **38.98** | 34.03 |
+| shadow 10,0, its region | 42.85 | 34.60 | **45.56** | 40.63 |
+| shadow 16,6, edge | 31.63 | 24.95 | **34.98** | 27.11 |
+| shadow 10,0 with a sub-pixel pan (`--camvx 0.05`), edge | 42.17 | 39.41 | **43.87** | 40.19 |
+| square without motion vectors (`--nomv`) | 7.58 | 28.95 | 12.29 | 7.59 |
+| smoke 6,-4, its region | 54.58 | 54.58 | 54.53 | 55.91 |
+| camera 4 units/frame (`--camvx 4`), whole frame | 36.59 | 30.12 | 36.56 | 19.35 |
+| square moving down 8 px/frame (`--dy 8`) | 35.07 | - | 35.03 | 7.52 |
+| shadow 8,8 px/frame, edge | 32.86 | - | **35.15** | 29.24 |
+| shadow 10,0 with a sub-pixel pan, region | 37.38 | - | **38.69** | 33.24 |
+| x3 (`--multi 2`), frames at 1/3 and 2/3 | 35.94, 39.22 | - | 36.09, 39.21 | 8.79 |
+| +-2 px noise on every motion vector | 26.86 | 28.1 | 26.97 | 7.59 |
+| smoke 24,-12 / still with a pan / 20,-8 with a pan, region | 43.18 / 38.23 / 35.79 | - | 43.25 / 38.23 / 35.80 | 43.19 / 22.34 / 22.49 |
+| square without motion vectors, 6 px/frame (texture period 14 px) | 14.52 | 7.5 | 8.17 | 15.00 |
+
+The shadow edge gains 2.3-3.4 dB over the old flow, which already beat the cross-fade, and refine's corrections
+lose 6-7 dB there. Everything with motion vectors stays within 0.05 dB. The square drawn without motion vectors
+gains 4.7 dB at 12 px/frame but loses 6.4 dB at 6 px/frame, where its stripes alias (14 px period: -8 matches
+nearly as well as +6). Both are below the cross-fade, as refine is in that case. Content without motion vectors
+still needs `FFX_OF_REFINE=1`, which corrects the motion vectors themselves (NFRU weights its motion-vector warps
+over the flow's).
+
+GPU time per interpolation (`DU_FG_GPU_TIMING`, 1280x720, x2, two alternating runs each): 3.46 ms with the
+motion vectors' flow; image flow 3.79 ms (+0.33) with a static background, where most cells settle, and 3.91 ms
+(+0.45) with a sub-pixel camera pan everywhere (`--camvx 0.05`), where few do; refine 3.88 ms. Per pass (static,
+by skipping passes): pyramid 0.08 (0.03 of it without the colour reads), level 0 search and filter 0.13, level 1
+0.05, levels 2-3 latency-bound. LEGO Batman (D3D12, 1280x800, headless gamescope, 150 s) ran with it, without
+errors.
+
+Tried and dropped:
+- Correcting the motion vectors from the image flow (the flow inverted onto the TP1 grid by an atomic min of TM1's
+  depth over the vector, a correction where a 4x4 or 8x8 cell matched below 10-50% of the motion vector's SSD):
+  `--nomv` 12.3 -> 16.0 dB only, and the shadow edge -4 to -5 dB at every ratio, since a shadow over a locally flat
+  texture matches the shadow's motion perfectly.
+- No filter at the coarse levels (seeds from the raw vectors of a ping-pong image): -0.9 dB on the 16,6 shadow.
+- Ending at level 1 (`FFX_OF_FINEST=1`, 8x8 pixel vectors at level 0's cells): -0.1 ms, -1 dB on the moving square.
+- Level 0 choosing only among its seeds (FSR 3's upscale, no +-1 search): -0.03 ms, -0.2 to -0.35 dB on shadows.
+- Settling where the seed's SSD is below an eighth of the block's variance: no faster under a pan (the hint and
+  the doubled coarse vectors differ by rounding there, so the seeds rarely agree), -3.9 dB on `--nomv`.
+- Fewer levels (3): the same quality here, 0.01-0.02 ms less; 4 keep about 40 px of reach for unhinted motion.
+- 16 GPU jobs instead of 10 (a pyramid dispatch per level, no coarse filters): no difference.

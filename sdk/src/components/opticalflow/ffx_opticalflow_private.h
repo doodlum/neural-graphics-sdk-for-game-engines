@@ -23,7 +23,12 @@
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_MOTION_FIX              17  // a correction per 8x8 pixels
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TP1               18  // the same at a quarter of the resolution
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TM1               19
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT                   20
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1             20  // image flow: the luma pyramid (all levels in one
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TM1             21  // image), ping-ponged with the previous frame's
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_RAW                22  // each level's searched vectors (likewise)
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_LEVELS             23  // ... filtered, the next finer level's seeds
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_HINT               24  // the flow from the motion vectors and depth
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT                   25
 
 #define FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER 0
 #define FFX_OPTICALFLOW_CONSTANTBUFFER_COUNT      1
@@ -72,6 +77,29 @@ typedef struct OpticalFlowRefineConstants
     float    mv_scale[2];
 } OpticalFlowRefineConstants;
 
+// The image flow's, per pass and level (ffx_opticalflow_image_common.h).
+#define FFX_OPTICALFLOW_IMAGE_MAX_LEVELS 5
+typedef struct OpticalFlowImageConstants
+{
+    int32_t  level_dims[2];
+    int32_t  src_dims[2];
+    int32_t  cell_dims[2];
+    int32_t  coarse_dims[2];
+    int32_t  hint_dims[2];
+    float    out_scale[2];
+    int32_t  level_row;
+    int32_t  flow_row;
+    int32_t  coarse_row;
+    int32_t  level;
+    uint32_t lambda_hint;
+    uint32_t lambda_seed;
+    int32_t  level_count;
+    uint32_t settled_cost;
+    int32_t  final;
+    int32_t  pad[3];
+    int32_t  levels[FFX_OPTICALFLOW_IMAGE_MAX_LEVELS][4];
+} OpticalFlowImageConstants;
+
 // The private implementation of the arm data graph optical flow context.
 typedef struct OpticalFlowContext_Private
 {
@@ -87,6 +115,19 @@ typedef struct OpticalFlowContext_Private
     FfxPipelineState                   pipelineRefine;
     FfxPipelineState                   pipelineSearch;
     FfxPipelineState                   pipelineApply;
+    FfxPipelineState                   pipelinePyramid;  // hintsOnly: image optical flow over that flow
+    FfxPipelineState                   pipelineFlowSearch;
+    FfxPipelineState                   pipelineFlowFilter;
+    FfxPipelineState                   pipelineFlowSearchFine;
+    bool                               imageFlow;
+    bool                               pyramidValid;    // the TM1 pyramid holds the previous frame
+    uint32_t                           levelCount;
+    uint32_t                           finestLevel;  // searched; the flow is its vectors at level 0's cells
+    FfxDimensions2D                    levelDims[FFX_OPTICALFLOW_IMAGE_MAX_LEVELS];  // luma texels
+    int32_t                            levelRow[FFX_OPTICALFLOW_IMAGE_MAX_LEVELS];   // in the pyramid
+    int32_t                            flowRow[FFX_OPTICALFLOW_IMAGE_MAX_LEVELS];    // in the flow images
+    uint32_t                           lambdaHint, lambdaSeed, settledCost;
+    FfxResourceInternal                pyramid[2];
     bool                               refine;
     bool                               lumaValid;       // the TM1 luma holds the previous frame
     bool                               fixedValid;      // this frame's corrected motion vectors are written
