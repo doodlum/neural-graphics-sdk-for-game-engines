@@ -458,6 +458,9 @@ TM1 by the flow, and needs both right: correcting only the flow gains nothing. S
 motion vectors, in their direction (TP1 -> TM1), and the flow is scattered from the corrected ones; the
 interpolation takes them too (`ffxOpticalFlowGetFixedMotionVectors`, FI dispatch `motionVectors`).
 
+**Removed** (the passes, `FFX_OF_REFINE` and `ffxOpticalFlowGetFixedMotionVectors`): in Clair Obscur the corrected
+motion vectors caused smearing and blocky edges with any optical flow. The measurements below are kept for reference.
+
 `FFX_OF_REFINE=1` (off by default): luma at half and a quarter of the resolution, a full +-32 px search per
 32 px block on the quarter seeded by the motion vectors (FSR 3's optical flow kernel, one level instead of seven),
 a 3DRS candidate pick per 8x8 pixels on the half (de Haan et al., IEEE TCSVT 1993), and the corrections applied.
@@ -592,7 +595,7 @@ with 4x fewer atomics). What was done (quality checked with `fg_vk_test` on 11 c
 | Graph: the DenseNet block of 1x1 convs (layers 12-14) in one dispatch, one thread per pixel, intermediates in registers (`ML_DOT4_CHAIN`); same result as the separate layers with fp32 requantisation. `FFX_ML_NO_CHAIN=1` off. | 85 us |
 | Graph: fp32 requantisation by default for frame interpolation (`FFX_ML_RESCALE_FLOAT=0` exact); interpolated frames within 0.02 dB | 45 us |
 | Postprocess: DLSS-G's 2x2 UI test per quad of lanes (each pixel loaded once, OR across the quad) instead of the block's 4 pixels per pixel; UI with grain +1.6 dB, others identical | 22 us |
-| Init warp: not clearing the TP1 holes, which the warp writes whole. Bit exact. | ~5 us |
+| ~~Init warp: not clearing the TP1 holes~~ Reverted: the warp scatters into the holes mask (each mark lands where its pixel's motion takes it), so without the clear it kept every earlier frame's holes; short harness runs did not show it, games did (smearing, blocky edges). | (0) |
 
 Total: 3.79 -> 3.52 ms (static background), 3.92 -> 3.64 ms (sub-pixel pan everywhere), interleaved runs, about 7%.
 Tried and dropped: clear jobs instead of init_warp's stores (72 us against 44: RADV clears these by compute),

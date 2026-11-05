@@ -706,7 +706,6 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             fiDispatchDesc.opticalFlowVector = internal_context->backendInterfaceShared.fpGetResource(
                 &internal_context->backendInterfaceShared, internal_context->sharedResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]);
 
-            TRY2(ffxOpticalFlowGetFixedMotionVectors(&internal_context->armOFContext, &fiDispatchDesc.motionVectors));
             fiDispatchDesc.opticalFlowScale = {1.f / fiDispatchDesc.opticalFlowVector.description.width,
                                                1.f / fiDispatchDesc.opticalFlowVector.description.height};
 

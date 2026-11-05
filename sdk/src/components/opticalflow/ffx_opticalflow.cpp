@@ -54,7 +54,7 @@ typedef struct ResourceBinding
     char     name[64];
 } ResourceBinding;
 
-constexpr int                srvTextureCount                         = 23;
+constexpr int                srvTextureCount                         = 17;
 static const ResourceBinding srvTextureBindingTable[srvTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS, "r_game_motion_vectors"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_DEPTH, "r_scatter_depth"},
@@ -63,12 +63,6 @@ static const ResourceBinding srvTextureBindingTable[srvTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_DEPTH, "r_depth"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PREV_DEPTH, "r_depth_tm1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS, "r_motion_vectors"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1, "r_luma_tp1"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TM1, "r_luma_tm1"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_BLOCK_FLOW, "r_block_flow"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_MOTION_FIX, "r_motion_fix"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TP1, "r_lumaq_tp1"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TM1, "r_lumaq_tm1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1, "r_pyramid_tp1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TM1, "r_pyramid_tm1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_RAW, "r_flow_raw"},
@@ -81,18 +75,13 @@ static const ResourceBinding srvTextureBindingTable[srvTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_FLOW, "r_arm_flow"},
 };
 
-constexpr int                uavTextureCount                         = 18;
+constexpr int                uavTextureCount                         = 13;
 static const ResourceBinding uavTextureBindingTable[uavTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_DEPTH, "rw_scatter_depth"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_RESULT, "rw_flow"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS, "rw_motion_vectors"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PREV_DEPTH, "rw_depth_tm1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PREV_COLOR, "rw_color_tm1"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FIXED_MOTION_VECTORS, "rw_fixed_motion_vectors"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1, "rw_luma_tp1"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_BLOCK_FLOW, "rw_block_flow"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_MOTION_FIX, "rw_motion_fix"},
-    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TP1, "rw_lumaq_tp1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1, "rw_pyramid_tp1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_RAW, "rw_flow_raw"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_LEVELS, "rw_flow_levels"},
@@ -296,10 +285,6 @@ static FfxErrorCode createPipelineStates(OpticalFlowContext_Private* context)
             uint32_t           constantsSize;
         } scatter[] = {{FFX_OPTICALFLOW_PASS_SCATTER_DEPTH, "ARM-OpticalFlow-ScatterDepth", &context->pipelineScatterDepth, sizeof(OpticalFlowScatterConstants)},
                        {FFX_OPTICALFLOW_PASS_SCATTER_FLOW, "ARM-OpticalFlow-ScatterFlow", &context->pipelineScatterFlow, sizeof(OpticalFlowScatterConstants)},
-                       {FFX_OPTICALFLOW_PASS_LUMA, "ARM-OpticalFlow-Luma", &context->pipelineLuma, sizeof(OpticalFlowRefineConstants)},
-                       {FFX_OPTICALFLOW_PASS_SEARCH, "ARM-OpticalFlow-Search", &context->pipelineSearch, sizeof(OpticalFlowRefineConstants)},
-                       {FFX_OPTICALFLOW_PASS_REFINE, "ARM-OpticalFlow-Refine", &context->pipelineRefine, sizeof(OpticalFlowRefineConstants)},
-                       {FFX_OPTICALFLOW_PASS_APPLY, "ARM-OpticalFlow-Apply", &context->pipelineApply, sizeof(OpticalFlowRefineConstants)},
                        {FFX_OPTICALFLOW_PASS_PYRAMID, "ARM-OpticalFlow-Pyramid", &context->pipelinePyramid, sizeof(OpticalFlowImageConstants)},
                        {FFX_OPTICALFLOW_PASS_FLOW_SEARCH, "ARM-OpticalFlow-FlowSearch", &context->pipelineFlowSearch, sizeof(OpticalFlowImageConstants)},
                        {FFX_OPTICALFLOW_PASS_FLOW_FILTER, "ARM-OpticalFlow-FlowFilter", &context->pipelineFlowFilter, sizeof(OpticalFlowImageConstants)},
@@ -484,40 +469,6 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
     const FfxOpticalFlowGridSize gridSize    = contextDescription->gridSize;
     context->opticalFlowSize                 = GetOpticalFlowTextureSizeFromBlockSize(displaySize, GetOpticalFlowBlockSize(gridSize));
 
-    // Block matching (hintsOnly): luma at half and a quarter of the display resolution, 4 texels a word, a spare word per row for
-    // the unaligned reads; FFX_OF_REFINE=1 turns it on (off by default: it costs about 0.42 ms at 1280x720, and in the
-    // ground-truth test 2.4 dB where the motion vectors are already right, and periodic textures can alias). FFX_OF_PENALTY and
-    // FFX_OF_PENALTY_STEP (SAD units) and FFX_OF_MATCH_RATIO (percent of the motion vector's SAD) set how much
-    // clearer a match than the motion vector's a correction needs.
-    const int32_t lumaWidth       = int32_t(displaySize.width / 2);
-    const int32_t lumaHeight      = int32_t(displaySize.height / 2);
-    const int32_t lumaQPacked     = (lumaWidth / 2 + 3) / 4 + 1;
-    const int32_t fixWidth        = int32_t(displaySize.width + 7) / 8;
-    const int32_t fixHeight       = int32_t(displaySize.height + 7) / 8;
-    const int32_t lumaPackedWidth = (lumaWidth + 3) / 4 + 1;
-    {
-        const char* v   = SettingEnv("FFX_OF_REFINE");
-        context->refine = context->hintsOnly && v && !strcmp(v, "1");
-        const char* p1  = getenv("FFX_OF_PENALTY");
-        const char* p2  = getenv("FFX_OF_PENALTY_STEP");
-        OpticalFlowRefineConstants& c = context->refineConstants;
-        c.output_dims[0]    = int32_t(context->opticalFlowSize.width);
-        c.output_dims[1]    = int32_t(context->opticalFlowSize.height);
-        c.luma_dims[0]      = lumaWidth;
-        c.luma_dims[1]      = lumaHeight;
-        c.color_dims[0]     = int32_t(displaySize.width);
-        c.color_dims[1]     = int32_t(displaySize.height);
-        c.packed_width      = lumaPackedWidth;
-        c.penalty_candidate = p1 ? uint32_t(atoi(p1)) : 64u;
-        c.penalty_step      = p2 ? uint32_t(atoi(p2)) : 16u;
-        const char* r       = getenv("FFX_OF_MATCH_RATIO");
-        c.match_ratio       = r ? atoi(r) : 50;
-        c.block_dims[0]     = (lumaWidth / 2 + 7) / 8;
-        c.block_dims[1]     = (lumaHeight / 2 + 7) / 8;
-        c.packed_width_q    = lumaQPacked;
-        c.depth_inverted    = (contextDescription->flags & FFX_OPTICALFLOW_ENABLE_DEPTH_INVERTED) ? 1 : 0;
-    }
-
     // Image optical flow (hintsOnly): a luma pyramid from the colour's resolution, halved per level (FFX_OF_LEVELS, 4
     // by default: motion of up to about 40 pixels the motion vectors do not have), the flow searched from the coarsest
     // over the hint flow (ffx_opticalflow_pyramid.glsl, _flow_search.glsl, _flow_filter.glsl). On by default where the
@@ -601,76 +552,6 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
          FFX_SURFACE_FORMAT_R32_UINT,
          context->opticalFlowSize.width,
          context->opticalFlowSize.height,
-         1,
-         FFX_RESOURCE_FLAGS_NONE,
-         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
-        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FIXED_MOTION_VECTORS,
-         "ArmOF_Fixed_Motion_Vectors",
-         FFX_RESOURCE_TYPE_TEXTURE2D,
-         FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R16G16_FLOAT,
-         displaySize.width,
-         displaySize.height,
-         1,
-         FFX_RESOURCE_FLAGS_NONE,
-         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
-        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_BLOCK_FLOW,
-         "ArmOF_Block_Flow",
-         FFX_RESOURCE_TYPE_TEXTURE2D,
-         FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R16G16_FLOAT,
-         uint32_t((lumaWidth / 2 + 7) / 8),
-         uint32_t((lumaHeight / 2 + 7) / 8),
-         1,
-         FFX_RESOURCE_FLAGS_NONE,
-         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
-        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_MOTION_FIX,
-         "ArmOF_Motion_Fix",
-         FFX_RESOURCE_TYPE_TEXTURE2D,
-         FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT,
-         uint32_t(fixWidth),
-         uint32_t(fixHeight),
-         1,
-         FFX_RESOURCE_FLAGS_NONE,
-         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
-        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1,
-         "ArmOF_Luma_0",
-         FFX_RESOURCE_TYPE_TEXTURE2D,
-         FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R32_UINT,
-         uint32_t(lumaPackedWidth),
-         uint32_t(lumaHeight),
-         1,
-         FFX_RESOURCE_FLAGS_NONE,
-         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
-        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TM1,
-         "ArmOF_Luma_1",
-         FFX_RESOURCE_TYPE_TEXTURE2D,
-         FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R32_UINT,
-         uint32_t(lumaPackedWidth),
-         uint32_t(lumaHeight),
-         1,
-         FFX_RESOURCE_FLAGS_NONE,
-         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
-        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TP1,
-         "ArmOF_LumaQ_0",
-         FFX_RESOURCE_TYPE_TEXTURE2D,
-         FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R32_UINT,
-         uint32_t(lumaQPacked),
-         uint32_t(lumaHeight / 2),
-         1,
-         FFX_RESOURCE_FLAGS_NONE,
-         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
-        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TM1,
-         "ArmOF_LumaQ_1",
-         FFX_RESOURCE_TYPE_TEXTURE2D,
-         FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R32_UINT,
-         uint32_t(lumaQPacked),
-         uint32_t(lumaHeight / 2),
          1,
          FFX_RESOURCE_FLAGS_NONE,
          {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
@@ -797,10 +678,6 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
 
     // copy resources to uavResrouces list
     memcpy(context->uavResources, context->srvResources, sizeof(context->srvResources));
-    context->luma[0] = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1];
-    context->luma[1] = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TM1];
-    context->lumaQ[0] = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TP1];
-    context->lumaQ[1] = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TM1];
     context->pyramid[0] = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1];
     context->pyramid[1] = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TM1];
 
@@ -819,10 +696,6 @@ static FfxErrorCode opticalFlowVkRelease(OpticalFlowContext_Private* context)
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineComputeMVHints, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineScatterDepth, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineScatterFlow, context->effectContextId);
-    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineLuma, context->effectContextId);
-    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineRefine, context->effectContextId);
-    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineSearch, context->effectContextId);
-    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineApply, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelinePyramid, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFlowSearch, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFlowFilter, context->effectContextId);
@@ -836,10 +709,6 @@ static FfxErrorCode opticalFlowVkRelease(OpticalFlowContext_Private* context)
         ffxSafeReleasePipeline(&context->contextDescription.backendInterface, p, context->effectContextId);
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1] = context->pyramid[0];
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TM1] = context->pyramid[1];
-    context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1] = context->luma[0];
-    context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TM1] = context->luma[1];
-    context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TP1] = context->lumaQ[0];
-    context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TM1] = context->lumaQ[1];
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFragmentMVHints, context->effectContextId);
 
     // unregister resources not created internally
@@ -1326,70 +1195,19 @@ static FfxErrorCode ArmOpticalFlowDispatch(OpticalFlowContext_Private* context, 
     if (context->hintsOnly)
     {
         // The camera-motion hints, then (with the game's motion vectors) the exact motion of everything visible in
-        // TP1 scattered over them (ffx_opticalflow_scatter_depth.glsl / _flow.glsl). From the second frame on, the
-        // motion vectors are first corrected where the image contradicts them (ffx_opticalflow_luma.glsl, _search.glsl,
-        // _refine.glsl), and the interpolation takes the corrected ones too (ffxOpticalFlowGetFixedMotionVectors).
+        // TP1 scattered over them (ffx_opticalflow_scatter_depth.glsl / _flow.glsl).
         FfxGpuJobDescription copyJob       = {FFX_GPU_JOB_COPY};
         copyJob.copyJobDescriptor.src      = context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS];
         copyJob.copyJobDescriptor.dst      = context->uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_RESULT];
         copyJob.copyJobDescriptor.copyMode = FFX_GPU_COPY_SRC_EXTENT;
         FFX_VALIDATE(context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &copyJob));
 
-        context->fixedValid = false;
-        if (context->refine)
-        {
-            const uint32_t tp1 = context->resourceFrameIndex;
-            for (FfxResourceInternal* r : {context->srvResources, context->uavResources})
-            {
-                r[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1] = context->luma[tp1];
-                r[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TM1] = context->luma[tp1 ^ 1];
-                r[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TP1] = context->lumaQ[tp1];
-                r[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TM1] = context->lumaQ[tp1 ^ 1];
-            }
-            OpticalFlowRefineConstants& c = context->refineConstants;
-            const bool fix = context->lumaValid && !params->reset && params->motionVectors.resource;
-            if (fix)
-            {
-                context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface,
-                                                                                &params->motionVectors,
-                                                                                context->effectContextId,
-                                                                                &context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS]);
-                c.mv_dims[0]  = int32_t(params->motionVectors.description.width);
-                c.mv_dims[1]  = int32_t(params->motionVectors.description.height);
-                c.mv_scale[0] = params->motionVectorScale[0];
-                c.mv_scale[1] = params->motionVectorScale[1];
-            }
-            FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
-                &context->contextDescription.backendInterface, &c, sizeof(c), &context->constantBuffers[FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER]));
-            scheduleMVHintsAndCopyResources(
-                context, &context->pipelineLuma, uint32_t(c.packed_width * 4 + 7) / 8, uint32_t(c.luma_dims[1] + 7) / 8, "ArmOF_Luma");
-            if (fix)
-            {
-                scheduleMVHintsAndCopyResources(context, &context->pipelineSearch, uint32_t(c.block_dims[0]), uint32_t(c.block_dims[1]), "ArmOF_Search");
-                // depth (TP1) and depthTm1 are registered above, for the MV hints.
-                scheduleMVHintsAndCopyResources(context,
-                                                &context->pipelineRefine,
-                                                uint32_t((c.color_dims[0] + 7) / 8 + 7) / 8,
-                                                uint32_t((c.color_dims[1] + 7) / 8 + 7) / 8,
-                                                "ArmOF_Refine");
-                scheduleMVHintsAndCopyResources(
-                    context, &context->pipelineApply, uint32_t(c.mv_dims[0] + 7) / 8, uint32_t(c.mv_dims[1] + 7) / 8, "ArmOF_Apply");
-                context->fixedValid = true;
-            }
-            context->lumaValid = true;
-        }
-
         if (params->motionVectors.resource && !params->reset)
         {
-            // The scatter reads the corrected motion vectors when there are any (same layout and scale).
-            if (context->fixedValid)
-                context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS] =
-                    context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FIXED_MOTION_VECTORS];
-            else
-                context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface,
-                                                                                &params->motionVectors,
-                                                                                context->effectContextId,
-                                                                                &context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS]);
+            context->contextDescription.backendInterface.fpRegisterResource(&context->contextDescription.backendInterface,
+                                                                            &params->motionVectors,
+                                                                            context->effectContextId,
+                                                                            &context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS]);
             if (!context->scatter64)  // its keys are reset by the resolve
             {
                 FfxGpuJobDescription clearJob = {FFX_GPU_JOB_CLEAR_UINT};
@@ -1611,18 +1429,6 @@ FfxErrorCode ffxOpticalFlowContextDispatch(FfxOpticalFlowContext* context, FfxOp
 
     const FfxErrorCode errorCode = ArmOpticalFlowDispatch(contextPrivate, dispatchParams);
     return errorCode;
-}
-
-FfxErrorCode ffxOpticalFlowGetFixedMotionVectors(FfxOpticalFlowContext* context, FfxResource* pResource)
-{
-    FFX_RETURN_ON_ERROR(context, FFX_ERROR_INVALID_POINTER);
-    FFX_RETURN_ON_ERROR(pResource, FFX_ERROR_INVALID_POINTER);
-    OpticalFlowContext_Private* contextPrivate = (OpticalFlowContext_Private*)(context);
-    *pResource = contextPrivate->fixedValid ? contextPrivate->contextDescription.backendInterface.fpGetResource(
-                                                  &contextPrivate->contextDescription.backendInterface,
-                                                  contextPrivate->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FIXED_MOTION_VECTORS])
-                                            : FfxResource{};
-    return FFX_OK;
 }
 
 FfxDimensions2D ffxOpticalFlowGetSize(FfxOpticalFlowContext* context)
