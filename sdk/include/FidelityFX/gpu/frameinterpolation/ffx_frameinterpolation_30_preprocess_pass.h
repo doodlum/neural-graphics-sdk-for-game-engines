@@ -123,17 +123,19 @@ void preprocess(int32_t2 input_pixel)
         return;
     }
 
-    int32_t2 output_pixel = padded_output_pixel;
-    if (output_pixel.x >= flowLane.x)
+    // The network's input at the tensor lane's size (the flow lane's, or fewer rows: FFX_FI_TENSOR_HEIGHT), mirrored
+    // into the data graph's alignment padding.
+    const int32_t2 tensorLane   = TensorLaneSize();
+    int32_t2       output_pixel = padded_output_pixel;
+    if (output_pixel.x >= tensorLane.x)
     {
-        output_pixel.x = (flowLane.x - 1) - (output_pixel.x - flowLane.x);
+        output_pixel.x = (tensorLane.x - 1) - (output_pixel.x - tensorLane.x);
     }
-    if (output_pixel.y >= flowLane.y)
+    if (output_pixel.y >= tensorLane.y)
     {
-        output_pixel.y = (flowLane.y - 1) - (output_pixel.y - flowLane.y);
+        output_pixel.y = (tensorLane.y - 1) - (output_pixel.y - tensorLane.y);
     }
-    float2 invFlowLane = FlowLaneSizeRcp();
-    float2 uv          = ((output_pixel.xy) + 0.5f) * invFlowLane;
+    float2 uv = ((output_pixel.xy) + 0.5f) * TensorLaneSizeRcp();
 
     int32_t2 iMvCoord   = int32_t2(floor(uv * float2(mvDepthLane)));
     int32_t2 iFlowCoord = int32_t2(floor(uv * float2(flowLane)));

@@ -10,6 +10,8 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_KHR_shader_subgroup_quad : require
+#extension GL_KHR_shader_subgroup_basic : require
 
 //-----------------------------------------------------------------------------
 // Input: SRV bindings
@@ -34,6 +36,7 @@
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_PREVIOUS_INTERPOLATION_SOURCE   8
 
 
+#define FFX_FRAMEINTERPOLATION_QUAD_UI 1
 #include "frameinterpolation/ffx_frameinterpolation_50_postprocess_pass.h"
 
 //------------------------------------------------------------------------------
@@ -46,5 +49,10 @@
 FFX_ARM_FRAMEINTERPOLATION_NUM_THREADS
 void main()
 {
-    postprocess(int32_t2(gl_GlobalInvocationID.xy));
+    // Each 4 consecutive lanes a 2x2 block (FFX_FRAMEINTERPOLATION_QUAD_UI), 8x8 such blocks a group. From the lane
+    // itself, not the local invocation index: with quad operations the driver may reorder local invocations.
+    const uint32_t i = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+    const int32_t2 q = int32_t2((i >> 2) % (FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH / 2), (i >> 2) / (FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH / 2));
+    postprocess(int32_t2(gl_WorkGroupID.xy) * int32_t2(FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH, FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT) +
+                q * 2 + int32_t2(i & 1u, (i >> 1) & 1u));
 }

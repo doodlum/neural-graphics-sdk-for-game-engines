@@ -12,7 +12,8 @@ void init_warp(int32_t2 output_pixel)
     if (all(lessThan(output_pixel, mv_depth_size)))
     {
         InitWarpClearQDataTp1(output_pixel);
-        InitWarpClearHolesTp1(output_pixel);
+        // Not the TP1 holes: the warp writes each of their pixels. (Clear jobs instead of these stores measured
+        // slower on RADV: 72 against 44 us at 1280x720.)
         InitWarpClearHolesTm1(output_pixel);
     }
 

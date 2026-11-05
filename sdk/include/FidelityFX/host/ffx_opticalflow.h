@@ -74,6 +74,8 @@ typedef enum FfxOpticalflowPass
     FFX_OPTICALFLOW_PASS_FLOW_SEARCH,    // ... block matching per level, coarse to fine
     FFX_OPTICALFLOW_PASS_FLOW_FILTER,    // ... and its vector median per level
     FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE,  // ... level 0's search, +-1 texel around level 1's
+    FFX_OPTICALFLOW_PASS_SCATTER,        // the two scatter steps in one, with 64-bit atomics
+    FFX_OPTICALFLOW_PASS_SCATTER_RESOLVE,  // ... and its winners written
 
     FFX_OPTICALFLOW_PASS_COUNT
 } FfxOpticalflowPass;

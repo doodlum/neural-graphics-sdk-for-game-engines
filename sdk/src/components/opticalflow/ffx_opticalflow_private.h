@@ -28,7 +28,8 @@
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_RAW                22  // each level's searched vectors (likewise)
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_LEVELS             23  // ... filtered, the next finer level's seeds
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_HINT               24  // the flow from the motion vectors and depth
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT                   25
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_KEYS            25  // depth key and flow per texel (64-bit atomics)
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT                   26
 
 #define FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER 0
 #define FFX_OPTICALFLOW_CONSTANTBUFFER_COUNT      1
@@ -119,6 +120,9 @@ typedef struct OpticalFlowContext_Private
     FfxPipelineState                   pipelineFlowSearch;
     FfxPipelineState                   pipelineFlowFilter;
     FfxPipelineState                   pipelineFlowSearchFine;
+    FfxPipelineState                   pipelineScatter;  // the scatter in one pass (64-bit atomics)
+    FfxPipelineState                   pipelineScatterResolve;
+    bool                               scatter64;
     bool                               imageFlow;
     bool                               pyramidValid;    // the TM1 pyramid holds the previous frame
     uint32_t                           levelCount;

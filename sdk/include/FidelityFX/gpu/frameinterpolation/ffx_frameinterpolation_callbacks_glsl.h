@@ -85,8 +85,21 @@ layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION,
     FfxInt32x2   _FlowLaneSize;
     FfxFloat32x2 _FlowLaneSizeRcp;
     FfxFloat32   _OfGridSizeRcp;
+    FfxFloat32   _Pad0;
+    FfxInt32x2   _TensorLaneSize;
+    FfxFloat32x2 _TensorLaneSizeRcp;
 }
 cbFI;
+
+FfxInt32x2 TensorLaneSize()
+{
+    return cbFI._TensorLaneSize;
+}
+
+FfxFloat32x2 TensorLaneSizeRcp()
+{
+    return cbFI._TensorLaneSizeRcp;
+}
 
 FfxFloat32x4x4 GetMotionTM1ToTP1()
 {
