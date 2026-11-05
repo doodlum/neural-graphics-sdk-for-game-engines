@@ -40,22 +40,41 @@ float2 SnapSmallOffset(float2 uv, float2 offset, float2 size)
     return dot(px, px) < 0.25f ? uv : uv + offset;
 }
 
+// FFX_FRAMEINTERPOLATION_QUAD_UI (the compute pass): each quad of lanes is a 2x2 pixel block (the UI test's block),
+// so the test loads each pixel once and ORs over the quad, where it loaded the block's four per pixel. Lanes off
+// the display take its last pixel and store nothing, so that every lane of a quad is active.
+#if FFX_FRAMEINTERPOLATION_QUAD_UI
+#if FFX_FRAMEINTERPOLATION_UI_BLOCK != 2
+#error the quad UI test takes 2x2 blocks
+#endif
+bool QuadAny(bool b)
+{
+    b = b || subgroupQuadSwapHorizontal(b);
+    return b || subgroupQuadSwapVertical(b);
+}
+#endif
+
 void postprocess(int32_t2 output_pixel)
 {
     int32_t2 displaySize = DisplaySize();
+#if FFX_FRAMEINTERPOLATION_QUAD_UI
+    const bool store = all(lessThan(output_pixel, displaySize));
+    output_pixel     = min(output_pixel, displaySize - 1);
+#else
+    const bool store = true;
     if (any(greaterThanEqual(output_pixel, displaySize)))
         return;
+#endif
 
     float2 uv = (float2(output_pixel.xy) + 0.5f) * DisplaySizeRcp();
 
     float2   mvDepthLanef = float2(MvDepthLaneSize());
     float2   flowLanef    = float2(FlowLaneSize());
-    float2   ofSizef      = float2(GetOpticalFlowResolution());
     int32_t2 iMvCoord     = int32_t2(floor(uv * mvDepthLanef));
     int32_t2 iFlowCoord   = int32_t2(floor(uv * flowLanef));
 
     // Read Output parameters - bilinear upsampling is done here
-    float2       tensor_uv = uv * ofSizef * InputTensorSizeRcp();
+    float2       tensor_uv = uv * float2(TensorLaneSize()) * InputTensorSizeRcp();
     FFX_MIN16_F4 params    = Dequantize(FFX_MIN16_F4(SampleOutParamsTensor(tensor_uv)), QuantParamsSNORM().zw);
 
     // Read Vectors warped to "t" position - sampling nearest
@@ -118,6 +137,9 @@ void postprocess(int32_t2 output_pixel)
         {
             // No HUD-less frame, the frame interpolated with its UI, and the UI's opacity (red, or alpha for a UI
             // layer): the frame as it is where the opacity is above 0.4 anywhere in the block, as DLSS-G does.
+#if FFX_FRAMEINTERPOLATION_QUAD_UI
+            const bool isUi = QuadAny(LoadUiAlpha(output_pixel, UiKind() == 5u) > FFX_MIN16_F(0.4f));
+#else
             const int32_t2 block = output_pixel & ~int32_t2(FFX_FRAMEINTERPOLATION_UI_BLOCK - 1);
             bool           isUi  = false;
             for (int32_t i = 0; i < FFX_FRAMEINTERPOLATION_UI_BLOCK * FFX_FRAMEINTERPOLATION_UI_BLOCK; ++i)
@@ -126,6 +148,7 @@ void postprocess(int32_t2 output_pixel)
                                        displaySize - 1);
                 isUi = isUi || LoadUiAlpha(q, UiKind() == 5u) > FFX_MIN16_F(0.4f);
             }
+#endif
             if (isUi)
                 rgb_t = ui.rgb;
         }
@@ -135,6 +158,10 @@ void postprocess(int32_t2 output_pixel)
             // The frame with UI: where it differs from the one interpolated (HUD-less), its pixel as it is, not warped.
             // DLSS-G's test: a channel off by more than 0.07 anywhere in the pixel's block, so grain or sharpening the
             // game adds after its HUD-less copy is not taken for UI, and text's soft edges go with its strokes.
+#if FFX_FRAMEINTERPOLATION_QUAD_UI
+            const FFX_MIN16_F3 d    = abs(ui.rgb - LoadCurrentBackbuffer(output_pixel));
+            const bool         isUi = QuadAny(max(d.r, max(d.g, d.b)) > FFX_MIN16_F(0.07f));
+#else
             const int32_t2 block = output_pixel & ~int32_t2(FFX_FRAMEINTERPOLATION_UI_BLOCK - 1);
             bool           isUi  = false;
             for (int32_t i = 0; i < FFX_FRAMEINTERPOLATION_UI_BLOCK * FFX_FRAMEINTERPOLATION_UI_BLOCK; ++i)
@@ -144,12 +171,15 @@ void postprocess(int32_t2 output_pixel)
                 const FFX_MIN16_F3 d   = abs(LoadUiSource(q).rgb - LoadCurrentBackbuffer(q));
                 isUi = isUi || max(d.r, max(d.g, d.b)) > FFX_MIN16_F(0.07f);
             }
+#endif
             if (isUi)
                 rgb_t = ui.rgb;
         }
     }
 #endif
 
+    if (!store)
+        return;
     StoreFrameinterpolationOutput(output_pixel, FFX_MIN16_F4(rgb_t, 1.0f));
 
     // When the SDK owns the previous-source ping-pong buffer, persist the current

@@ -480,6 +480,10 @@ namespace
 
 int main(int argc, char** argv)
 {
+    // FFX_ML_TEST_LOG=<file>: stdout to a file (under Proton a console app's output does not reach the shell).
+    if (const char* log = getenv("FFX_ML_TEST_LOG"))
+        freopen(log, "w", stdout), freopen(log, "a", stderr);
+    setvbuf(stdout, nullptr, _IONBF, 0);
     int gpu = 0, width = 960, height = 544, iterations = 20;
     for (int i = 1; i + 1 < argc; i += 2)
     {

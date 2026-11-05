@@ -706,6 +706,13 @@ static FfxErrorCode frameinterpolationCreate(FfxArmFrameInterpolationContext_Pri
         context->tensorLane.width  = static_cast<uint32_t>(floorf(FFX_FRAMEINTERPOLATION_TENSOR_LANE_MAX_HEIGHT * A));
         context->tensorLane.height = FFX_FRAMEINTERPOLATION_TENSOR_LANE_MAX_HEIGHT;
     }
+    // FFX_FI_TENSOR_HEIGHT=N: the network at N rows (fewer than the flow's: its cost goes with the area).
+    if (const char* th = getenv("FFX_FI_TENSOR_HEIGHT"))
+    {
+        const uint32_t n = uint32_t(atoi(th));
+        if (n >= 16 && n < context->tensorLane.height)
+            context->tensorLane = {uint32_t(roundf(float(context->tensorLane.width) * float(n) / float(context->tensorLane.height))), n};
+    }
 
     // Set constant buffer.
     context->constants._RenderSize[0]  = renderSize.width;
@@ -738,6 +745,10 @@ static FfxErrorCode frameinterpolationCreate(FfxArmFrameInterpolationContext_Pri
     context->constants._FlowLaneSize[1]       = context->flowLane.height;
     context->constants._FlowLaneSizeRcp[0]    = 1.0f / context->flowLane.width;
     context->constants._FlowLaneSizeRcp[1]    = 1.0f / context->flowLane.height;
+    context->constants._TensorLaneSize[0]     = context->tensorLane.width;
+    context->constants._TensorLaneSize[1]     = context->tensorLane.height;
+    context->constants._TensorLaneSizeRcp[0]  = 1.0f / context->tensorLane.width;
+    context->constants._TensorLaneSizeRcp[1]  = 1.0f / context->tensorLane.height;
 
     context->constants._QuantParamsSINT[0]  = 1 / 0.003921568859368563;  // quant scale
     context->constants._QuantParamsSINT[1]  = -128;                      // quant zero

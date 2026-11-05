@@ -767,6 +767,7 @@ typedef struct FfxDeviceCapabilities
     bool           extendedSynchronizationSupported;            ///< The device supports extended synchronization mechanism.
     bool           shaderStorageBufferArrayNonUniformIndexing;  ///< The device supports shader storage buffer array non uniform indexing.
     bool           integerDotProductSupported;                  ///< The device supports packed 8-bit integer dot products in shaders.
+    bool           bufferInt64AtomicsSupported;                 ///< The device supports 64-bit atomics on storage buffers.
     bool           tensorSupported;                             ///< The device supports tensors.
     bool           computeSupportTensor;                        ///< The device supports tensors in compute stage.
     bool           fragmentSupportTensor;                       ///< The device supports tensors in fragment stage.

@@ -93,6 +93,11 @@ static const ResourceBinding uavTextureBindingTable[uavTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_LEVELS, "rw_flow_levels"},
 };
 
+static const ResourceBinding uavBufferBindingTable[] = {
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_KEYS, "rw_scatter_keys"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_KEYS, "ScatterKeys_t"},  // the block's name, as reflection may give it
+};
+
 static const ResourceBinding rtResourceBindingTable[] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS, "rw_motion_vectors"},
 };
@@ -125,6 +130,20 @@ static FfxErrorCode patchResourceBindings(FfxPipelineState* inoutPipeline)
             return FFX_ERROR_INVALID_ARGUMENT;
 
         inoutPipeline->uavTextureBindings[uavIndex].resourceIdentifier = uavTextureBindingTable[mapIndex].index;
+    }
+
+    for (uint32_t uavIndex = 0; uavIndex < inoutPipeline->uavBufferCount; ++uavIndex)
+    {
+        int32_t mapIndex = 0;
+        for (mapIndex = 0; mapIndex < FFX_COUNTOF(uavBufferBindingTable); ++mapIndex)
+        {
+            if (0 == strcmp(uavBufferBindingTable[mapIndex].name, inoutPipeline->uavBufferBindings[uavIndex].name))
+                break;
+        }
+        if (mapIndex == FFX_COUNTOF(uavBufferBindingTable))
+            return FFX_ERROR_INVALID_ARGUMENT;
+
+        inoutPipeline->uavBufferBindings[uavIndex].resourceIdentifier = uavBufferBindingTable[mapIndex].index;
     }
 
     for (uint32_t rtIndex = 0; rtIndex < inoutPipeline->rtCount; ++rtIndex)
@@ -274,9 +293,17 @@ static FfxErrorCode createPipelineStates(OpticalFlowContext_Private* context)
                        {FFX_OPTICALFLOW_PASS_PYRAMID, "ARM-OpticalFlow-Pyramid", &context->pipelinePyramid, sizeof(OpticalFlowImageConstants)},
                        {FFX_OPTICALFLOW_PASS_FLOW_SEARCH, "ARM-OpticalFlow-FlowSearch", &context->pipelineFlowSearch, sizeof(OpticalFlowImageConstants)},
                        {FFX_OPTICALFLOW_PASS_FLOW_FILTER, "ARM-OpticalFlow-FlowFilter", &context->pipelineFlowFilter, sizeof(OpticalFlowImageConstants)},
-                       {FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE, "ARM-OpticalFlow-FlowSearchFine", &context->pipelineFlowSearchFine, sizeof(OpticalFlowImageConstants)}};
+                       {FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE, "ARM-OpticalFlow-FlowSearchFine", &context->pipelineFlowSearchFine, sizeof(OpticalFlowImageConstants)},
+                       {FFX_OPTICALFLOW_PASS_SCATTER, "ARM-OpticalFlow-Scatter", &context->pipelineScatter, sizeof(OpticalFlowScatterConstants)},
+                       {FFX_OPTICALFLOW_PASS_SCATTER_RESOLVE, "ARM-OpticalFlow-ScatterResolve", &context->pipelineScatterResolve, sizeof(OpticalFlowScatterConstants)}};
         for (const auto& sp : scatter)
         {
+            // Passes the device cannot run (their shaders need 64-bit atomics or packed dot products) are not built.
+            const bool image = sp.pass == FFX_OPTICALFLOW_PASS_PYRAMID || sp.pass == FFX_OPTICALFLOW_PASS_FLOW_SEARCH ||
+                               sp.pass == FFX_OPTICALFLOW_PASS_FLOW_FILTER || sp.pass == FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE;
+            if ((image && !context->imageFlow) ||
+                (!context->scatter64 && (sp.pass == FFX_OPTICALFLOW_PASS_SCATTER || sp.pass == FFX_OPTICALFLOW_PASS_SCATTER_RESOLVE)))
+                continue;
             ffxSafeReleasePipeline(&context->contextDescription.backendInterface, sp.pipeline, context->effectContextId);
             FfxPipelineDescription pipelineDescription = {};
             pipelineDescription.stage                  = FFX_BIND_COMPUTE_SHADER_STAGE;
@@ -402,6 +429,11 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
     // grid (the ScatterDepth / ScatterFlow passes), over the camera-motion field the MV hints pass computes from depth
     // (which also serves alone without motion vectors). The engine's refinement of non-geometric motion is missing.
     context->hintsOnly = !capabilities.dataGraphOFSupported;
+    // The motion vectors' scatter in one pass where 64-bit buffer atomics allow (FFX_OF_SCATTER64=0: two passes).
+    {
+        const char* v      = getenv("FFX_OF_SCATTER64");
+        context->scatter64 = context->hintsOnly && capabilities.bufferInt64AtomicsSupported && !(v && !strcmp(v, "0"));
+    }
     const bool outputGridSizeSupported = context->hintsOnly || (contextDescription->gridSize & capabilities.supportedOutputGridSizes) != 0;
     // TODO: add check on hint grid size when we start using hint.
     // const bool hintGridSizeSupported   = (contextDescription->gridSize & capabilities.supportedHintGridSizes) != 0;
@@ -636,6 +668,16 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
          1,
          FFX_RESOURCE_FLAGS_NONE,
          {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_KEYS,
+         "ArmOF_Scatter_Keys",
+         FFX_RESOURCE_TYPE_BUFFER,
+         FFX_RESOURCE_USAGE_UAV,
+         FFX_SURFACE_FORMAT_UNKNOWN,
+         context->opticalFlowSize.width * context->opticalFlowSize.height * 8,
+         8,
+         1,
+         FFX_RESOURCE_FLAGS_NONE,
+         FfxResourceInitData::FfxResourceInitValue(size_t(context->opticalFlowSize.width) * context->opticalFlowSize.height * 8, 0xff)},
         {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_HINT,
          "ArmOF_Flow_Hint",
          FFX_RESOURCE_TYPE_TEXTURE2D,
@@ -688,6 +730,8 @@ static FfxErrorCode opticalFlowVkRelease(OpticalFlowContext_Private* context)
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFlowSearch, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFlowFilter, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFlowSearchFine, context->effectContextId);
+    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineScatter, context->effectContextId);
+    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineScatterResolve, context->effectContextId);
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1] = context->pyramid[0];
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TM1] = context->pyramid[1];
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1] = context->luma[0];
@@ -799,6 +843,9 @@ static void scheduleMVHintsAndCopyResources(
             dispatchJob.computeJobDescriptor.uavTextures[currentUnorderedAccessViewIndex].mip      = 0;
         }
     }
+
+    for (uint32_t i = 0; i < pipeline->uavBufferCount; ++i)
+        dispatchJob.computeJobDescriptor.uavBuffers[i].resource = context->uavResources[pipeline->uavBufferBindings[i].resourceIdentifier];
 
     for (uint32_t currentTensorIndex = 0; currentTensorIndex < pipeline->srvTensorCount; ++currentTensorIndex)
     {
@@ -1147,11 +1194,14 @@ static FfxErrorCode ArmOpticalFlowDispatch(OpticalFlowContext_Private* context, 
                                                                                 &params->motionVectors,
                                                                                 context->effectContextId,
                                                                                 &context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS]);
-            FfxGpuJobDescription clearJob = {FFX_GPU_JOB_CLEAR_UINT};
-            for (uint32_t& v : clearJob.clearUintJobDescriptor.color)
-                v = 0xffffffffu;
-            clearJob.clearUintJobDescriptor.target = context->uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_DEPTH];
-            FFX_VALIDATE(context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &clearJob));
+            if (!context->scatter64)  // its keys are reset by the resolve
+            {
+                FfxGpuJobDescription clearJob = {FFX_GPU_JOB_CLEAR_UINT};
+                for (uint32_t& v : clearJob.clearUintJobDescriptor.color)
+                    v = 0xffffffffu;
+                clearJob.clearUintJobDescriptor.target = context->uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_DEPTH];
+                FFX_VALIDATE(context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &clearJob));
+            }
 
             OpticalFlowScatterConstants c = {};
             c.motion_vector_scale[0] = params->motionVectorScale[0];
@@ -1170,8 +1220,20 @@ static FfxErrorCode ArmOpticalFlowDispatch(OpticalFlowContext_Private* context, 
             // One invocation per 2x2 block of motion vectors.
             const uint32_t groupsX = (params->motionVectors.description.width + 31) / 32;
             const uint32_t groupsY = (params->motionVectors.description.height + 31) / 32;
-            scheduleMVHintsAndCopyResources(context, &context->pipelineScatterDepth, groupsX, groupsY, "ArmOF_ScatterDepth");
-            scheduleMVHintsAndCopyResources(context, &context->pipelineScatterFlow, groupsX, groupsY, "ArmOF_ScatterFlow");
+            if (context->scatter64)
+            {
+                scheduleMVHintsAndCopyResources(context, &context->pipelineScatter, groupsX, groupsY, "ArmOF_Scatter");
+                scheduleMVHintsAndCopyResources(context,
+                                                &context->pipelineScatterResolve,
+                                                (context->opticalFlowSize.width + 7) / 8,
+                                                (context->opticalFlowSize.height + 7) / 8,
+                                                "ArmOF_ScatterResolve");
+            }
+            else
+            {
+                scheduleMVHintsAndCopyResources(context, &context->pipelineScatterDepth, groupsX, groupsY, "ArmOF_ScatterDepth");
+                scheduleMVHintsAndCopyResources(context, &context->pipelineScatterFlow, groupsX, groupsY, "ArmOF_ScatterFlow");
+            }
         }
 
         if (context->imageFlow)

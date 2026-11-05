@@ -496,6 +496,94 @@ void main()
     }
 }
 
+#elif ML_DOT4_CHAIN
+// ---------------------------------------------------------------------------------------------------------
+// NOT BIT EXACT (fp32 requantisation, as FFX_ML_RESCALE_FLOAT): 2 or 3 chained 1x1 convolutions in one dispatch, one
+// thread per pixel, the intermediate tensors in registers. Layer 0 reads src0 | src1; layer k > 0 reads its side
+// tensor (binding 4 + k) | layer k - 1's output (a DenseNet block: NFRU's layers 12-14). Weights [icWord][OC4] (one
+// output-channel block) and params ([bias][multiplier][shift] + 64 + [scale][offset], as the tiled kernel's) are read
+// from the whole constants buffer at each layer's base, with uniform addresses (scalar loads, SGPR dot4 operands).
+// ---------------------------------------------------------------------------------------------------------
+layout(set = 0, binding = 5, std430) readonly buffer Side1 { uint side1[]; };
+layout(set = 0, binding = 6, std430) readonly buffer Side2 { uint side2[]; };
+layout(constant_id = 70) const int CH_N      = 3;   // layers
+layout(constant_id = 71) const int CH_PIXELS = 1;
+layout(constant_id = 72) const int A_WORDS   = 4;   // layer 0's sources: words per pixel used, words per pixel stored
+layout(constant_id = 73) const int A_STRIDE  = 4;
+layout(constant_id = 74) const int B_WORDS   = 4;
+layout(constant_id = 75) const int B_STRIDE  = 4;
+layout(constant_id = 76) const int OCW0 = 1;  // output words per layer
+layout(constant_id = 77) const int WB0  = 0;  // weights base (words in the constants buffer)
+layout(constant_id = 78) const int PB0  = 0;  // params base (ints)
+layout(constant_id = 79) const int PS0  = 4;  // params stride (OC rounded to 4)
+layout(constant_id = 80) const int OCW1 = 1;
+layout(constant_id = 81) const int WB1  = 0;
+layout(constant_id = 82) const int PB1  = 0;
+layout(constant_id = 83) const int PS1  = 4;
+layout(constant_id = 84) const int OCW2 = 1;
+layout(constant_id = 85) const int WB2  = 0;
+layout(constant_id = 86) const int PB2  = 0;
+layout(constant_id = 87) const int PS2  = 4;
+layout(constant_id = 88) const int S1_WORDS  = 4;  // side tensors of layers 1 and 2
+layout(constant_id = 89) const int S1_STRIDE_W = 4;
+layout(constant_id = 90) const int S2_WORDS  = 4;
+layout(constant_id = 91) const int S2_STRIDE_W = 4;
+layout(constant_id = 92) const int OUT_STRIDE_W = 4;
+
+#define CH_MAX_IN  16  // input words (64 channels)
+#define CH_MAX_OUT 16  // output words
+
+// y = requant(W x) for one layer: ICW input words in x, OCW output words to y.
+#define CHAIN_LAYER(ICW, OCW, WB, PB, PS)                                                                      \
+    [[unroll]] for (int ow = 0; ow < CH_MAX_OUT; ++ow)                                                       \
+    {                                                                                                        \
+        if (ow < (OCW))                                                                                      \
+        {                                                                                                    \
+            ivec4 r;                                                                                         \
+            [[unroll]] for (int j = 0; j < 4; ++j)                                                           \
+            {                                                                                                \
+                const int oc  = ow * 4 + j;                                                                  \
+                int       acc = 0;                                                                           \
+                [[unroll]] for (int w = 0; w < CH_MAX_IN; ++w)                                               \
+                    if (w < (ICW))                                                                           \
+                        acc += dotPacked4x8EXT(int(x[w]), int(weights[(WB) + w * (OCW) * 4 + oc]));          \
+                const float f = fma(float(acc), intBitsToFloat(params[(PB) + 3 * (PS) + 64 + oc]),           \
+                                    intBitsToFloat(params[(PB) + 4 * (PS) + 64 + oc]));                      \
+                r[j] = clamp(int(roundEven(f)), -128, 127);                                                  \
+            }                                                                                                \
+            y[ow] = PackResult(r);                                                                           \
+        }                                                                                                    \
+    }
+
+void main()
+{
+    const int  pixel = int(gl_GlobalInvocationID.x);
+    const int  p     = min(pixel, CH_PIXELS - 1);  // past the end: a valid pixel, not stored
+    uint       x[CH_MAX_IN], y[CH_MAX_OUT];
+    [[unroll]] for (int w = 0; w < CH_MAX_IN; ++w)
+        x[w] = w < A_WORDS ? src0[p * A_STRIDE + w] : (w < A_WORDS + B_WORDS ? src1[p * B_STRIDE + w - A_WORDS] : 0u);
+    CHAIN_LAYER(A_WORDS + B_WORDS, OCW0, WB0, PB0, PS0)
+
+    if (CH_N > 1)
+    {
+        [[unroll]] for (int w = 0; w < CH_MAX_IN; ++w)
+            x[w] = w < S1_WORDS ? side1[p * S1_STRIDE_W + w] : (w < S1_WORDS + OCW0 ? y[w - S1_WORDS] : 0u);
+        CHAIN_LAYER(S1_WORDS + OCW0, OCW1, WB1, PB1, PS1)
+    }
+    if (CH_N > 2)
+    {
+        [[unroll]] for (int w = 0; w < CH_MAX_IN; ++w)
+            x[w] = w < S2_WORDS ? side2[p * S2_STRIDE_W + w] : (w < S2_WORDS + OCW1 ? y[w - S2_WORDS] : 0u);
+        CHAIN_LAYER(S2_WORDS + OCW1, OCW2, WB2, PB2, PS2)
+    }
+    if (pixel >= CH_PIXELS)
+        return;
+    const int ocwLast = CH_N > 2 ? OCW2 : (CH_N > 1 ? OCW1 : OCW0);
+    [[unroll]] for (int ow = 0; ow < CH_MAX_OUT; ++ow)
+        if (ow < ocwLast)
+            dst[p * OUT_STRIDE_W + ow] = y[ow];
+}
+
 #elif ML_DOT4_TILED
 // ---------------------------------------------------------------------------------------------------------
 // Register-tiled packed int8 conv. Each thread owns PX consecutive output pixels of one row and OCB output channels

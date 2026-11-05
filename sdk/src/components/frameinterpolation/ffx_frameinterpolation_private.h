@@ -92,6 +92,9 @@ typedef struct FrameInterpolationConstants
     int32_t _FlowLaneSize[2];
     float   _FlowLaneSizeRcp[2];
     float   _OfGridSizeRcp;  ///< Reciprocal of optical flow block/grid size (e.g. 0.25 for 4x4 blocks).
+    float   _Pad0;
+    int32_t _TensorLaneSize[2];     ///< the network's input (before the data graph's alignment)
+    float   _TensorLaneSizeRcp[2];
 } FrameInterpolationConstants;
 
 typedef struct FrameInterpolationRenderDescription

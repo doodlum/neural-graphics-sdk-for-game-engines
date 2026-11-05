@@ -18,6 +18,8 @@
 #include <ffx_opticalflow_flow_search_permutations.h>
 #include <ffx_opticalflow_flow_filter_permutations.h>
 #include <ffx_opticalflow_flow_search_fine_permutations.h>
+#include <ffx_opticalflow_scatter_permutations.h>
+#include <ffx_opticalflow_scatter_resolve_permutations.h>
 #include <string.h>  // for memset
 
 #if defined(POPULATE_PERMUTATION_KEY)
@@ -149,6 +151,22 @@ FfxErrorCode opticalflowGetPermutationBlobByIndex(FfxOpticalflowPass passId, uin
         ffx_opticalflow_flow_search_fine_PermutationKey key;
         POPULATE_PERMUTATION_KEY(permutationOptions, key);
         FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_flow_search_fine_PermutationInfo, g_ffx_opticalflow_flow_search_fine_IndirectionTable[key.index]);
+        memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
+        return FFX_OK;
+    }
+    case FFX_OPTICALFLOW_PASS_SCATTER:
+    {
+        ffx_opticalflow_scatter_PermutationKey key;
+        POPULATE_PERMUTATION_KEY(permutationOptions, key);
+        FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_scatter_PermutationInfo, g_ffx_opticalflow_scatter_IndirectionTable[key.index]);
+        memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
+        return FFX_OK;
+    }
+    case FFX_OPTICALFLOW_PASS_SCATTER_RESOLVE:
+    {
+        ffx_opticalflow_scatter_resolve_PermutationKey key;
+        POPULATE_PERMUTATION_KEY(permutationOptions, key);
+        FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_scatter_resolve_PermutationInfo, g_ffx_opticalflow_scatter_resolve_IndirectionTable[key.index]);
         memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
         return FFX_OK;
     }

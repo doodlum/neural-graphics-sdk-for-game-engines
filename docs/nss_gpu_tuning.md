@@ -576,3 +576,28 @@ Tried and dropped:
   the doubled coarse vectors differ by rounding there, so the seeds rarely agree), -3.9 dB on `--nomv`.
 - Fewer levels (3): the same quality here, 0.01-0.02 ms less; 4 keep about 40 px of reach for unhinted motion.
 - 16 GPU jobs instead of 10 (a pyramid dispatch per level, no coarse filters): no difference.
+
+### NFRU speed round (Steam Deck, 1280x720 x2)
+
+Goal set: 2x. Not reachable: NFRU's network is 2.92 G int8 MACs, and `v_dot4_i32_i8` (the fastest product SPIR-V reaches
+on RDNA 2; no int4 dot, no WMMA) peaks at 2.13 T/s at the ~1040 MHz the GPU holds in this load, so the network alone
+needs 1.37 ms of a 1.9 ms target; its inner loop is already 84% `v_dot4` (ISA dump). Every other pass is bound by
+memory traffic, not instructions (`FFX_PROFILE_BARRIERS`: barriers 1-4 us a job; the scatter passes did not change
+with 4x fewer atomics). What was done (quality checked with `fg_vk_test` on 11 cases, bit-identical where noted):
+
+| Change | Saved |
+| --- | --- |
+| Motion vector scatter in one pass: a 64-bit atomic min of depth (high word) and half2 flow (low), then a resolve (`ffx_opticalflow_scatter.glsl`, `_resolve.glsl`; needs `shaderBufferInt64Atomics`, which DeckyUpscaler's layer now enables). The two passes each read all the motion vectors and depth. Ties go to the smaller flow bits. | ~100 us (pass), 65 us (frame) |
+| Graph: a barrier only before a layer that reads or overwrites what the layers since the last one wrote (the 4 branches off one tensor and 2 more pairs run back to back). Bit exact. | 35 us |
+| Graph: the DenseNet block of 1x1 convs (layers 12-14) in one dispatch, one thread per pixel, intermediates in registers (`ML_DOT4_CHAIN`); same result as the separate layers with fp32 requantisation. `FFX_ML_NO_CHAIN=1` off. | 85 us |
+| Graph: fp32 requantisation by default for frame interpolation (`FFX_ML_RESCALE_FLOAT=0` exact); interpolated frames within 0.02 dB | 45 us |
+| Postprocess: DLSS-G's 2x2 UI test per quad of lanes (each pixel loaded once, OR across the quad) instead of the block's 4 pixels per pixel; UI with grain +1.6 dB, others identical | 22 us |
+| Init warp: not clearing the TP1 holes, which the warp writes whole. Bit exact. | ~5 us |
+
+Total: 3.79 -> 3.52 ms (static background), 3.92 -> 3.64 ms (sub-pixel pan everywhere), interleaved runs, about 7%.
+Tried and dropped: clear jobs instead of init_warp's stores (72 us against 44: RADV clears these by compute),
+pre-reduced atomics in the scatter (no change), the vector median's 36 pairwise distances instead of 81 (scratch
+memory, 3x slower), the flow warps reusing the motion vectors' samples where they coincide (no change), dot4 tile
+knobs (within the runtime test's +-0.1 ms clock noise). A smaller network (`FFX_FI_TENSOR_HEIGHT=N`, rows of its
+input, default the flow's 180): 144 rows 3.04 ms (-1.7 dB on the moving square), 120 rows 2.72 ms (-4.8 dB), 96 rows
+2.38 ms (shadow below the cross-fade).

@@ -15,6 +15,7 @@
 #include "ffx_ml_conv2d_scalar_spv.h"
 #include "ffx_ml_conv2d_dot4_spv.h"
 #include "ffx_ml_conv2d_dot4_tiled_spv.h"
+#include "ffx_ml_conv2d_dot4_chain_spv.h"
 #include "ffx_ml_conv2d_coopmat_int8_spv.h"
 #include "ffx_ml_conv2d_coopmat_fp16_spv.h"
 #include "ffx_ml_conv2d_coopmat_bf16_spv.h"
@@ -593,6 +594,7 @@ namespace ffx_ml
     struct Graph::Impl
     {
         static constexpr uint32_t kSetGroups = 4;  // descriptor set groups kept for distinct external bindings
+        static constexpr uint32_t kBindings  = 7;
 
         struct Allocation
         {
@@ -610,6 +612,10 @@ namespace ffx_ml
             uint32_t     src[2] = {0, 0};  // StoredTensor indices
             uint32_t     numSources = 1;
             uint32_t     dst = 0;
+            uint32_t     chain = 1;        // > 1: this layer dispatches the 1x1 chain kernel for itself and the next chain - 1
+            bool         fused = false;    // in a previous layer's chain: nothing to dispatch
+            uint32_t     side[2] = {0, 0}; // chain: the side tensors of its second and third layers
+            uint32_t     chainDst = 0;     // chain: its last layer's output
         };
 
         struct SetGroup
@@ -629,6 +635,7 @@ namespace ffx_ml
         VkPipelineLayout      pipelineLayout = VK_NULL_HANDLE;
         VkDescriptorPool      pool           = VK_NULL_HANDLE;
         VkShaderModule        module         = VK_NULL_HANDLE;
+        VkShaderModule        chainModule    = VK_NULL_HANDLE;
         std::vector<Layer>    layers;
         std::vector<Allocation> internals;
         // Tiled dot4: internal tensors get one extra pixel holding their consumers' input zero point, so padding taps
@@ -659,6 +666,8 @@ namespace ffx_ml
             Free(constantsStaging);
             if (module)
                 fn.DestroyShaderModule(ctx.device, module, nullptr);
+            if (chainModule)
+                fn.DestroyShaderModule(ctx.device, chainModule, nullptr);
             if (pool)
                 fn.DestroyDescriptorPool(ctx.device, pool, nullptr);
             if (pipelineLayout)
@@ -812,12 +821,12 @@ namespace ffx_ml
             fn.GetPhysicalDeviceProperties2(ctx.physicalDevice, &deviceProperties);
             const uint32_t sharedMemoryLimit = deviceProperties.properties.limits.maxComputeSharedMemorySize;
 
-            // Descriptor layout: src0, src1, weights, params, dst.
-            VkDescriptorSetLayoutBinding bindings[5] = {};
-            for (uint32_t i = 0; i < 5; ++i)
+            // Descriptor layout: src0, src1, weights, params, dst; and the 1x1 chain kernel's two side tensors.
+            VkDescriptorSetLayoutBinding bindings[kBindings] = {};
+            for (uint32_t i = 0; i < kBindings; ++i)
                 bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
             VkDescriptorSetLayoutCreateInfo setInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-            setInfo.bindingCount                    = 5;
+            setInfo.bindingCount                    = kBindings;
             setInfo.pBindings                       = bindings;
             if (fn.CreateDescriptorSetLayout(ctx.device, &setInfo, nullptr, &setLayout) != VK_SUCCESS)
                 return fail("vkCreateDescriptorSetLayout failed");
@@ -878,6 +887,58 @@ namespace ffx_ml
             const bool rawInput = !coop || selection.matType == MatType::Int8;
 
             layers.resize(lowered.convs.size());
+
+            // 1x1 chains (fp32 requantisation only, as the kernel): from a 1x1 conv with two whole sources, the next
+            // 1x1 convs whose second source is the previous one's output and that nothing else reads, up to 3 layers,
+            // channels in whole words. FFX_ML_NO_CHAIN=1 keeps them separate.
+            {
+                const char* rf       = getenv("FFX_ML_RESCALE_FLOAT");
+                const bool  floatRq  = rf ? strcmp(rf, "0") != 0 : selection.rescaleFloat;
+                const bool  chains   = selection.path == Path::Dot4 && selection.dot4Tiled && floatRq && !getenv("FFX_ML_NO_CHAIN");
+                std::vector<uint32_t> readers(lowered.tensors.size(), 0);
+                for (const FusedConv& fc : lowered.convs)
+                    for (const ConvSource& src : fc.sources)
+                        ++readers[src.tensor];
+                auto plain1x1 = [&](const FusedConv& fc) {
+                    const tosa::Node& c = *fc.conv;
+                    bool ok = c.kernelH == 1 && c.kernelW == 1 && c.stride[0] == 1 && c.stride[1] == 1 && c.pad[0] == 0 && c.pad[1] == 0 &&
+                              c.pad[2] == 0 && c.pad[3] == 0 && !fc.table && fc.sources.size() == 2 && fc.outC % 4 == 0 && fc.inH == fc.outH &&
+                              fc.inW == fc.outW;
+                    for (const ConvSource& src : fc.sources)
+                    {
+                        const StoredTensor& t = lowered.tensors[src.tensor];
+                        ok = ok && !src.resize && t.c % 4 == 0 && t.h == fc.outH && t.w == fc.outW;
+                    }
+                    return ok;
+                };
+                for (size_t li = 0; chains && li < lowered.convs.size(); ++li)
+                {
+                    if (!plain1x1(lowered.convs[li]) || lowered.convs[li].inC > 64)
+                        continue;
+                    uint32_t n = 1;
+                    while (n < 3 && li + n < lowered.convs.size())
+                    {
+                        const FusedConv& prev = lowered.convs[li + n - 1];
+                        const FusedConv& next = lowered.convs[li + n];
+                        if (!plain1x1(next) || next.sources[1].tensor != prev.output || readers[prev.output] != 1 ||
+                            lowered.tensors[prev.output].external || next.outH != prev.outH || next.outW != prev.outW || next.inC > 64 ||
+                            prev.outC > 64)
+                            break;
+                        ++n;
+                    }
+                    if (n < 2 || lowered.convs[li + n - 1].outC > 64)
+                        continue;
+                    layers[li].chain = n;
+                    for (uint32_t k = 1; k < n; ++k)
+                    {
+                        layers[li + k].fused     = true;
+                        layers[li].side[k - 1] = lowered.convs[li + k].sources[0].tensor;
+                    }
+                    layers[li].chainDst = lowered.convs[li + n - 1].output;
+                    li += n - 1;
+                }
+            }
+
             for (size_t li = 0; li < lowered.convs.size(); ++li)
             {
                 const FusedConv&  fc   = lowered.convs[li];
@@ -900,6 +961,9 @@ namespace ffx_ml
                 Dot4Tile   tile  = {};
                 if (tiled)
                     tile = ChooseDot4Tile(fc, conv);
+                const bool inChain = layers[li].chain > 1 || layers[li].fused;
+                if (tiled && inChain)  // the chain kernel reads [icWord][OC4]: one output block
+                    tile.blocks = 1, tile.ocb = RoundUp(OC, 4);
 
                 // Weights
                 align(64);
@@ -999,6 +1063,13 @@ namespace ffx_ml
                     printf("[ffx_ml] layer %zu: IC %u OC %u %dx%d->%dx%d, shift %d..%d%s%s, scale32 %d, tile px %u ocb %u blocks %u ksplit %u\n", li, IC, OC, fc.inH,
                            fc.inW, fc.outH, fc.outW, minShift, maxShift, rs.doubleRound ? " double-round" : "", fc.table ? " table" : "", rs.scale32 ? 1 : 0,
                            tile.px, tile.ocb, tile.blocks, tile.ksplit);
+                if (getenv("FFX_ML_DEBUG_LAYERS"))
+                {
+                    printf("[ffx_ml]   out t%u <-", fc.output);
+                    for (const ConvSource& src : fc.sources)
+                        printf(" t%u%s", src.tensor, src.resize ? "(resize)" : "");
+                    printf("\n");
+                }
                 if (fc.table)
                 {
                     for (uint32_t i = 0; i < 256; ++i)
@@ -1085,7 +1156,8 @@ namespace ffx_ml
                     // Cheaper exact rescale when no shift needs the low product word (the NSS models: shifts 35..49).
                     const bool hiOnly = rs.scale32 && !rs.doubleRound && minShift >= 33 && maxShift <= 62 && !getenv("FFX_ML_NO_SCALE_HI_ONLY");
                     spec(58, hiOnly ? 1 : 0);
-                    spec(62, getenv("FFX_ML_RESCALE_FLOAT") ? 1 : 0);
+                    const char* rf = getenv("FFX_ML_RESCALE_FLOAT");
+                    spec(62, (rf ? strcmp(rf, "0") != 0 : selection.rescaleFloat) ? 1 : 0);
                 }
                 if (coop)
                 {
@@ -1199,6 +1271,65 @@ namespace ffx_ml
                 }
             }
 
+            // The chains' pipelines: every member's constants at its base in the whole constants buffer.
+            for (size_t li = 0; li < layers.size(); ++li)
+            {
+                Layer& head = layers[li];
+                if (head.chain < 2)
+                    continue;
+                if (!chainModule)
+                {
+                    VkShaderModuleCreateInfo chainInfo = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                    chainInfo.codeSize                 = sizeof(ffx_ml_conv2d_dot4_chain);
+                    chainInfo.pCode                    = ffx_ml_conv2d_dot4_chain;
+                    if (fn.CreateShaderModule(ctx.device, &chainInfo, nullptr, &chainModule) != VK_SUCCESS)
+                        return fail("vkCreateShaderModule failed (1x1 chain)");
+                }
+                std::vector<VkSpecializationMapEntry> entries;
+                std::vector<int32_t>                  values;
+                auto spec = [&](uint32_t id, int32_t value) {
+                    entries.push_back({id, uint32_t(values.size() * 4), 4});
+                    values.push_back(value);
+                };
+                const FusedConv&    first = lowered.convs[li];
+                const StoredTensor& a     = lowered.tensors[first.sources[0].tensor];
+                const StoredTensor& b     = lowered.tensors[first.sources[1].tensor];
+                const uint32_t      wg    = 64;
+                spec(0, int32_t(wg));
+                spec(70, int32_t(head.chain));
+                spec(71, first.outH * first.outW);
+                spec(72, a.c / 4), spec(73, a.channelStride / 4), spec(74, b.c / 4), spec(75, b.channelStride / 4);
+                for (uint32_t k = 0; k < head.chain; ++k)
+                {
+                    const FusedConv& fc = lowered.convs[li + k];
+                    spec(76 + 4 * k, fc.outC / 4);
+                    spec(77 + 4 * k, int32_t(layers[li + k].weightsOffset / 4));
+                    spec(78 + 4 * k, int32_t(layers[li + k].paramsOffset / 4));
+                    spec(79 + 4 * k, int32_t(RoundUp(uint32_t(fc.outC), 4)));
+                    if (k > 0)
+                    {
+                        const StoredTensor& side = lowered.tensors[fc.sources[0].tensor];
+                        spec(k == 1 ? 88 : 90, side.c / 4), spec(k == 1 ? 89 : 91, side.channelStride / 4);
+                    }
+                }
+                spec(92, lowered.tensors[head.chainDst].channelStride / 4);
+                VkSpecializationInfo        specInfo = {uint32_t(entries.size()), entries.data(), values.size() * 4, values.data()};
+                VkComputePipelineCreateInfo pipeInfo = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                pipeInfo.stage.sType                 = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                pipeInfo.stage.stage                 = VK_SHADER_STAGE_COMPUTE_BIT;
+                pipeInfo.stage.module                = chainModule;
+                pipeInfo.stage.pName                 = "main";
+                pipeInfo.stage.pSpecializationInfo   = &specInfo;
+                pipeInfo.layout                      = pipelineLayout;
+                fn.DestroyPipeline(ctx.device, head.pipeline, nullptr);
+                head.pipeline = VK_NULL_HANDLE;
+                if (fn.CreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &head.pipeline) != VK_SUCCESS)
+                    return fail("vkCreateComputePipelines failed for the 1x1 chain at layer " + std::to_string(li));
+                head.groups[0] = (uint32_t(first.outH * first.outW) + wg - 1) / wg, head.groups[1] = 1, head.groups[2] = 1;
+                if (getenv("FFX_ML_DEBUG_LAYERS"))
+                    printf("[ffx_ml] layers %zu-%zu: one 1x1 chain dispatch\n", li, li + head.chain - 1);
+            }
+
             align(64);
             if (!Allocate(constantsDevice, constants.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
                 !Allocate(constantsStaging, constants.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
@@ -1209,7 +1340,7 @@ namespace ffx_ml
             memcpy(mapped, constants.data(), constants.size());
             fn.UnmapMemory(ctx.device, constantsStaging.memory);
 
-            VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(5 * layers.size() * kSetGroups)};
+            VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(kBindings * layers.size() * kSetGroups)};
             VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
             poolInfo.maxSets                    = uint32_t(layers.size() * kSetGroups);
             poolInfo.poolSizeCount              = 1;
@@ -1285,24 +1416,33 @@ namespace ffx_ml
             group->externals = key;
             group->lastUse   = frame;
 
-            std::vector<VkDescriptorBufferInfo> infos(layers.size() * 5);
-            std::vector<VkWriteDescriptorSet>   writes(layers.size() * 5, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
+            std::vector<VkDescriptorBufferInfo> infos(layers.size() * kBindings);
+            std::vector<VkWriteDescriptorSet>   writes(layers.size() * kBindings, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
             for (size_t li = 0; li < layers.size(); ++li)
             {
-                const Layer& l = layers[li];
-                infos[li * 5 + 0] = TensorInfo(l.src[0], tensors, count);
-                infos[li * 5 + 1] = TensorInfo(l.src[1], tensors, count);
-                infos[li * 5 + 2] = {constantsDevice.buffer, l.weightsOffset, l.weightsSize};
-                infos[li * 5 + 3] = {constantsDevice.buffer, l.paramsOffset, l.paramsSize};
-                infos[li * 5 + 4] = TensorInfo(l.dst, tensors, count);
-                for (uint32_t b = 0; b < 5; ++b)
+                const Layer&            l = layers[li];
+                VkDescriptorBufferInfo* i = &infos[li * kBindings];
+                i[0] = TensorInfo(l.src[0], tensors, count);
+                i[1] = TensorInfo(l.src[1], tensors, count);
+                i[2] = {constantsDevice.buffer, l.weightsOffset, l.weightsSize};
+                i[3] = {constantsDevice.buffer, l.paramsOffset, l.paramsSize};
+                i[4] = TensorInfo(l.dst, tensors, count);
+                i[5] = i[0], i[6] = i[0];
+                if (l.chain > 1)  // every layer's constants at its base, the last layer's output, the side tensors
                 {
-                    VkWriteDescriptorSet& w = writes[li * 5 + b];
+                    i[2] = i[3] = {constantsDevice.buffer, 0, VK_WHOLE_SIZE};
+                    i[4]        = TensorInfo(l.chainDst, tensors, count);
+                    i[5]        = TensorInfo(l.side[0], tensors, count);
+                    i[6]        = l.chain > 2 ? TensorInfo(l.side[1], tensors, count) : i[0];
+                }
+                for (uint32_t b = 0; b < kBindings; ++b)
+                {
+                    VkWriteDescriptorSet& w = writes[li * kBindings + b];
                     w.dstSet                = group->sets[li];
                     w.dstBinding            = b;
                     w.descriptorCount       = 1;
                     w.descriptorType        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                    w.pBufferInfo           = &infos[li * 5 + b];
+                    w.pBufferInfo           = &infos[li * kBindings + b];
                 }
             }
             fn.UpdateDescriptorSets(ctx.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
@@ -1336,20 +1476,43 @@ namespace ffx_ml
 
             if (profilePool)
                 fn.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profilePool, profileFirst);
+            // A barrier only before a layer that reads a tensor written since the last one, or writes one read or
+            // written since: independent layers (NFRU's branches off one tensor) run back to back and overlap. Each
+            // stored tensor has its own memory. Profiling keeps one after every layer, as its timestamps need.
+            static const bool noBarriers  = getenv("FFX_ML_EXPERIMENT_NO_BARRIERS") != nullptr;  // timing experiments only: wrong results
+            static const bool allBarriers = getenv("FFX_ML_ALL_BARRIERS") != nullptr;
+            std::vector<uint8_t> written(lowered.tensors.size()), read(lowered.tensors.size());
             for (size_t li = 0; li < layers.size(); ++li)
             {
                 const Layer& l = layers[li];
+                if (l.fused)
+                {
+                    if (profilePool)
+                        fn.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profilePool, profileFirst + uint32_t(li) + 1);
+                    continue;
+                }
+                const uint32_t out    = l.chain > 1 ? l.chainDst : l.dst;
+                bool           hazard = written[out] || read[out];
+                for (uint32_t s = 0; s < l.numSources; ++s)
+                    hazard = hazard || written[l.src[s]];
+                for (uint32_t k = 1; k < l.chain; ++k)
+                    hazard = hazard || written[l.side[k - 1]];
+                if (li > 0 && !noBarriers && (hazard || allBarriers || profilePool))
+                {
+                    VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+                    fn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                    std::fill(written.begin(), written.end(), 0), std::fill(read.begin(), read.end(), 0);
+                }
+                written[out] = 1;
+                for (uint32_t s = 0; s < l.numSources; ++s)
+                    read[l.src[s]] = 1;
+                for (uint32_t k = 1; k < l.chain; ++k)
+                    read[l.side[k - 1]] = 1;
                 fn.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, l.pipeline);
                 fn.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &group->sets[li], 0, nullptr);
                 fn.CmdDispatch(cmd, l.groups[0], l.groups[1], l.groups[2]);
                 if (profilePool)
                     fn.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profilePool, profileFirst + uint32_t(li) + 1);
-                static const bool noBarriers = getenv("FFX_ML_EXPERIMENT_NO_BARRIERS") != nullptr;  // timing experiments only: wrong results
-                if (li + 1 < layers.size() && !noBarriers)
-                {
-                    VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
-                    fn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-                }
             }
         }
     };
