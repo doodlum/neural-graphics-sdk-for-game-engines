@@ -76,6 +76,13 @@ typedef enum FfxOpticalflowPass
     FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE,  // ... level 0's search, +-1 texel around level 1's
     FFX_OPTICALFLOW_PASS_SCATTER,        // the two scatter steps in one, with 64-bit atomics
     FFX_OPTICALFLOW_PASS_SCATTER_RESOLVE,  // ... and its winners written
+    FFX_OPTICALFLOW_PASS_FSR3_SEARCH,    // image optical flow, FFX_OF_IMAGE=fsr3: FSR 3's block search per level
+    FFX_OPTICALFLOW_PASS_FSR3_FILTER,    // ... and its vector median per level
+    FFX_OPTICALFLOW_PASS_ARM_PYRAMID,    // image optical flow, FFX_OF_IMAGE=arm: the emulated engine's luma pyramid
+    FFX_OPTICALFLOW_PASS_ARM_WARP,       // ... per level: TP1 warped by the coarser level's flow
+    FFX_OPTICALFLOW_PASS_ARM_MATCH,      // ... the block match and subpixel step
+    FFX_OPTICALFLOW_PASS_ARM_MEDIAN,     // ... the median filter
+    FFX_OPTICALFLOW_PASS_ARM_BILATERAL,  // ... the bilateral filter (and at the last level the hint)
 
     FFX_OPTICALFLOW_PASS_COUNT
 } FfxOpticalflowPass;

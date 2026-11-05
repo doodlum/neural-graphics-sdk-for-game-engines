@@ -601,3 +601,38 @@ memory, 3x slower), the flow warps reusing the motion vectors' samples where the
 knobs (within the runtime test's +-0.1 ms clock noise). A smaller network (`FFX_FI_TENSOR_HEIGHT=N`, rows of its
 input, default the flow's 180): 144 rows 3.04 ms (-1.7 dB on the moving square), 120 rows 2.72 ms (-4.8 dB), 96 rows
 2.38 ms (shadow below the cross-fade).
+
+### Other image flows: FSR 3's and the Arm optical flow engine's (`FFX_OF_IMAGE=fsr3`, `=arm`)
+
+Two alternatives to the image flow above, on the same hints-only path (DeckyUpscaler's Optical flow setting):
+
+- `fsr3`: FidelityFX FSR 3's optical flow (SDK 2.4.0) as its own algorithm (`ffx_opticalflow_fsr3_search.glsl`,
+  `_fsr3_filter.glsl`, the pyramid with FSR 3's luma and truncation): a vector per 8x8 block, SAD over -8..+7 around
+  the coarser level's (its scale pass folded into the search), the 3x3 vector median, zero motion at level 0 where it
+  costs no more. No hint. Plain SAD per invocation, not optimised.
+- `arm`: the engine NFRU is made for (`VK_ARM_data_graph_optical_flow`, absent on RADV) as Arm's ML Emulation Layer
+  for Vulkan models it (`graph/optical_flow.cpp`, `shaders/optical_flow/*.comp`), configured as the data graph path
+  configures it: 4x4 output grid, medium performance level, hint on, search range 3 (`ffx_opticalflow_arm_*.glsl`).
+  Its luma pyramid (levels 1 to 5, rounded up to even); per level from 5 to 2 the warp by the coarser flow, the 5x5
+  SAD in the Motion Engine's spiral order and the subpixel step in one pass, the median and the joint bilateral
+  filter; at level 2 the hint where its SAD is lower. The hint is the motion vectors' flow (`FFX_OF_ARM_HINT=camera`:
+  the depth and camera motion alone, as the data graph path passes). Checked: a still scene gives 99 dB, TP1 matched
+  with itself a zero flow, the hint everywhere the result without image flow; not compared with the layer itself.
+
+`tests/fg_vk_test`, 1280x720 x2, generated frame against the truth (moving region; shadow edge where given):
+
+| Case | Own | FSR 3 | Arm | None |
+| --- | --- | --- | --- | --- |
+| moving square | 39.23 | 38.90 | 38.71 | 39.22 |
+| shadow 10 px (edge) | 38.97 | 38.20 | 38.27 | 36.24 |
+| shadow 16,6 px (edge) | 34.96 | 34.93 | 33.97 | 31.63 |
+| vertical motion 8 px | 35.04 | 33.83 | 30.13 | 35.07 |
+| sub-pixel pan + shadow | 38.19 | 29.93 | 30.05 | 38.18 |
+| square without motion vectors, 6 px | 8.17 | 32.01 | 11.12 | 14.52 |
+| motion vector noise 2 px | 25.86 | 25.77 | 25.16 | 25.86 |
+
+GPU time per interpolation (shadow case, interleaved runs): own 3.60 ms, Arm 4.95 ms, FSR 3 6.83 ms, none 3.18 ms.
+The Arm engine's flow is noisier than the motion vectors where they are right (its own vectors replace them unless
+the hint matches better), which costs the pan and vertical cases; FSR 3's ignores them entirely. The own image flow
+stays the default.
+

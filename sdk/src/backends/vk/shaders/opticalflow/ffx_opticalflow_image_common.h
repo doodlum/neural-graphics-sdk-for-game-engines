@@ -19,7 +19,9 @@ layout(set = 0, binding = 0, std140) uniform Uniforms {
     FfxInt32     _LevelCount;   // pyramid: all levels in one dispatch
     FfxUInt32    _SettledCost;  // search: a cell whose seeds agree and cost no more is not searched
     FfxInt32     _Final;        // filter: the finest level searched, written to rw_flow per level 0 cell (pixels)
-    FfxInt32     _Pad0, _Pad1, _Pad2;
+    FfxInt32     _Fsr3;         // pyramid: FSR 3's luma (FFX_OF_IMAGE=fsr3: Rec. 709, truncated, the levels the truncated mean)
+    FfxInt32     _Unorm8;       // FFX_OF_IMAGE=arm, pyramid: the colour is 8-bit (the emulation layer's UNORM8_INPUT)
+    FfxInt32     _Pad2;
     FfxInt32x4   _Levels[5];    // ... their texels (xy) and first rows (z)
 }ubo;
 #define _LevelDimsAll(l) (ubo._Levels[l].xy)
