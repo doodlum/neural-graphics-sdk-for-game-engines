@@ -66,10 +66,6 @@ typedef enum FfxOpticalflowPass
     FFX_OPTICALFLOW_PASS_COMPUTE_MOTION_FROM_DEPTH = 0,
     FFX_OPTICALFLOW_PASS_SCATTER_DEPTH,  // without the data graph engine: the flow from the game's motion vectors, step 1
     FFX_OPTICALFLOW_PASS_SCATTER_FLOW,   // ... step 2
-    FFX_OPTICALFLOW_PASS_LUMA,           // ... then block matching on the image: half-resolution luma
-    FFX_OPTICALFLOW_PASS_SEARCH,         // ... a full search per block around the motion vectors
-    FFX_OPTICALFLOW_PASS_REFINE,         // ... the candidate search per texel
-    FFX_OPTICALFLOW_PASS_APPLY,          // ... and the corrected motion vectors
     FFX_OPTICALFLOW_PASS_PYRAMID,        // image optical flow: TP1's luma pyramid
     FFX_OPTICALFLOW_PASS_FLOW_SEARCH,    // ... block matching per level, coarse to fine
     FFX_OPTICALFLOW_PASS_FLOW_FILTER,    // ... and its vector median per level
@@ -254,10 +250,6 @@ FFX_API FfxOpticalFlowGridSize ffxOpticalFlowGetGridSize(FfxOpticalFlowContext* 
 ///
 /// @ingroup ffxOpticalflow
 FFX_API FfxDimensions2D ffxOpticalFlowGetSize(FfxOpticalFlowContext* context);
-
-/// The game's motion vectors corrected by block matching this frame (same layout and scale as the game's), or a null
-/// resource when none were made (with the data graph engine, FFX_OF_REFINE=0, on a reset or the first frame).
-FFX_API FfxErrorCode ffxOpticalFlowGetFixedMotionVectors(FfxOpticalFlowContext* context, FfxResource* pResource);
 
 /// Destroy the FidelityFX OpticalFlow context.
 ///

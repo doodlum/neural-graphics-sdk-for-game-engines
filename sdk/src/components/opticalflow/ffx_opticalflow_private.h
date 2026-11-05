@@ -16,13 +16,6 @@
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COLOR_2                 10
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS     11
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_DEPTH           12  // nearest TP1 depth per TM1 flow texel
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FIXED_MOTION_VECTORS    13  // the game's, corrected by block matching
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1                14  // half-resolution packed luma, ping-ponged with
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TM1                15  // the previous frame's
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_BLOCK_FLOW              16  // the full search's flow per 32x32 pixel block
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_MOTION_FIX              17  // a correction per 8x8 pixels
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TP1               18  // the same at a quarter of the resolution
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMAQ_TM1               19
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1             20  // image flow: the luma pyramid (all levels in one
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TM1             21  // image), ping-ponged with the previous frame's
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_RAW                22  // each level's searched vectors (likewise)
@@ -67,22 +60,6 @@ typedef struct OpticalFlowScatterConstants
     int32_t display_dims[2];
 } OpticalFlowScatterConstants;
 
-typedef struct OpticalFlowRefineConstants
-{
-    int32_t  output_dims[2];
-    int32_t  luma_dims[2];
-    int32_t  color_dims[2];
-    int32_t  packed_width;
-    uint32_t penalty_candidate;
-    uint32_t penalty_step;
-    int32_t  match_ratio;
-    int32_t  block_dims[2];
-    int32_t  depth_inverted;
-    int32_t  packed_width_q;
-    int32_t  mv_dims[2];
-    float    mv_scale[2];
-} OpticalFlowRefineConstants;
-
 // The image flow's, per pass and level (ffx_opticalflow_image_common.h).
 #define FFX_OPTICALFLOW_IMAGE_MAX_LEVELS 5
 typedef struct OpticalFlowImageConstants
@@ -119,10 +96,6 @@ typedef struct OpticalFlowContext_Private
     FfxPipelineState                   pipelineFragmentMVHints;
     FfxPipelineState                   pipelineScatterDepth;  // hintsOnly: the flow from the game's motion vectors
     FfxPipelineState                   pipelineScatterFlow;
-    FfxPipelineState                   pipelineLuma;    // hintsOnly: block matching on the image over that flow
-    FfxPipelineState                   pipelineRefine;
-    FfxPipelineState                   pipelineSearch;
-    FfxPipelineState                   pipelineApply;
     FfxPipelineState                   pipelinePyramid;  // hintsOnly: image optical flow over that flow
     FfxPipelineState                   pipelineFlowSearch;
     FfxPipelineState                   pipelineFlowFilter;
@@ -150,12 +123,6 @@ typedef struct OpticalFlowContext_Private
     int32_t                            flowRow[FFX_OPTICALFLOW_IMAGE_MAX_LEVELS];    // in the flow images
     uint32_t                           lambdaHint, lambdaSeed, settledCost;
     FfxResourceInternal                pyramid[2];
-    bool                               refine;
-    bool                               lumaValid;       // the TM1 luma holds the previous frame
-    bool                               fixedValid;      // this frame's corrected motion vectors are written
-    FfxResourceInternal                luma[2];
-    FfxResourceInternal                lumaQ[2];
-    OpticalFlowRefineConstants         refineConstants;
     bool                               useMVHintsFragment;
     bool                               hintsOnly;  // no data graph optical flow engine: the MV hints are the flow
     FfxResourceInternal                srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT];
