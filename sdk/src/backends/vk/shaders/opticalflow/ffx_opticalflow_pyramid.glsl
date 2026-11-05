@@ -32,11 +32,25 @@ layout(set = 0, binding = 2, r32ui) uniform writeonly uimage2D rw_pyramid_tp1;
 FfxUInt32 Luma(FfxInt32x2 p)
 {
     const FfxFloat32x3 c = texelFetch(r_color_tp1, clamp(p, FfxInt32x2(0), ubo._SrcDims - FfxInt32x2(1)), 0).rgb;
+    if (ubo._Fsr3 != 0)  // ffx_opticalflow_prepare_luma.h (SDR)
+        return FfxUInt32(clamp(dot(c, FfxFloat32x3(0.2126f, 0.7152f, 0.0722f)) * 255.0f, 0.0f, 255.0f));
     return FfxUInt32(clamp(dot(c, FfxFloat32x3(0.299f, 0.587f, 0.114f)) * 255.0f + 0.5f, 0.0f, 255.0f));
 }
 
 shared FfxUInt32 s_luma[TILE][TILE + 1];            // level 0, so that the colour reads are row-contiguous
-shared FfxUInt32 s_level[2][TILE / 2][TILE / 2];  // ping-pong: level 1 (32x32), 2 (16x16), ...
+shared FfxUInt32 s_level[2][TILE / 2][TILE / 2];  // ping-pong: level 1 (32x32), 2 (16x16), ... (with _Fsr3 the sums)
+
+// A level's texel from the 2x2 below it: rounded; with _Fsr3 the sum, so that the level is the truncated mean of the
+// level 0 texels under it (FSR 3's SPD keeps its intermediate levels in floating point).
+FfxUInt32 Reduce(FfxUInt32 a, FfxUInt32 b, FfxUInt32 c, FfxUInt32 d)
+{
+    return ubo._Fsr3 != 0 ? a + b + c + d : (a + b + c + d + 2u) >> 2u;
+}
+
+FfxUInt32 Texel(FfxInt32 l, FfxUInt32 v)
+{
+    return ubo._Fsr3 != 0 ? v >> FfxUInt32(2 * l) : v;
+}
 
 // Level l's row (of the tile's n x n texels, l >= 1) from s_level[from]: one word per invocation.
 void StoreLevel(FfxInt32 l, FfxInt32 from, FfxInt32 n, FfxInt32 i)
@@ -48,8 +62,8 @@ void StoreLevel(FfxInt32 l, FfxInt32 from, FfxInt32 n, FfxInt32 i)
     const FfxInt32x2 g = FfxInt32x2(gl_WorkGroupID.xy) * n + t;
     if (g.x >= _LevelDimsAll(l).x || g.y >= _LevelDimsAll(l).y)
         return;
-    const FfxUInt32 v = s_level[from][t.y][t.x] | (s_level[from][t.y][t.x + 1] << 8u) | (s_level[from][t.y][t.x + 2] << 16u) |
-                        (s_level[from][t.y][t.x + 3] << 24u);
+    const FfxUInt32 v = Texel(l, s_level[from][t.y][t.x]) | (Texel(l, s_level[from][t.y][t.x + 1]) << 8u) |
+                        (Texel(l, s_level[from][t.y][t.x + 2]) << 16u) | (Texel(l, s_level[from][t.y][t.x + 3]) << 24u);
     imageStore(rw_pyramid_tp1, FfxInt32x2(g.x / 4, _LevelRows(l) + g.y), FfxUInt32x4(v));
 }
 
@@ -76,7 +90,7 @@ void main()
     }
     [[unroll]] for (FfxInt32 y = 0; y < 2; ++y)
         [[unroll]] for (FfxInt32 x = 0; x < 2; ++x)
-            s_level[0][l.y * 2 + y][l.x * 2 + x] = (v[2 * y][2 * x] + v[2 * y][2 * x + 1] + v[2 * y + 1][2 * x] + v[2 * y + 1][2 * x + 1] + 2u) >> 2u;
+            s_level[0][l.y * 2 + y][l.x * 2 + x] = Reduce(v[2 * y][2 * x], v[2 * y][2 * x + 1], v[2 * y + 1][2 * x], v[2 * y + 1][2 * x + 1]);
     barrier();
     StoreLevel(1, 0, TILE / 2, i);
 
@@ -87,7 +101,7 @@ void main()
         {
             const FfxInt32x2 t = FfxInt32x2(i % n, i / n) * 2;
             s_level[from ^ 1][t.y / 2][t.x / 2] =
-                (s_level[from][t.y][t.x] + s_level[from][t.y][t.x + 1] + s_level[from][t.y + 1][t.x] + s_level[from][t.y + 1][t.x + 1] + 2u) >> 2u;
+                Reduce(s_level[from][t.y][t.x], s_level[from][t.y][t.x + 1], s_level[from][t.y + 1][t.x], s_level[from][t.y + 1][t.x + 1]);
         }
         from ^= 1;
         barrier();

@@ -54,7 +54,7 @@ typedef struct ResourceBinding
     char     name[64];
 } ResourceBinding;
 
-constexpr int                srvTextureCount                         = 18;
+constexpr int                srvTextureCount                         = 23;
 static const ResourceBinding srvTextureBindingTable[srvTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_GAME_MOTION_VECTORS, "r_game_motion_vectors"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_DEPTH, "r_scatter_depth"},
@@ -74,9 +74,14 @@ static const ResourceBinding srvTextureBindingTable[srvTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_RAW, "r_flow_raw"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_LEVELS, "r_flow_levels"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_HINT, "r_flow_hint"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_WARP, "r_arm_warp"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_MATCH, "r_arm_match"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_SUB, "r_arm_sub"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_MED, "r_arm_med"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_FLOW, "r_arm_flow"},
 };
 
-constexpr int                uavTextureCount                         = 13;
+constexpr int                uavTextureCount                         = 18;
 static const ResourceBinding uavTextureBindingTable[uavTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_DEPTH, "rw_scatter_depth"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_RESULT, "rw_flow"},
@@ -91,6 +96,11 @@ static const ResourceBinding uavTextureBindingTable[uavTextureCount] = {
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1, "rw_pyramid_tp1"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_RAW, "rw_flow_raw"},
     {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_LEVELS, "rw_flow_levels"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_WARP, "rw_arm_warp"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_MATCH, "rw_arm_match"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_SUB, "rw_arm_sub"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_MED, "rw_arm_med"},
+    {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_FLOW, "rw_arm_flow"},
 };
 
 static const ResourceBinding uavBufferBindingTable[] = {
@@ -295,13 +305,25 @@ static FfxErrorCode createPipelineStates(OpticalFlowContext_Private* context)
                        {FFX_OPTICALFLOW_PASS_FLOW_FILTER, "ARM-OpticalFlow-FlowFilter", &context->pipelineFlowFilter, sizeof(OpticalFlowImageConstants)},
                        {FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE, "ARM-OpticalFlow-FlowSearchFine", &context->pipelineFlowSearchFine, sizeof(OpticalFlowImageConstants)},
                        {FFX_OPTICALFLOW_PASS_SCATTER, "ARM-OpticalFlow-Scatter", &context->pipelineScatter, sizeof(OpticalFlowScatterConstants)},
-                       {FFX_OPTICALFLOW_PASS_SCATTER_RESOLVE, "ARM-OpticalFlow-ScatterResolve", &context->pipelineScatterResolve, sizeof(OpticalFlowScatterConstants)}};
+                       {FFX_OPTICALFLOW_PASS_SCATTER_RESOLVE, "ARM-OpticalFlow-ScatterResolve", &context->pipelineScatterResolve, sizeof(OpticalFlowScatterConstants)},
+                       {FFX_OPTICALFLOW_PASS_FSR3_SEARCH, "ARM-OpticalFlow-Fsr3Search", &context->pipelineFsr3Search, sizeof(OpticalFlowImageConstants)},
+                       {FFX_OPTICALFLOW_PASS_FSR3_FILTER, "ARM-OpticalFlow-Fsr3Filter", &context->pipelineFsr3Filter, sizeof(OpticalFlowImageConstants)},
+                       {FFX_OPTICALFLOW_PASS_ARM_PYRAMID, "ARM-OpticalFlow-ArmPyramid", &context->pipelineArmPyramid, sizeof(OpticalFlowImageConstants)},
+                       {FFX_OPTICALFLOW_PASS_ARM_WARP, "ARM-OpticalFlow-ArmWarp", &context->pipelineArmWarp, sizeof(OpticalFlowImageConstants)},
+                       {FFX_OPTICALFLOW_PASS_ARM_MATCH, "ARM-OpticalFlow-ArmMatch", &context->pipelineArmMatch, sizeof(OpticalFlowImageConstants)},
+                       {FFX_OPTICALFLOW_PASS_ARM_MEDIAN, "ARM-OpticalFlow-ArmMedian", &context->pipelineArmMedian, sizeof(OpticalFlowImageConstants)},
+                       {FFX_OPTICALFLOW_PASS_ARM_BILATERAL, "ARM-OpticalFlow-ArmBilateral", &context->pipelineArmBilateral, sizeof(OpticalFlowImageConstants)}};
         for (const auto& sp : scatter)
         {
             // Passes the device cannot run (their shaders need 64-bit atomics or packed dot products) are not built.
-            const bool image = sp.pass == FFX_OPTICALFLOW_PASS_PYRAMID || sp.pass == FFX_OPTICALFLOW_PASS_FLOW_SEARCH ||
-                               sp.pass == FFX_OPTICALFLOW_PASS_FLOW_FILTER || sp.pass == FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE;
-            if ((image && !context->imageFlow) ||
+            // Of the image flows, only the one in use.
+            const bool own   = sp.pass == FFX_OPTICALFLOW_PASS_FLOW_SEARCH || sp.pass == FFX_OPTICALFLOW_PASS_FLOW_FILTER ||
+                               sp.pass == FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE;
+            const bool fsr3  = sp.pass == FFX_OPTICALFLOW_PASS_FSR3_SEARCH || sp.pass == FFX_OPTICALFLOW_PASS_FSR3_FILTER;
+            const bool arm   = sp.pass >= FFX_OPTICALFLOW_PASS_ARM_PYRAMID && sp.pass <= FFX_OPTICALFLOW_PASS_ARM_BILATERAL;
+            const bool image = sp.pass == FFX_OPTICALFLOW_PASS_PYRAMID || own || fsr3 || arm;
+            if ((image && !context->imageFlow) || (own && (context->fsr3Flow || context->armFlow)) || (fsr3 && !context->fsr3Flow) ||
+                (arm && !context->armFlow) || (sp.pass == FFX_OPTICALFLOW_PASS_PYRAMID && context->armFlow) ||
                 (!context->scatter64 && (sp.pass == FFX_OPTICALFLOW_PASS_SCATTER || sp.pass == FFX_OPTICALFLOW_PASS_SCATTER_RESOLVE)))
                 continue;
             ffxSafeReleasePipeline(&context->contextDescription.backendInterface, sp.pipeline, context->effectContextId);
@@ -503,10 +525,20 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
     // turns it off. FFX_OF_LAMBDA_HINT and FFX_OF_LAMBDA_SEED set the search's cost per texel of distance from the
     // hint flow and from the seed, FFX_OF_SETTLED the cost below which agreeing seeds are not searched around, and
     // FFX_OF_FINEST=1 ends the search at level 1 (0.1 ms less at 1280x720, 1 dB less on the moving square).
+    // FFX_OF_IMAGE=fsr3 (the plugin's optical flow setting) runs FidelityFX FSR 3's optical flow instead, on the same
+    // pyramid with FSR 3's luma (ffx_opticalflow_fsr3_search.glsl, _fsr3_filter.glsl): a vector per 8x8 block,
+    // searched -8..+7 around the coarser level's, without the hint flow; it needs no packed dot products.
+    // FFX_OF_IMAGE=arm runs the optical flow engine NFRU is made for (VK_ARM_data_graph_optical_flow, which RADV does
+    // not have) as Arm's ML Emulation Layer for Vulkan models it, configured as NFRU's data graph path configures it
+    // (ffx_opticalflow_arm_*.glsl), with the hint flow as its hint (FFX_OF_ARM_HINT=camera: the depth and camera
+    // motion alone, as the data graph path passes).
     int32_t pyramidRows = 0, flowRows = 0;
     {
         const char* v      = SettingEnv("FFX_OF_IMAGE");
-        context->imageFlow = context->hintsOnly && capabilities.integerDotProductSupported && !(v && !strcmp(v, "0")) &&
+        context->fsr3Flow  = v && !strcmp(v, "fsr3");
+        context->armFlow   = v && !strcmp(v, "arm");
+        context->imageFlow = context->hintsOnly && (capabilities.integerDotProductSupported || context->fsr3Flow || context->armFlow) &&
+                             !(v && !strcmp(v, "0")) &&
                              context->opticalFlowSize.width == (displaySize.width + 3) / 4 &&
                              context->opticalFlowSize.height == (displaySize.height + 3) / 4;
         const char*     lv        = getenv("FFX_OF_LEVELS");
@@ -524,15 +556,30 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
             d = {(d.width + 1) / 2, (d.height + 1) / 2};
         }
         const char* fl       = getenv("FFX_OF_FINEST");
-        context->finestLevel = std::min(fl ? uint32_t(atoi(fl)) : 0u, context->levelCount - 1);
+        context->finestLevel = context->fsr3Flow ? 0u : std::min(fl ? uint32_t(atoi(fl)) : 0u, context->levelCount - 1);
         const char* lh      = getenv("FFX_OF_LAMBDA_HINT");
         const char* ls      = getenv("FFX_OF_LAMBDA_SEED");
         context->lambdaHint = lh ? uint32_t(atoi(lh)) : 256u;
         context->lambdaSeed = ls ? uint32_t(atoi(ls)) : 64u;
         const char* sc       = getenv("FFX_OF_SETTLED");
         context->settledCost = sc ? uint32_t(atoi(sc)) : 256u;
+        // The engine's pyramid: each level half the one before, rounded up to even (setupPyramidLevelDimensions).
+        context->armDims[0] = displaySize;
+        context->armRow[0]  = 0;
+        int32_t armRows     = 0;
+        for (uint32_t l = 1; l < 6; ++l)
+        {
+            const FfxDimensions2D p = context->armDims[l - 1];
+            context->armDims[l]     = {((p.width + 1) / 2 + 1) & ~1u, ((p.height + 1) / 2 + 1) & ~1u};
+            context->armRow[l]      = armRows;
+            armRows += int32_t(context->armDims[l].height);
+        }
+        if (context->armFlow)
+            pyramidRows = armRows;
     }
 
+    // FFX_OF_IMAGE=arm's one-level images, level 2's size (1 x 1 when not in use).
+    const uint32_t armW = context->armFlow ? context->armDims[2].width : 1u, armH = context->armFlow ? context->armDims[2].height : 1u;
     const FfxResourceUsage otherProcessOutputImageUsage =
         context->contextDescription.flags & FFX_OPTICALFLOW_ENABLE_MV_HINTS_FRAGMENT ? FFX_RESOURCE_USAGE_RENDERTARGET : FFX_RESOURCE_USAGE_UAV;
     // Declare internal resources needed
@@ -632,8 +679,8 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
          "ArmOF_Pyramid_0",
          FFX_RESOURCE_TYPE_TEXTURE2D,
          FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R32_UINT,
-         (displaySize.width + 3) / 4 + 2,
+         context->armFlow ? FFX_SURFACE_FORMAT_R8_UNORM : FFX_SURFACE_FORMAT_R32_UINT,
+         context->armFlow ? context->armDims[1].width : (displaySize.width + 3) / 4 + 2,
          uint32_t(pyramidRows),
          1,
          FFX_RESOURCE_FLAGS_NONE,
@@ -642,8 +689,8 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
          "ArmOF_Pyramid_1",
          FFX_RESOURCE_TYPE_TEXTURE2D,
          FFX_RESOURCE_USAGE_UAV,
-         FFX_SURFACE_FORMAT_R32_UINT,
-         (displaySize.width + 3) / 4 + 2,
+         context->armFlow ? FFX_SURFACE_FORMAT_R8_UNORM : FFX_SURFACE_FORMAT_R32_UINT,
+         context->armFlow ? context->armDims[1].width : (displaySize.width + 3) / 4 + 2,
          uint32_t(pyramidRows),
          1,
          FFX_RESOURCE_FLAGS_NONE,
@@ -685,6 +732,56 @@ static FfxErrorCode opticalFlowVkCreate(OpticalFlowContext_Private* context, con
          FFX_SURFACE_FORMAT_R16G16_FLOAT,
          context->opticalFlowSize.width,
          context->opticalFlowSize.height,
+         1,
+         FFX_RESOURCE_FLAGS_NONE,
+         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_WARP,
+         "ArmOF_Arm_Warp",
+         FFX_RESOURCE_TYPE_TEXTURE2D,
+         FFX_RESOURCE_USAGE_UAV,
+         FFX_SURFACE_FORMAT_R8_UNORM,
+         armW,
+         armH,
+         1,
+         FFX_RESOURCE_FLAGS_NONE,
+         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_MATCH,
+         "ArmOF_Arm_Match",
+         FFX_RESOURCE_TYPE_TEXTURE2D,
+         FFX_RESOURCE_USAGE_UAV,
+         FFX_SURFACE_FORMAT_R32_UINT,
+         armW,
+         armH,
+         1,
+         FFX_RESOURCE_FLAGS_NONE,
+         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_SUB,
+         "ArmOF_Arm_Sub",
+         FFX_RESOURCE_TYPE_TEXTURE2D,
+         FFX_RESOURCE_USAGE_UAV,
+         FFX_SURFACE_FORMAT_R16G16_FLOAT,
+         armW,
+         armH,
+         1,
+         FFX_RESOURCE_FLAGS_NONE,
+         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_MED,
+         "ArmOF_Arm_Med",
+         FFX_RESOURCE_TYPE_TEXTURE2D,
+         FFX_RESOURCE_USAGE_UAV,
+         FFX_SURFACE_FORMAT_R16G16_FLOAT,
+         armW,
+         armH,
+         1,
+         FFX_RESOURCE_FLAGS_NONE,
+         {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
+        {FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_FLOW,
+         "ArmOF_Arm_Flow",
+         FFX_RESOURCE_TYPE_TEXTURE2D,
+         FFX_RESOURCE_USAGE_UAV,
+         FFX_SURFACE_FORMAT_R16G16_FLOAT,
+         armW,
+         armH,
          1,
          FFX_RESOURCE_FLAGS_NONE,
          {FFX_RESOURCE_INIT_DATA_TYPE_UNINITIALIZED}},
@@ -732,6 +829,11 @@ static FfxErrorCode opticalFlowVkRelease(OpticalFlowContext_Private* context)
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFlowSearchFine, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineScatter, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineScatterResolve, context->effectContextId);
+    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFsr3Search, context->effectContextId);
+    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineFsr3Filter, context->effectContextId);
+    for (FfxPipelineState* p : {&context->pipelineArmPyramid, &context->pipelineArmWarp, &context->pipelineArmMatch, &context->pipelineArmMedian,
+                                &context->pipelineArmBilateral})
+        ffxSafeReleasePipeline(&context->contextDescription.backendInterface, p, context->effectContextId);
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1] = context->pyramid[0];
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TM1] = context->pyramid[1];
     context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_LUMA_TP1] = context->luma[0];
@@ -965,6 +1067,65 @@ static void scheduleFragmentMVHints(
 
 // Image optical flow over the hint flow in the result: TP1's luma pyramid; then, when there is TM1's, the hint copied
 // aside and the flow searched and filtered level by level from the coarsest, level 0's filter writing the result.
+// FFX_OF_IMAGE=arm: the emulated optical flow engine (ffx_opticalflow_arm_*.glsl). TP1's pyramid (levels 1 to 5);
+// then, with TM1's, per level from 5 to 2 its warp, block match and subpixel step, median and bilateral filters, and
+// at level 2 the hint (the hint flow, or the depth and camera motion with FFX_OF_ARM_HINT=camera) where it matches
+// better. The data graph path's flags (TM1's pyramid kept from the frame before) are the ping-pong here.
+static FfxErrorCode scheduleArmFlow(OpticalFlowContext_Private* context, const FfxOpticalFlowDispatchDescription* params)
+{
+    const FfxSurfaceFormat f = params->color.description.format;
+    OpticalFlowImageConstants c = {};
+    c.src_dims[0] = int32_t(params->color.description.width), c.src_dims[1] = int32_t(params->color.description.height);
+    c.hint_dims[0] = int32_t(context->opticalFlowSize.width), c.hint_dims[1] = int32_t(context->opticalFlowSize.height);
+    c.unorm8 = f == FFX_SURFACE_FORMAT_R8G8B8A8_UNORM || f == FFX_SURFACE_FORMAT_B8G8R8A8_UNORM || f == FFX_SURFACE_FORMAT_R8G8B8A8_SRGB ||
+               f == FFX_SURFACE_FORMAT_B8G8R8A8_SRGB || f == FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS || f == FFX_SURFACE_FORMAT_B8G8R8A8_TYPELESS ||
+               f == FFX_SURFACE_FORMAT_R8_UNORM;
+    auto stage = [&]() {
+        return context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+            &context->contextDescription.backendInterface, &c, sizeof(c), &context->constantBuffers[FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER]);
+    };
+    auto groups = [](FfxDimensions2D d) { return FfxDimensions2D{(d.width + 7) / 8, (d.height + 7) / 8}; };
+    for (int32_t l = 1; l < 6; ++l)
+    {
+        const FfxDimensions2D d = context->armDims[l], s = context->armDims[l - 1];
+        c.level = l, c.level_row = context->armRow[l], c.coarse_row = context->armRow[l - 1];
+        c.level_dims[0] = int32_t(d.width), c.level_dims[1] = int32_t(d.height);
+        c.coarse_dims[0] = int32_t(s.width), c.coarse_dims[1] = int32_t(s.height);
+        FFX_VALIDATE(stage());
+        const FfxDimensions2D g = groups(d);
+        scheduleMVHintsAndCopyResources(context, &context->pipelineArmPyramid, g.width, g.height, "ArmOF_ArmPyramid");
+    }
+    if (!context->pyramidValid || params->reset)
+        return FFX_OK;
+
+    static const bool cameraHint = [] {
+        const char* v = getenv("FFX_OF_ARM_HINT");
+        return v && !strcmp(v, "camera");
+    }();
+    FfxGpuJobDescription copyJob       = {FFX_GPU_JOB_COPY};
+    copyJob.copyJobDescriptor.src      = cameraHint ? context->srvResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COMPUTED_MOTION_VECTORS]
+                                                    : context->uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_RESULT];
+    copyJob.copyJobDescriptor.dst      = context->uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_HINT];
+    copyJob.copyJobDescriptor.copyMode = FFX_GPU_COPY_SRC_EXTENT;
+    FFX_VALIDATE(context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &copyJob));
+
+    for (int32_t l = 5; l >= 2; --l)
+    {
+        const FfxDimensions2D d  = context->armDims[l];
+        const FfxDimensions2D cc = l == 5 ? FfxDimensions2D{0, 0} : context->armDims[l + 1];
+        c.level = l, c.level_row = context->armRow[l], c.coarse_row = 0, c.final = l == 2;
+        c.level_dims[0] = int32_t(d.width), c.level_dims[1] = int32_t(d.height);
+        c.coarse_dims[0] = int32_t(cc.width), c.coarse_dims[1] = int32_t(cc.height);
+        FFX_VALIDATE(stage());
+        const FfxDimensions2D g = groups(d);
+        scheduleMVHintsAndCopyResources(context, &context->pipelineArmWarp, g.width, g.height, "ArmOF_ArmWarp");
+        scheduleMVHintsAndCopyResources(context, &context->pipelineArmMatch, g.width, g.height, "ArmOF_ArmMatch");
+        scheduleMVHintsAndCopyResources(context, &context->pipelineArmMedian, g.width, g.height, "ArmOF_ArmMedian");
+        scheduleMVHintsAndCopyResources(context, &context->pipelineArmBilateral, g.width, g.height, "ArmOF_ArmBilateral");
+    }
+    return FFX_OK;
+}
+
 static FfxErrorCode scheduleImageFlow(OpticalFlowContext_Private* context, const FfxOpticalFlowDispatchDescription* params)
 {
     const uint32_t tp1 = context->resourceFrameIndex;
@@ -973,11 +1134,18 @@ static FfxErrorCode scheduleImageFlow(OpticalFlowContext_Private* context, const
         r[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TP1] = context->pyramid[tp1];
         r[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_PYRAMID_TM1] = context->pyramid[tp1 ^ 1];
     }
+    if (context->armFlow)
+    {
+        FFX_VALIDATE(scheduleArmFlow(context, params));
+        context->pyramidValid = true;
+        return FFX_OK;
+    }
     auto cells = [](FfxDimensions2D d) { return FfxDimensions2D{(d.width + 3) / 4, (d.height + 3) / 4}; };
 
     OpticalFlowImageConstants c = {};
     c.src_dims[0] = int32_t(params->color.description.width), c.src_dims[1] = int32_t(params->color.description.height);
     c.level_count = int32_t(context->levelCount);
+    c.fsr3        = context->fsr3Flow ? 1 : 0;
     for (uint32_t l = 0; l < context->levelCount; ++l)
     {
         c.levels[l][0] = int32_t(context->levelDims[l].width), c.levels[l][1] = int32_t(context->levelDims[l].height);
@@ -991,7 +1159,35 @@ static FfxErrorCode scheduleImageFlow(OpticalFlowContext_Private* context, const
                                     (context->levelDims[0].height + 63) / 64,
                                     "ArmOF_Pyramid");
 
-    if (context->pyramidValid && !params->reset)
+    if (context->pyramidValid && !params->reset && context->fsr3Flow)
+    {
+        // FSR 3's: 8x8 blocks at each level (cells here), seeded from the coarser level's (step 2 runs its scale pass).
+        auto blocks = [](FfxDimensions2D d) { return FfxDimensions2D{(d.width + 7) / 8, (d.height + 7) / 8}; };
+        for (int32_t l = int32_t(context->levelCount) - 1; l >= 0; --l)
+        {
+            const FfxDimensions2D d   = context->levelDims[l];
+            const FfxDimensions2D n   = blocks(d);
+            const bool            top = l + 1 == int32_t(context->levelCount);
+            const FfxDimensions2D cc  = top ? FfxDimensions2D{0, 0} : blocks(context->levelDims[l + 1]);
+            c.level_dims[0] = int32_t(d.width), c.level_dims[1] = int32_t(d.height);
+            c.cell_dims[0] = int32_t(n.width), c.cell_dims[1] = int32_t(n.height);
+            c.coarse_dims[0] = int32_t(cc.width), c.coarse_dims[1] = int32_t(cc.height);
+            c.hint_dims[0] = int32_t(context->opticalFlowSize.width), c.hint_dims[1] = int32_t(context->opticalFlowSize.height);
+            c.out_scale[0] = float(params->color.description.width) / float(context->levelDims[0].width);
+            c.out_scale[1] = float(params->color.description.height) / float(context->levelDims[0].height);
+            c.level_row    = context->levelRow[l];
+            c.flow_row     = context->flowRow[l];
+            c.coarse_row   = top ? 0 : context->flowRow[l + 1];
+            c.level        = l;
+            c.final        = l == 0;
+            FFX_VALIDATE(context->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+                &context->contextDescription.backendInterface, &c, sizeof(c), &context->constantBuffers[FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER]));
+            scheduleMVHintsAndCopyResources(context, &context->pipelineFsr3Search, (n.width + 7) / 8, (n.height + 7) / 8, "ArmOF_Fsr3Search");
+            const FfxDimensions2D o = c.final ? context->opticalFlowSize : n;
+            scheduleMVHintsAndCopyResources(context, &context->pipelineFsr3Filter, (o.width + 7) / 8, (o.height + 7) / 8, "ArmOF_Fsr3Filter");
+        }
+    }
+    else if (context->pyramidValid && !params->reset)
     {
         FfxGpuJobDescription copyJob       = {FFX_GPU_JOB_COPY};
         copyJob.copyJobDescriptor.src      = context->uavResources[FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_RESULT];

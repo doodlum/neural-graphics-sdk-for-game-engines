@@ -29,7 +29,12 @@
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_LEVELS             23  // ... filtered, the next finer level's seeds
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_FLOW_HINT               24  // the flow from the motion vectors and depth
 #define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_SCATTER_KEYS            25  // depth key and flow per texel (64-bit atomics)
-#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT                   26
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_WARP                26  // FFX_OF_IMAGE=arm (the pyramid is PYRAMID_*): the
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_MATCH               27  // warped TP1, the match's cost, the flow after the
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_SUB                 28  // subpixel step, after the median, and filtered
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_MED                 29  // (one level at a time, level 2's size)
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_ARM_FLOW                30
+#define FFX_OPTICALFLOW_RESOURCE_IDENTIFIER_COUNT                   31
 
 #define FFX_OPTICALFLOW_CONSTANTBUFFER_IDENTIFIER 0
 #define FFX_OPTICALFLOW_CONSTANTBUFFER_COUNT      1
@@ -97,7 +102,9 @@ typedef struct OpticalFlowImageConstants
     int32_t  level_count;
     uint32_t settled_cost;
     int32_t  final;
-    int32_t  pad[3];
+    int32_t  fsr3;  // pyramid: FSR 3's luma
+    int32_t  unorm8;  // FFX_OF_IMAGE=arm, pyramid: 8-bit colour
+    int32_t  pad;
     int32_t  levels[FFX_OPTICALFLOW_IMAGE_MAX_LEVELS][4];
 } OpticalFlowImageConstants;
 
@@ -122,8 +129,19 @@ typedef struct OpticalFlowContext_Private
     FfxPipelineState                   pipelineFlowSearchFine;
     FfxPipelineState                   pipelineScatter;  // the scatter in one pass (64-bit atomics)
     FfxPipelineState                   pipelineScatterResolve;
+    FfxPipelineState                   pipelineFsr3Search;  // FFX_OF_IMAGE=fsr3: FSR 3's optical flow instead
+    FfxPipelineState                   pipelineFsr3Filter;
+    FfxPipelineState                   pipelineArmPyramid;  // FFX_OF_IMAGE=arm: the emulated optical flow engine
+    FfxPipelineState                   pipelineArmWarp;
+    FfxPipelineState                   pipelineArmMatch;
+    FfxPipelineState                   pipelineArmMedian;
+    FfxPipelineState                   pipelineArmBilateral;
     bool                               scatter64;
     bool                               imageFlow;
+    bool                               fsr3Flow;
+    bool                               armFlow;  // FFX_OF_IMAGE=arm: the image flow is the emulated engine's
+    FfxDimensions2D                    armDims[6];  // its pyramid's levels (0: the colour's; 1 to 5 in PYRAMID_*)
+    int32_t                            armRow[6];  // FFX_OF_IMAGE=fsr3: the image flow is FSR 3's (8x8 blocks, no hint)
     bool                               pyramidValid;    // the TM1 pyramid holds the previous frame
     uint32_t                           levelCount;
     uint32_t                           finestLevel;  // searched; the flow is its vectors at level 0's cells
