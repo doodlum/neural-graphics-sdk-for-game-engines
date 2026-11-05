@@ -2612,6 +2612,19 @@ FfxErrorCode GetDeviceCapabilitiesVK(FfxInterface* backendInterface, FfxDeviceCa
             // no features structure so extension name is enough
             deviceCapabilities->bufferMarkerSupported = true;
         }
+        else if (strcmp(extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) == 0)
+        {
+            VkPhysicalDeviceShaderIntegerDotProductFeatures integerDotProductFeatures = {};
+            integerDotProductFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+
+            VkPhysicalDeviceFeatures2 physicalDeviceFeatures2 = {};
+            physicalDeviceFeatures2.sType                     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            physicalDeviceFeatures2.pNext                     = &integerDotProductFeatures;
+
+            VulkanWrapper().vkGetPhysicalDeviceFeatures2(backendContext->physicalDevice, &physicalDeviceFeatures2);
+
+            deviceCapabilities->integerDotProductSupported = (bool)integerDotProductFeatures.shaderIntegerDotProduct;
+        }
         else if (strcmp(extensionName, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) == 0)
         {
             // check for extended synchronization support

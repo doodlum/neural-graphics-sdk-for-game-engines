@@ -14,6 +14,10 @@
 #include <ffx_opticalflow_refine_permutations.h>
 #include <ffx_opticalflow_search_permutations.h>
 #include <ffx_opticalflow_apply_permutations.h>
+#include <ffx_opticalflow_pyramid_permutations.h>
+#include <ffx_opticalflow_flow_search_permutations.h>
+#include <ffx_opticalflow_flow_filter_permutations.h>
+#include <ffx_opticalflow_flow_search_fine_permutations.h>
 #include <string.h>  // for memset
 
 #if defined(POPULATE_PERMUTATION_KEY)
@@ -113,6 +117,38 @@ FfxErrorCode opticalflowGetPermutationBlobByIndex(FfxOpticalflowPass passId, uin
         ffx_opticalflow_refine_PermutationKey key;
         POPULATE_PERMUTATION_KEY(permutationOptions, key);
         FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_refine_PermutationInfo, g_ffx_opticalflow_refine_IndirectionTable[key.index]);
+        memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
+        return FFX_OK;
+    }
+    case FFX_OPTICALFLOW_PASS_PYRAMID:
+    {
+        ffx_opticalflow_pyramid_PermutationKey key;
+        POPULATE_PERMUTATION_KEY(permutationOptions, key);
+        FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_pyramid_PermutationInfo, g_ffx_opticalflow_pyramid_IndirectionTable[key.index]);
+        memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
+        return FFX_OK;
+    }
+    case FFX_OPTICALFLOW_PASS_FLOW_SEARCH:
+    {
+        ffx_opticalflow_flow_search_PermutationKey key;
+        POPULATE_PERMUTATION_KEY(permutationOptions, key);
+        FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_flow_search_PermutationInfo, g_ffx_opticalflow_flow_search_IndirectionTable[key.index]);
+        memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
+        return FFX_OK;
+    }
+    case FFX_OPTICALFLOW_PASS_FLOW_FILTER:
+    {
+        ffx_opticalflow_flow_filter_PermutationKey key;
+        POPULATE_PERMUTATION_KEY(permutationOptions, key);
+        FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_flow_filter_PermutationInfo, g_ffx_opticalflow_flow_filter_IndirectionTable[key.index]);
+        memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
+        return FFX_OK;
+    }
+    case FFX_OPTICALFLOW_PASS_FLOW_SEARCH_FINE:
+    {
+        ffx_opticalflow_flow_search_fine_PermutationKey key;
+        POPULATE_PERMUTATION_KEY(permutationOptions, key);
+        FfxShaderBlob blob = POPULATE_SHADER_BLOB_FFX(g_ffx_opticalflow_flow_search_fine_PermutationInfo, g_ffx_opticalflow_flow_search_fine_IndirectionTable[key.index]);
         memcpy(outBlob, &blob, sizeof(FfxShaderBlob));
         return FFX_OK;
     }
