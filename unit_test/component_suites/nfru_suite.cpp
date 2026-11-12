@@ -55,7 +55,15 @@ namespace
     static_assert(offsetof(FfxFrameInterpolationPrepareDescription, depth) == 56);
     static_assert(offsetof(FfxFrameInterpolationPrepareDescription, frameID) == 776);
     static_assert(offsetof(FfxFrameInterpolationPrepareDescription, viewProjection) == 784);
-    static_assert(sizeof(FfxFrameInterpolationDispatchDescription) == 424);
+    static_assert(sizeof(FfxFrameInterpolationDispatchDescription) == 912);
+    static_assert(offsetof(FfxFrameInterpolationDispatchDescription, numGeneratedFrames) == 424);
+    static_assert(offsetof(FfxFrameInterpolationDispatchDescription, additionalOutputs) == 432);
+    static_assert(FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES == 5u);
+    static_assert(FFX_FRAMEINTERPOLATION_MAX_GENERATED_FRAMES == 5);
+    // Multi-frame generation keeps the upstream FFX API dispatch layout (4 inline outputs); frame 5 is chained.
+    static_assert(offsetof(ffxApiDispatchDescFrameGeneration, numGeneratedFrames) ==
+                  offsetof(ffxApiDispatchDescFrameGeneration, outputs) + 4 * sizeof(FfxApiResource));
+    static_assert(sizeof(ffxApiDispatchDescFrameGenerationExtraOutputs::outputs) == sizeof(FfxApiResource));
     static_assert(alignof(FfxFrameInterpolationDispatchDescription) == 8);
     static_assert(offsetof(FfxFrameInterpolationDispatchDescription, currentBackBuffer) == 16);
     static_assert(offsetof(FfxFrameInterpolationDispatchDescription, opticalFlowVector) == 256);
@@ -759,6 +767,67 @@ UNIT_TEST_CASE(nfru_provider_fake_backend, retries_after_prepare_validation)
     return true;
 }
 
+// Multi-frame generation contract at the ffx-api level: numGeneratedFrames in [1, 5], one output per generated frame
+// (frame 5 through the chained extra-outputs descriptor). Rejected dispatches leave the prepared frame retryable.
+UNIT_TEST_CASE(nfru_provider_fake_backend, validates_generated_frame_count_and_outputs)
+{
+    FakeNfruBackend backend;
+    struct ContextGuard
+    {
+        ffxContext context = nullptr;
+        ~ContextGuard()
+        {
+            DestroyContextIfNeeded(context);
+        }
+    } contextGuard;
+
+    const uint32_t flags = FFX_API_FG_CONTEXT_FLAG_MANAGE_PREVIOUS_DEPTH | FFX_API_FG_CONTEXT_FLAG_MANAGE_PREVIOUS_COLOR;
+    UNIT_TEST_CHECK(CreateFakeNfruContext(backend, flags, contextGuard.context) == FFX_API_RETURN_OK);
+    UNIT_TEST_CHECK(ConfigureNfruContext(contextGuard.context, true, FFX_API_FG_DISPATCH_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY, 1) == FFX_API_RETURN_OK);
+
+    const FfxApiResource output =
+        MakeFakeApiResource(192, 192, FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM, FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    for (uint64_t frameId = 1; frameId <= 2; ++frameId)
+    {
+        UNIT_TEST_CHECK(FakePrepare(contextGuard.context, frameId, true) == FFX_API_RETURN_OK);
+        const uint32_t scheduledBefore = backend.scheduleCalls;
+
+        // Out of range: 0 and 6.
+        for (const uint32_t invalidCount : {0u, FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES + 1})
+        {
+            auto dispatchDesc               = MakeFakeDispatchDesc(frameId);
+            dispatchDesc.numGeneratedFrames = invalidCount;
+            UNIT_TEST_CHECK(ffxDispatch(&contextGuard.context, &dispatchDesc.header) == FFX_API_RETURN_ERROR_PARAMETER);
+        }
+        // Missing inline output for frame 3.
+        {
+            auto dispatchDesc               = MakeFakeDispatchDesc(frameId);
+            dispatchDesc.numGeneratedFrames = 3;
+            dispatchDesc.outputs[1]         = output;
+            UNIT_TEST_CHECK(ffxDispatch(&contextGuard.context, &dispatchDesc.header) == FFX_API_RETURN_ERROR_PARAMETER);
+        }
+        // Frame 5 without the chained descriptor.
+        auto dispatchDesc               = MakeFakeDispatchDesc(frameId);
+        dispatchDesc.numGeneratedFrames = FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES;
+        for (uint32_t index = 1; index < FFX_API_FRAMEGENERATION_INLINE_OUTPUTS; ++index)
+        {
+            dispatchDesc.outputs[index] = output;
+        }
+        UNIT_TEST_CHECK(ffxDispatch(&contextGuard.context, &dispatchDesc.header) == FFX_API_RETURN_ERROR_PARAMETER);
+        UNIT_TEST_CHECK(backend.scheduleCalls == scheduledBefore);
+
+        // Valid 6x dispatch with the chained fifth output.
+        ffxApiDispatchDescFrameGenerationExtraOutputs extraOutputs{};
+        extraOutputs.header.type  = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_EXTRA_OUTPUTS;
+        extraOutputs.outputs[0]   = output;
+        dispatchDesc.header.pNext = &extraOutputs.header;
+        dispatchDesc.reset        = frameId == 1;
+        UNIT_TEST_CHECK(ffxDispatch(&contextGuard.context, &dispatchDesc.header) == FFX_API_RETURN_OK);
+        UNIT_TEST_CHECK(backend.scheduleCalls > scheduledBefore);
+    }
+    return true;
+}
+
 UNIT_TEST_CASE(nfru_provider_fake_backend, maps_invalid_prepare_arguments_to_parameter_error)
 {
     FakeNfruBackend backend;
@@ -1031,8 +1100,11 @@ namespace
                 state.uavResources[i]               = state.srvResources[i];
             }
             state.pipelineDownsampleInpaintSeed.uavTextureCount = 1;
-            state.pipelineDownsampleInpaintMip.srvTextureCount  = 1;
-            state.pipelineDownsampleInpaintMip.uavTextureCount  = 1;
+            for (FfxPipelineState& mipPipeline : state.pipelineDownsampleInpaintMip)
+            {
+                mipPipeline.srvTextureCount = 1;
+                mipPipeline.uavTextureCount = 1;
+            }
 
             auto& backend         = state.contextDescription.backendInterface;
             backend.scratchBuffer = this;

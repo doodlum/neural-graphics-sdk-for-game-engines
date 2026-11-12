@@ -17,6 +17,7 @@ set(UNIT_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/component_suites/nss_suite.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/component_suites/nfru_suite.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/component_suites/nfru_resolution_suite.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/component_suites/nfru_mfg_suite.cpp
 )
 
 if(FFX_CAPTURE_ENABLED)
