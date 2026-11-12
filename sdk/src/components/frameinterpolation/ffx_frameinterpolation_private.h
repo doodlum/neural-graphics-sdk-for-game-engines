@@ -63,6 +63,9 @@ typedef enum FfxFrameInterpolationShaderPermutationOptions
 struct FfxPipelineState;
 struct FfxResource;
 
+/// Number of inpaint-pyramid mip downsample passes (levels 1..4 of the five-level pyramid).
+#define FFX_FRAMEINTERPOLATION_INPAINT_MIP_PIPELINE_COUNT (4)
+
 typedef struct FrameInterpolationConstants
 {
     FfxFloat32x4x4 _MotionTM1ToTP1;
@@ -82,8 +85,8 @@ typedef struct FrameInterpolationConstants
     float _MotionVectorScale[2];
 
     float _JitterCancellation[2];
-    float _MvSimilarityThresholds[3];  // x: similarity threshold (eps), y: noise threshold (tau), z: relative threshold (rel_eps)
-    float _MvSimilarityThresholdsPadding;
+    float    _MvSimilarityThresholds[3];  // x: similarity threshold (eps), y: noise threshold (tau), z: relative threshold (rel_eps)
+    uint32_t _InputTensorChannels;        // 16: original graph input; 20: channel 16 carries the timestep (std140 packs it after the vec3)
 
     int32_t  _InputTensorSize[2];
     int      _Reset;
@@ -100,15 +103,23 @@ typedef struct FrameInterpolationConstants
     float   _OfInputSizeRcp[2];
     float   _DepthClipScale;
     float   _DepthClipPower;
+
+    // Multi-frame generation: 1 for the first generated frame of a dispatch. Storage-image history writes in the
+    // warp and postprocess passes are skipped for later frames (the values are timestep independent).
+    uint32_t _WriteHistory;
+    uint32_t _WriteHistoryPadding[3];
 } FrameInterpolationConstants;
 
 static_assert(offsetof(FrameInterpolationConstants, _JitterCancellation) == 216, "Frame interpolation constants must match the std140 shader layout.");
 static_assert(offsetof(FrameInterpolationConstants, _MvSimilarityThresholds) == 224, "Frame interpolation constants must match the std140 shader layout.");
+static_assert(offsetof(FrameInterpolationConstants, _InputTensorChannels) == 236, "Frame interpolation constants must match the std140 shader layout.");
 static_assert(offsetof(FrameInterpolationConstants, _InputTensorSize) == 240, "Frame interpolation constants must match the std140 shader layout.");
+static_assert(offsetof(FrameInterpolationConstants, _Timestep) == 252, "Frame interpolation constants must match the std140 shader layout.");
 static_assert(offsetof(FrameInterpolationConstants, _MvDepthLaneSize) == 264, "Frame interpolation constants must match the std140 shader layout.");
 static_assert(offsetof(FrameInterpolationConstants, _QuantParamsGateSNORM) == 304, "Frame interpolation constants must match the std140 shader layout.");
 static_assert(offsetof(FrameInterpolationConstants, _OfInputSizeRcp) == 320, "Frame interpolation constants must match the std140 shader layout.");
-static_assert(sizeof(FrameInterpolationConstants) == 336, "Frame interpolation constants must preserve std140 block size.");
+static_assert(offsetof(FrameInterpolationConstants, _WriteHistory) == 336, "Frame interpolation constants must match the std140 shader layout.");
+static_assert(sizeof(FrameInterpolationConstants) == 352, "Frame interpolation constants must preserve std140 block size.");
 
 typedef struct FrameInterpolationRenderDescription
 {
@@ -156,7 +167,10 @@ typedef struct FfxArmFrameInterpolationContext_Private
     FfxPipelineState pipelinePreprocess;
     FfxPipelineState pipelineNFRUInterpolation;
     FfxPipelineState pipelineDownsampleInpaintSeed;  // 31 seed -> mip0
-    FfxPipelineState pipelineDownsampleInpaintMip;   // 31 mip i-1 -> i
+    // 31 mip i-1 -> i, one pipeline state per level (index level - 1). The backend rotates descriptor sets per
+    // pipeline layout with a fixed per-frame budget, so separate states keep multi-frame generation (one pyramid
+    // per generated frame) within that budget instead of using one layout FFX_FRAMEINTERPOLATION_INPAINT_MIP_PIPELINE_COUNT * N times.
+    FfxPipelineState pipelineDownsampleInpaintMip[FFX_FRAMEINTERPOLATION_INPAINT_MIP_PIPELINE_COUNT];
     FfxPipelineState pipelineInpaint;                // 50_inpaint resolver
     FfxPipelineState pipelinePostprocess;
 
@@ -175,6 +189,7 @@ typedef struct FfxArmFrameInterpolationContext_Private
     uint32_t pipelineFlags;
     uint32_t dataGraphWidth;
     uint32_t dataGraphHeight;
+    uint32_t inputTensorChannels;  // 16 or 20, read from the data graph's input tensor shape at creation
 
     uint64_t       previousFrameID;
     uint64_t       dispatchCount;

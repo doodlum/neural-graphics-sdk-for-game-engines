@@ -11,6 +11,7 @@
 #include <ffx_api/ffx_framegeneration.hpp>
 #include <FidelityFX/host/ffx_frameinterpolation.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
@@ -469,6 +470,26 @@ void NfruDiagnostics::LogDispatchBegin(const ffxApiDispatchDescFrameGeneration& 
                   info.frameGenerationFlags,
                   static_cast<unsigned>((info.frameGenerationFlags & FFX_API_FG_DISPATCH_FLAG_DRAW_DEBUG_VIEW) != 0));
     PrintFrameMessage(desc.frameID, FFX_MESSAGE_TYPE_INFO, message);
+
+    // Multi-frame generation: one line with the timestep of every generated frame (t = 0 previous, t = 1 current).
+    {
+        const uint32_t generated = std::min<uint32_t>(desc.numGeneratedFrames, FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES);
+        int            written   = std::snprintf(message,
+                                    sizeof(message),
+                                    "event=dispatch_timesteps generated_frames=%u multiplier=%ux input_tensor_channels=%u timesteps=",
+                                    desc.numGeneratedFrames,
+                                    desc.numGeneratedFrames + 1,
+                                    info.inputTensorChannels);
+        for (uint32_t frameIndex = 1; frameIndex <= generated && written > 0 && static_cast<size_t>(written) < sizeof(message); ++frameIndex)
+        {
+            written += std::snprintf(message + written,
+                                     sizeof(message) - static_cast<size_t>(written),
+                                     "%s%.4f",
+                                     frameIndex > 1 ? "," : "",
+                                     static_cast<double>(frameIndex) / static_cast<double>(generated + 1));
+        }
+        PrintFrameMessage(desc.frameID, FFX_MESSAGE_TYPE_INFO, message);
+    }
 
     const FfxApiResourceDescription& present = desc.presentColor.description;
     const FfxApiResourceDescription& output  = desc.outputs[0].description;

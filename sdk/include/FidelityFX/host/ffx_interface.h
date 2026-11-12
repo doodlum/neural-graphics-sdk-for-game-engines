@@ -499,6 +499,8 @@ typedef struct FfxFrameGenerationConfig
     bool                           drawDebugPacingLines;     ///< Sets the state of pacing debug lines. Set to true to display debug lines
     bool                           dumpGeneratedFrame;       ///< Sets the state of frame dumping. Set to true to dump interpolated frames to disk
     const char*                    dumpGeneratedFramePath;   ///< The path to dump generated frames to disk. If null, a default path will be used
+    uint32_t
+        numGeneratedFrames;  ///< Generated frames per rendered frame for the swapchain path, in [1, FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES]; 0 is treated as 1.
 } FfxFrameGenerationConfig;
 
 typedef FfxErrorCode (*FfxSwapChainConfigureFrameGenerationFunc)(FfxFrameGenerationConfig const* config);

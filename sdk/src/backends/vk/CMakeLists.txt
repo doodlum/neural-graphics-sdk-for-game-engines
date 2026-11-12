@@ -224,6 +224,9 @@ endif()
 
 if (FFX_FI OR FFX_ALL)
 	target_compile_definitions(ffx_backend_vk_${FFX_PLATFORM_NAME} PRIVATE FFX_FI)
+	# Data graph selection (FFX_NFRU_DATA_GRAPH_FILE) is resolved in sdk/CMakeLists.txt.
+	target_include_directories(ffx_backend_vk_${FFX_PLATFORM_NAME} PRIVATE "${FFX_NFRU_DATA_GRAPH_SELECTION_DIR}")
+
 	include (CMakeShadersArmFrameinterpolation.txt)
 endif()
 

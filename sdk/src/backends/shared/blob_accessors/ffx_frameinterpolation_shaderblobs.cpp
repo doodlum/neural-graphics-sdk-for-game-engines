@@ -30,8 +30,13 @@
 #include "ffx_frameinterpolation_shaderblobs.h"
 #include "frameinterpolation/ffx_frameinterpolation_private.h"
 
-// Data Graph
+// Data Graph: selected at configure time by FFX_NFRU_DATA_GRAPH_FILE (default nfru_v2_0_0_int8.vgf).
+#if __has_include(<ffx_nfru_data_graph_selection.h>)
+#include <ffx_nfru_data_graph_selection.h>
+#else
 #include <nfru_v2_0_0_int8.h>
+#define FFX_NFRU_DATA_GRAPH_INFO g_nfru_v2_0_0_int8_Info
+#endif
 
 // Normal permutations
 #include <ffx_frameinterpolation_00_init_warp_pass_permutations.h>
@@ -528,7 +533,8 @@ FfxErrorCode frameInterpolationGetPermutationBlobByIndex(
     }
     case FFX_FRAMEINTERPOLATION_PASS_NFRU_INTERPOLATION:
     {
-        memcpy(outDataGraphBlob, &g_nfru_v2_0_0_int8_Info, sizeof(FfxDataGraphBlob));
+        static_assert(sizeof(FFX_NFRU_DATA_GRAPH_INFO) == sizeof(FfxDataGraphBlob), "generated data graph info must match FfxDataGraphBlob");
+        memcpy(outDataGraphBlob, &FFX_NFRU_DATA_GRAPH_INFO, sizeof(FfxDataGraphBlob));
         return FFX_OK;
     }
     case FFX_FRAMEINTERPOLATION_PASS_DEBUG_VIEW:

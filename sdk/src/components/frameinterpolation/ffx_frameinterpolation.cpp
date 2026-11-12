@@ -45,6 +45,23 @@
 #include "ffx_frameinterpolation_private.h"
 #include "ffx_frameinterpolation_trace.h"
 
+// Quantization parameters of the data graph compiled into the SDK (generated from its export metadata by
+// NfruDataGraphSelection.cmake). The fallback keeps the nfru_v2_0_0_int8 values for builds outside the SDK CMake.
+#if __has_include(<ffx_nfru_data_graph_quant.h>)
+#include <ffx_nfru_data_graph_quant.h>
+#else
+#define FFX_NFRU_QUANT_INPUT_SINT_SCALE   (0.003921568859368563)
+#define FFX_NFRU_QUANT_INPUT_SINT_ZERO    (-128)
+#define FFX_NFRU_QUANT_INPUT_SNORM_SCALE  (0.49803924513980746)
+#define FFX_NFRU_QUANT_INPUT_SNORM_ZERO   (-1.0078740157480315)
+#define FFX_NFRU_QUANT_PARAMS_SINT_SCALE  (0.4059530198574066)
+#define FFX_NFRU_QUANT_PARAMS_SINT_ZERO   (80)
+#define FFX_NFRU_QUANT_PARAMS_SNORM_SCALE (51.55603352189064)
+#define FFX_NFRU_QUANT_PARAMS_SNORM_ZERO  (0.6299212598425197)
+#define FFX_NFRU_QUANT_GATE_SNORM_SCALE   (0.49803924513980746)
+#define FFX_NFRU_QUANT_GATE_SNORM_ZERO    (-1.0078740157480315)
+#endif
+
 static constexpr const char* ffxLogComponentName()
 {
     return "NFRU";
@@ -695,8 +712,13 @@ static FfxErrorCode createPipelineStates(FfxArmFrameInterpolationContext_Private
     // Inpaint pyramid downsample (always compute; distinct resources preserve whole-image layouts)
     FFX_VALIDATE(CreatePipeline(
         FFX_FRAMEINTERPOLATION_PASS_DOWNSAMPLE_INPAINT_SEED, "ARM_NFRU_DOWNSAMPLE_INPAINT_SEED", &context->pipelineDownsampleInpaintSeed, false));
-    FFX_VALIDATE(
-        CreatePipeline(FFX_FRAMEINTERPOLATION_PASS_DOWNSAMPLE_INPAINT_MIP, "ARM_NFRU_DOWNSAMPLE_INPAINT_MIP", &context->pipelineDownsampleInpaintMip, false));
+    for (uint32_t mipIndex = 0; mipIndex < FFX_FRAMEINTERPOLATION_INPAINT_MIP_PIPELINE_COUNT; ++mipIndex)
+    {
+        char mipPipelineName[FFX_RESOURCE_NAME_SIZE];
+        snprintf(mipPipelineName, sizeof(mipPipelineName), "ARM_NFRU_DOWNSAMPLE_INPAINT_MIP_%u", mipIndex + 1);
+        FFX_VALIDATE(
+            CreatePipeline(FFX_FRAMEINTERPOLATION_PASS_DOWNSAMPLE_INPAINT_MIP, mipPipelineName, &context->pipelineDownsampleInpaintMip[mipIndex], false));
+    }
     FFX_VALIDATE(CreatePipeline(FFX_FRAMEINTERPOLATION_PASS_INPAINT, "ARM_NFRU_INPAINT", &context->pipelineInpaint, false));
     FFX_VALIDATE(CreatePipeline(FFX_FRAMEINTERPOLATION_PASS_POSTPROCESS, "ARM_NFRU_POSTPROCESS", &context->pipelinePostprocess, postprocessUseFragment));
 
@@ -707,6 +729,45 @@ static FfxErrorCode createPipelineStates(FfxArmFrameInterpolationContext_Private
 }
 
 static FfxErrorCode logErrorWithCallback(FfxErrorCode errorCode, const char* errorMessage, FfxLogMessageCallback callback, const char* funcName);
+
+// Read the innermost (channel) dimension of the data graph's input tensor. Backends that cannot provide the blob
+// (for example host-only test backends) keep the original 16-channel layout.
+static FfxErrorCode queryDataGraphInputChannels(FfxArmFrameInterpolationContext_Private* context, uint32_t* outChannels)
+{
+    *outChannels                                   = FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_BASE;
+    const FfxGetPermutationBlobByIndexFunc getBlob = context->contextDescription.backendInterface.fpGetPermutationBlobByIndex;
+    if (!context->enableDataGraphFI || getBlob == nullptr)
+    {
+        return FFX_OK;
+    }
+
+    FfxDataGraphBlob blob = {};
+    if (getBlob(ARM_EFFECT_FRAMEINTERPOLATION,
+                static_cast<FfxPass>(FFX_FRAMEINTERPOLATION_PASS_NFRU_INTERPOLATION),
+                context->pipelineFlags,
+                nullptr,
+                nullptr,
+                &blob) != FFX_OK ||
+        blob.inputTensorNums == 0 || blob.inputTensorDimSize == nullptr || blob.inputTensorDims == nullptr || blob.inputTensorDimSize[0] == 0)
+    {
+        return FFX_OK;
+    }
+
+    const int64_t channels = blob.inputTensorDims[0][blob.inputTensorDimSize[0] - 1];
+    if (channels != FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_BASE && channels != FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_TIMESTEP)
+    {
+        char message[160];
+        snprintf(message,
+                 sizeof(message),
+                 "NFRU data graph input has %lld channels; supported layouts are %d (base) and %d (timestep channel)",
+                 static_cast<long long>(channels),
+                 FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_BASE,
+                 FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_TIMESTEP);
+        return logErrorWithCallback(FFX_ERROR_INVALID_ARGUMENT, message, context->contextDescription.fpMessage, FFX_BUILTIN_FUNCTION);
+    }
+    *outChannels = static_cast<uint32_t>(channels);
+    return FFX_OK;
+}
 
 static FfxErrorCode frameinterpolationCreate(FfxArmFrameInterpolationContext_Private*       context,
                                              const FfxFrameInterpolationContextDescription* contextDescription)
@@ -784,21 +845,21 @@ static FfxErrorCode frameinterpolationCreate(FfxArmFrameInterpolationContext_Pri
     context->constants._OfInputSizeRcp[0]     = 1.0f / context->ofInputColour.width;
     context->constants._OfInputSizeRcp[1]     = 1.0f / context->ofInputColour.height;
 
-    // model specific
+    // model specific: generated from the selected data graph's export metadata (see NfruDataGraphSelection.cmake).
     // .xy = input quant (scale, zero); .zw = output dequant (scale, zero) = output tensor metadata.
-    context->constants._QuantParamsSINT[0]  = 1 / 0.003921568859368563;  // input quant scale (x)
-    context->constants._QuantParamsSINT[1]  = -128;                      // input quant zero
-    context->constants._QuantParamsSINT[2]  = 0.4059530198574066;        // params dequant scale (getitem SINT)
-    context->constants._QuantParamsSINT[3]  = 80;                        // params dequant zero
-    context->constants._QuantParamsSNORM[0] = 1 / 0.49803924513980746;   // input quant scale
-    context->constants._QuantParamsSNORM[1] = -1.0078740157480315;       // input quant zero
-    context->constants._QuantParamsSNORM[2] = 51.55603352189064;         // params dequant scale (getitem SNORM)
-    context->constants._QuantParamsSNORM[3] = 0.6299212598425197;        // params dequant zero
+    context->constants._QuantParamsSINT[0]  = 1.0 / FFX_NFRU_QUANT_INPUT_SINT_SCALE;   // input quant scale (x)
+    context->constants._QuantParamsSINT[1]  = FFX_NFRU_QUANT_INPUT_SINT_ZERO;          // input quant zero
+    context->constants._QuantParamsSINT[2]  = FFX_NFRU_QUANT_PARAMS_SINT_SCALE;        // params dequant scale (getitem SINT)
+    context->constants._QuantParamsSINT[3]  = FFX_NFRU_QUANT_PARAMS_SINT_ZERO;         // params dequant zero
+    context->constants._QuantParamsSNORM[0] = 1.0 / FFX_NFRU_QUANT_INPUT_SNORM_SCALE;  // input quant scale
+    context->constants._QuantParamsSNORM[1] = FFX_NFRU_QUANT_INPUT_SNORM_ZERO;         // input quant zero
+    context->constants._QuantParamsSNORM[2] = FFX_NFRU_QUANT_PARAMS_SNORM_SCALE;       // params dequant scale (getitem SNORM)
+    context->constants._QuantParamsSNORM[3] = FFX_NFRU_QUANT_PARAMS_SNORM_ZERO;        // params dequant zero
     // gate output (getitem_1) dequant params. .zw used by the postprocess gate.
-    context->constants._QuantParamsGateSNORM[0] = 1 / 0.49803924513980746;  // gate quant scale
-    context->constants._QuantParamsGateSNORM[1] = -1.0078740157480315;      // gate quant zero
-    context->constants._QuantParamsGateSNORM[2] = 0.49803924513980746;      // gate dequant scale (getitem_1 SNORM)
-    context->constants._QuantParamsGateSNORM[3] = -1.0078740157480315;      // gate dequant zero
+    context->constants._QuantParamsGateSNORM[0] = 1.0 / FFX_NFRU_QUANT_GATE_SNORM_SCALE;  // gate quant scale
+    context->constants._QuantParamsGateSNORM[1] = FFX_NFRU_QUANT_GATE_SNORM_ZERO;         // gate quant zero
+    context->constants._QuantParamsGateSNORM[2] = FFX_NFRU_QUANT_GATE_SNORM_SCALE;        // gate dequant scale (getitem_1 SNORM)
+    context->constants._QuantParamsGateSNORM[3] = FFX_NFRU_QUANT_GATE_SNORM_ZERO;         // gate dequant zero
 
     context->dataGraphWidth                = context->resolutionPlan.paddedTensorLane.width;
     context->dataGraphHeight               = context->resolutionPlan.paddedTensorLane.height;
@@ -838,8 +899,13 @@ static FfxErrorCode frameinterpolationCreate(FfxArmFrameInterpolationContext_Pri
     // Debug checks
     nfruDebugCheckCreate(context);
 
-    constexpr uint32_t inputTensorChannels  = 16;  // innermost dimension
-    constexpr uint32_t outputTensorChannels = 4;   // innermost dimension
+    // The input-tensor layout follows the data graph compiled into the SDK: 16 channels (original NFRU v2 graph) or
+    // 20 channels (multi-frame graph: channels 16-19 carry t, t*|mv|/64, (1-t)*|mv|/64 and 0; see the preprocess pass).
+    FFX_VALIDATE(queryDataGraphInputChannels(context, &context->inputTensorChannels));
+    context->constants._InputTensorChannels = context->inputTensorChannels;
+
+    const uint32_t     inputTensorChannels  = context->inputTensorChannels;  // innermost dimension
+    constexpr uint32_t outputTensorChannels = 4;                             // innermost dimension
     constexpr uint32_t gateTensorChannels   = 1;   // second output (inpaint gate)
     constexpr uint32_t tensorShapeSize      = 4;
 
@@ -1130,7 +1196,10 @@ static FfxErrorCode frameinterpolationRelease(FfxArmFrameInterpolationContext_Pr
     }
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineInpaint, context->effectContextId);
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineDownsampleInpaintSeed, context->effectContextId);
-    ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineDownsampleInpaintMip, context->effectContextId);
+    for (FfxPipelineState& mipPipeline : context->pipelineDownsampleInpaintMip)
+    {
+        ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &mipPipeline, context->effectContextId);
+    }
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelinePostprocess, context->effectContextId);
     // Release utility pipelines
     ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineDebugView, context->effectContextId);
@@ -1962,12 +2031,26 @@ static FfxErrorCode dispatchFrameInterpolation(FfxFrameInterpolationContext*    
         contextPrivate->constants._JitterCancellation[1] = 0.0f;
     }
 
+    // Multi-frame generation: frame k (1-based, presentation order) of N is generated at t_k = k / (N + 1), measured
+    // from the previous rendered frame (t = 0, TM1) towards the current one (t = 1, TP1). N = 1 keeps t = 0.5.
+    const uint32_t numGeneratedFrames = params->numGeneratedFrames == 0 ? 1u : params->numGeneratedFrames;
+    FFX_ASSERT(numGeneratedFrames <= FFX_FRAMEINTERPOLATION_MAX_GENERATED_FRAMES);
+
+    // Each generated frame stages its own copy of the constants. The backend copies staged data into its staging ring
+    // here and into a fresh uniform-buffer allocation when the job is recorded, so a later timestep never overwrites
+    // the constants an earlier dispatch of this frame still reads.
+    const auto stageTimestepConstants = [&](uint32_t generatedFrameIndex) -> FfxErrorCode {
+        contextPrivate->constants._Timestep     = ffxFrameInterpolationTimestep(generatedFrameIndex, numGeneratedFrames);
+        contextPrivate->constants._WriteHistory = generatedFrameIndex == 1 ? 1u : 0u;
+        return contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
+            &contextPrivate->contextDescription.backendInterface,
+            &contextPrivate->constants,
+            sizeof(contextPrivate->constants),
+            &contextPrivate->constantBuffers[FFX_FRAMEINTERPOLATION_CONSTANTBUFFER_IDENTIFIER]);
+    };
+
     setTraceStage(FfxNfruFiStage::Preprocess);
-    FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpStageConstantBufferDataFunc(
-        &contextPrivate->contextDescription.backendInterface,
-        &contextPrivate->constants,
-        sizeof(contextPrivate->constants),
-        &contextPrivate->constantBuffers[FFX_FRAMEINTERPOLATION_CONSTANTBUFFER_IDENTIFIER]));
+    FFX_VALIDATE(stageTimestepConstants(1));
 
     DynamicResourceCleanup cleanup{&contextPrivate->contextDescription.backendInterface, params->commandList, contextPrivate->effectContextId, true};
     FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
@@ -1997,6 +2080,21 @@ static FfxErrorCode dispatchFrameInterpolation(FfxFrameInterpolationContext*    
         &contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT]));
     contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] =
         contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT];
+
+    // Register the outputs of generated frames 2..N; per-timestep passes rebind the OUTPUT slot to output k.
+    FfxResourceInternal generatedOutputs[FFX_FRAMEINTERPOLATION_MAX_GENERATED_FRAMES] = {};
+    generatedOutputs[0] = contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT];
+    for (uint32_t frameIndex = 2; frameIndex <= numGeneratedFrames; ++frameIndex)
+    {
+        FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(&contextPrivate->contextDescription.backendInterface,
+                                                                                            &params->additionalOutputs[frameIndex - 2],
+                                                                                            contextPrivate->effectContextId,
+                                                                                            &generatedOutputs[frameIndex - 1]));
+    }
+    const auto bindGeneratedOutput = [&](uint32_t generatedFrameIndex) {
+        contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = generatedOutputs[generatedFrameIndex - 1];
+        contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = generatedOutputs[generatedFrameIndex - 1];
+    };
 
     // set optical flow buffers
     if (params->opticalFlowScale.x > 0)
@@ -2053,7 +2151,8 @@ static FfxErrorCode dispatchFrameInterpolation(FfxFrameInterpolationContext*    
     ///////////////////
     NfruCpuClock::time_point preScheduleStart{};
     NfruCpuClock::time_point postScheduleStart{};
-    bool                     postTimingStarted = false;
+    bool                     postTimingStarted     = false;
+    double                   graphUsAfterPostStart = 0.0;
     if (collectTimings)
     {
         preScheduleStart = NfruCpuClock::now();
@@ -2092,151 +2191,192 @@ static FfxErrorCode dispatchFrameInterpolation(FfxFrameInterpolationContext*    
             FFX_VALIDATE(
                 contextPrivate->contextDescription.backendInterface.fpScheduleGpuJob(&contextPrivate->contextDescription.backendInterface, &clearJobs));
 
-            // copy current frame to interpolation output to avoid undefined output when resetting.
-            FfxGpuJobDescription resetcopyJob  = {FFX_GPU_JOB_COPY};
-            resetcopyJob.copyJobDescriptor.src = contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE];
-            resetcopyJob.copyJobDescriptor.dst = contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT];
-            FFX_VALIDATE(
-                contextPrivate->contextDescription.backendInterface.fpScheduleGpuJob(&contextPrivate->contextDescription.backendInterface, &resetcopyJob));
+            // copy current frame to every generated output to avoid undefined output when resetting.
+            for (uint32_t frameIndex = 1; frameIndex <= numGeneratedFrames; ++frameIndex)
+            {
+                FfxGpuJobDescription resetcopyJob  = {FFX_GPU_JOB_COPY};
+                resetcopyJob.copyJobDescriptor.src = contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_CURRENT_INTERPOLATION_SOURCE];
+                resetcopyJob.copyJobDescriptor.dst = generatedOutputs[frameIndex - 1];
+                FFX_VALIDATE(
+                    contextPrivate->contextDescription.backendInterface.fpScheduleGpuJob(&contextPrivate->contextDescription.backendInterface, &resetcopyJob));
+            }
         }
         else
         {
-            // Zero-initialise QMVD and MV Holes before warp passes
-            FFX_VALIDATE(scheduleInitWarp());
-            FFX_VALIDATE(schedulePreWarpDownsample());
-            bindWarpInputs();
-
-            /////////////////
-            // T+1 MV work //
-            /////////////////
-            // Generate warped filled motion using this frame's motion vectors
-            // Warp motion vectors and encode with depth
-            if (warpUseFragment)
+            // Multi-frame generation. Per rendered frame (once): optical flow (provider), OF-colour and pre-warp
+            // downsamples, warp-input binding and the colour/depth/dynamic-mask histories. Per generated frame k
+            // (t_k dependent): init warp, MV/depth scatter to t_k (10), flow scatter to t_k (11), fill holes (21),
+            // preprocess (30), inpaint pyramid (31), data graph, inpaint resolve (50) and postprocess (50) into
+            // output k. Pass 10 also produces the dynamic mask TP1 and depth history and the postprocess the colour history;
+            // they do not depend on t, so only k = 1 writes them (_WriteHistory; render-target variants rewrite identical values).
+            // Intermediate resources are reused across k: the backend adds a barrier for every resource of every
+            // job, and the jobs of each k are recorded before the next k starts (FFX_MAX_GPU_JOBS per execute).
+            for (uint32_t frameIndex = 1; frameIndex <= numGeneratedFrames; ++frameIndex)
             {
-                FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelineWarpFlow, mvDepthLane.width, mvDepthLane.height));
-            }
-            else
-            {
-                uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(mvDepthLane.width, FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH);
-                uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(mvDepthLane.height, FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT);
-                FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineWarpFlow, dispatchSizeX, dispatchSizeY));
-            }
-            /////////////////
-            // T-1 OF work //
-            /////////////////
-            // Generated warped filled OF using the Optical Flow and last frame's depth
-            // Warp Optical Flow and encode with last frame's depth
-            if (warpUseFragment)
-            {
-                FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelineWarpFlowTM1, flowLane.width, flowLane.height));
-            }
-            else
-            {
-                uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(flowLane.width, FFX_FRAMEINTERPOLATION_WARP_FLOW_TM1_THREAD_GROUP_WIDTH);
-                uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(flowLane.height, FFX_FRAMEINTERPOLATION_WARP_FLOW_TM1_THREAD_GROUP_HEIGHT);
-                FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineWarpFlowTM1, dispatchSizeX, dispatchSizeY));
-            }
-            // Fill holes TM1
-            if (fillHolesUseFragment)
-            {
-                FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelineFillHolesTM1, flowLane.width, flowLane.height));
-            }
-            else
-            {
-                uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(flowLane.width, FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH);
-                uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(flowLane.height, FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT);
-                FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineFillHolesTM1, dispatchSizeX, dispatchSizeY));
-            }
-
-            ////////////////////
-            // Generate frame //
-            ////////////////////
-            // Preprocessing
-            if (preProcessUseFragment)
-            {
-                FFX_VALIDATE(
-                    scheduleFragment(contextPrivate, &contextPrivate->pipelinePreprocess, contextPrivate->dataGraphWidth, contextPrivate->dataGraphHeight));
-            }
-            else
-            {
-                uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(contextPrivate->dataGraphWidth, FFX_FRAMEINTERPOLATION_PREPROCESS_THREAD_GROUP_WIDTH);
-                uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(contextPrivate->dataGraphHeight, FFX_FRAMEINTERPOLATION_PREPROCESS_THREAD_GROUP_HEIGHT);
-                FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelinePreprocess, dispatchSizeX, dispatchSizeY));
-            }
-
-            // 31 seed -> level 0
-            {
-                const FfxResourceInternal seed        = contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINT_SEED];
-                const FfxResourceInternal destination = contextPrivate->uavResources[INPAINT_LEVEL_RESOURCE_IDS[0]];
-                FFX_ASSERT(seed.internalIndex != destination.internalIndex);
-                uint32_t dx = FFX_DIVIDE_ROUNDING_UP(flowLane.width, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_WIDTH);
-                uint32_t dy = FFX_DIVIDE_ROUNDING_UP(flowLane.height, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_HEIGHT);
-                FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineDownsampleInpaintSeed, dx, dy, nullptr, &destination));
-            }
-            // 31 level i-1 -> i. Per-job overrides make the source explicit and keep SRV/UAV images distinct.
-            for (uint32_t level = 1; level < FFX_FRAMEINTERPOLATION_INPAINT_LEVEL_COUNT; ++level)
-            {
-                const FfxResourceInternal source      = contextPrivate->srvResources[INPAINT_LEVEL_RESOURCE_IDS[level - 1]];
-                const FfxResourceInternal destination = contextPrivate->uavResources[INPAINT_LEVEL_RESOURCE_IDS[level]];
-                FFX_ASSERT(source.internalIndex != destination.internalIndex);
-                uint32_t levelWidth  = std::max(1u, flowLane.width >> level);
-                uint32_t levelHeight = std::max(1u, flowLane.height >> level);
-                uint32_t dx          = FFX_DIVIDE_ROUNDING_UP(levelWidth, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_WIDTH);
-                uint32_t dy          = FFX_DIVIDE_ROUNDING_UP(levelHeight, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_HEIGHT);
-                FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineDownsampleInpaintMip, dx, dy, &source, &destination));
-            }
-
-            if (contextPrivate->enableDataGraphFI)
-            {
-                // NFRU Interpolation
-                if (collectTimings)
+                if (frameIndex > 1)
                 {
-                    trace->preScheduleUs = elapsedMicroseconds(preScheduleStart, NfruCpuClock::now());
+                    setTraceStage(FfxNfruFiStage::Preprocess);
+                    FFX_VALIDATE(stageTimestepConstants(frameIndex));
                 }
-                setTraceStage(FfxNfruFiStage::DataGraph);
-                NfruCpuClock::time_point graphScheduleStart{};
-                if (collectTimings)
-                {
-                    graphScheduleStart = NfruCpuClock::now();
-                }
-                FFX_VALIDATE(scheduleDataGraph(contextPrivate, &contextPrivate->pipelineNFRUInterpolation));
-                if (collectTimings)
-                {
-                    trace->graphScheduleUs = elapsedMicroseconds(graphScheduleStart, NfruCpuClock::now());
-                    postScheduleStart      = NfruCpuClock::now();
-                    postTimingStarted      = true;
-                }
-                setTraceStage(FfxNfruFiStage::Postprocess);
-            }
+                bindGeneratedOutput(frameIndex);
 
-            // 50 resolve the five logical levels -> inpaint result (flow lane)
-            {
-                uint32_t dx = FFX_DIVIDE_ROUNDING_UP(flowLane.width, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_WIDTH);
-                uint32_t dy = FFX_DIVIDE_ROUNDING_UP(flowLane.height, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_HEIGHT);
-                FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineInpaint, dx, dy));
-            }
-            // Postprocessing
-            if (postprocessUseFragment)
-            {
-                FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelinePostprocess, displaySize.width, displaySize.height));
-            }
-            else
-            {
-                uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(displaySize.width, FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH);
-                uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(displaySize.height, FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT);
-                FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelinePostprocess, dispatchSizeX, dispatchSizeY));
-            }
-            if (params->flags & FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_VIEW)
-            {
-                if (debugViewUseFragment)
+                // Zero-initialise QMVD and MV Holes before warp passes (scatter targets are min-atomics, so per timestep)
+                FFX_VALIDATE(scheduleInitWarp());
+                if (frameIndex == 1)
                 {
-                    FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelineDebugView, displaySize.width, displaySize.height));
+                    FFX_VALIDATE(schedulePreWarpDownsample());
+                    bindWarpInputs();
+                }
+
+                /////////////////
+                // T+1 MV work //
+                /////////////////
+                // Generate warped filled motion using this frame's motion vectors
+                // Warp motion vectors and encode with depth
+                if (warpUseFragment)
+                {
+                    FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelineWarpFlow, mvDepthLane.width, mvDepthLane.height));
+                }
+                else
+                {
+                    uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(mvDepthLane.width, FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH);
+                    uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(mvDepthLane.height, FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT);
+                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineWarpFlow, dispatchSizeX, dispatchSizeY));
+                }
+                /////////////////
+                // T-1 OF work //
+                /////////////////
+                // Generated warped filled OF using the Optical Flow and last frame's depth
+                // Warp Optical Flow and encode with last frame's depth
+                if (warpUseFragment)
+                {
+                    FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelineWarpFlowTM1, flowLane.width, flowLane.height));
+                }
+                else
+                {
+                    uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(flowLane.width, FFX_FRAMEINTERPOLATION_WARP_FLOW_TM1_THREAD_GROUP_WIDTH);
+                    uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(flowLane.height, FFX_FRAMEINTERPOLATION_WARP_FLOW_TM1_THREAD_GROUP_HEIGHT);
+                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineWarpFlowTM1, dispatchSizeX, dispatchSizeY));
+                }
+                // Fill holes TM1
+                if (fillHolesUseFragment)
+                {
+                    FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelineFillHolesTM1, flowLane.width, flowLane.height));
+                }
+                else
+                {
+                    uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(flowLane.width, FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH);
+                    uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(flowLane.height, FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT);
+                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineFillHolesTM1, dispatchSizeX, dispatchSizeY));
+                }
+
+                ////////////////////
+                // Generate frame //
+                ////////////////////
+                // Preprocessing
+                if (preProcessUseFragment)
+                {
+                    FFX_VALIDATE(
+                        scheduleFragment(contextPrivate, &contextPrivate->pipelinePreprocess, contextPrivate->dataGraphWidth, contextPrivate->dataGraphHeight));
+                }
+                else
+                {
+                    uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(contextPrivate->dataGraphWidth, FFX_FRAMEINTERPOLATION_PREPROCESS_THREAD_GROUP_WIDTH);
+                    uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(contextPrivate->dataGraphHeight, FFX_FRAMEINTERPOLATION_PREPROCESS_THREAD_GROUP_HEIGHT);
+                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelinePreprocess, dispatchSizeX, dispatchSizeY));
+                }
+
+                // 31 seed -> level 0
+                {
+                    const FfxResourceInternal seed        = contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINT_SEED];
+                    const FfxResourceInternal destination = contextPrivate->uavResources[INPAINT_LEVEL_RESOURCE_IDS[0]];
+                    FFX_ASSERT(seed.internalIndex != destination.internalIndex);
+                    uint32_t dx = FFX_DIVIDE_ROUNDING_UP(flowLane.width, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_WIDTH);
+                    uint32_t dy = FFX_DIVIDE_ROUNDING_UP(flowLane.height, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_HEIGHT);
+                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineDownsampleInpaintSeed, dx, dy, nullptr, &destination));
+                }
+                // 31 level i-1 -> i. Per-job overrides make the source explicit and keep SRV/UAV images distinct.
+                for (uint32_t level = 1; level < FFX_FRAMEINTERPOLATION_INPAINT_LEVEL_COUNT; ++level)
+                {
+                    const FfxResourceInternal source      = contextPrivate->srvResources[INPAINT_LEVEL_RESOURCE_IDS[level - 1]];
+                    const FfxResourceInternal destination = contextPrivate->uavResources[INPAINT_LEVEL_RESOURCE_IDS[level]];
+                    FFX_ASSERT(source.internalIndex != destination.internalIndex);
+                    uint32_t levelWidth  = std::max(1u, flowLane.width >> level);
+                    uint32_t levelHeight = std::max(1u, flowLane.height >> level);
+                    uint32_t dx          = FFX_DIVIDE_ROUNDING_UP(levelWidth, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_WIDTH);
+                    uint32_t dy          = FFX_DIVIDE_ROUNDING_UP(levelHeight, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_HEIGHT);
+                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineDownsampleInpaintMip[level - 1], dx, dy, &source, &destination));
+                }
+
+                if (contextPrivate->enableDataGraphFI)
+                {
+                    // NFRU Interpolation
+                    if (collectTimings && frameIndex == 1)
+                    {
+                        trace->preScheduleUs = elapsedMicroseconds(preScheduleStart, NfruCpuClock::now());
+                    }
+                    setTraceStage(FfxNfruFiStage::DataGraph);
+                    NfruCpuClock::time_point graphScheduleStart{};
+                    if (collectTimings)
+                    {
+                        graphScheduleStart = NfruCpuClock::now();
+                    }
+                    FFX_VALIDATE(scheduleDataGraph(contextPrivate, &contextPrivate->pipelineNFRUInterpolation));
+                    if (collectTimings)
+                    {
+                        const double graphUs = elapsedMicroseconds(graphScheduleStart, NfruCpuClock::now());
+                        trace->graphScheduleUs += graphUs;
+                        if (!postTimingStarted)
+                        {
+                            postScheduleStart = NfruCpuClock::now();
+                            postTimingStarted = true;
+                        }
+                        else
+                        {
+                            graphUsAfterPostStart += graphUs;
+                        }
+                    }
+                    setTraceStage(FfxNfruFiStage::Postprocess);
+                }
+
+                // 50 resolve the five logical levels -> inpaint result (flow lane)
+                {
+                    uint32_t dx = FFX_DIVIDE_ROUNDING_UP(flowLane.width, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_WIDTH);
+                    uint32_t dy = FFX_DIVIDE_ROUNDING_UP(flowLane.height, FFX_FRAMEINTERPOLATION_INPAINT_GROUP_HEIGHT);
+                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineInpaint, dx, dy));
+                }
+                // Postprocessing
+                if (postprocessUseFragment)
+                {
+                    FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelinePostprocess, displaySize.width, displaySize.height));
                 }
                 else
                 {
                     uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(displaySize.width, FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH);
                     uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(displaySize.height, FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT);
-                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineDebugView, dispatchSizeX, dispatchSizeY));
+                    FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelinePostprocess, dispatchSizeX, dispatchSizeY));
+                }
+                if (params->flags & FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_VIEW)
+                {
+                    if (debugViewUseFragment)
+                    {
+                        FFX_VALIDATE(scheduleFragment(contextPrivate, &contextPrivate->pipelineDebugView, displaySize.width, displaySize.height));
+                    }
+                    else
+                    {
+                        uint32_t dispatchSizeX = FFX_DIVIDE_ROUNDING_UP(displaySize.width, FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH);
+                        uint32_t dispatchSizeY = FFX_DIVIDE_ROUNDING_UP(displaySize.height, FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT);
+                        FFX_VALIDATE(scheduleDispatch(contextPrivate, &contextPrivate->pipelineDebugView, dispatchSizeX, dispatchSizeY));
+                    }
+                }
+
+                // Record this timestep's jobs before scheduling the next one; the final timestep is recorded below
+                // together with the history copy.
+                if (frameIndex < numGeneratedFrames)
+                {
+                    setTraceStage(FfxNfruFiStage::RecordCommands);
+                    FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpExecuteGpuJobs(
+                        &contextPrivate->contextDescription.backendInterface, params->commandList, contextPrivate->effectContextId));
                 }
             }
         }
@@ -2257,7 +2397,7 @@ static FfxErrorCode dispatchFrameInterpolation(FfxFrameInterpolationContext*    
         {
             if (postTimingStarted)
             {
-                trace->postScheduleUs = elapsedMicroseconds(postScheduleStart, NfruCpuClock::now());
+                trace->postScheduleUs = std::max(0.0, elapsedMicroseconds(postScheduleStart, NfruCpuClock::now()) - graphUsAfterPostStart);
             }
             else
             {
@@ -2358,6 +2498,20 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatchWithTrace(FfxFrameInterpolatio
     {
         return trace ? FFX_ERROR_INVALID_POINTER : logErrorWithCallback(FFX_ERROR_INVALID_POINTER, "dispatch requires a command list", userMsgCallback);
     }
+    if (params->numGeneratedFrames > FFX_FRAMEINTERPOLATION_MAX_GENERATED_FRAMES)
+    {
+        return trace ? FFX_ERROR_INVALID_ARGUMENT
+                     : logErrorWithCallback(
+                           FFX_ERROR_INVALID_ARGUMENT, "dispatch numGeneratedFrames exceeds the multi-frame generation limit of 5", userMsgCallback);
+    }
+    for (uint32_t frameIndex = 2; frameIndex <= params->numGeneratedFrames; ++frameIndex)
+    {
+        if (params->additionalOutputs[frameIndex - 2].resource == nullptr)
+        {
+            return trace ? FFX_ERROR_INVALID_POINTER
+                         : logErrorWithCallback(FFX_ERROR_INVALID_POINTER, "dispatch requires an output resource for every generated frame", userMsgCallback);
+        }
+    }
 
     const FfxErrorCode errorCode = dispatchFrameInterpolation(context, params, trace);
     if (errorCode != FFX_OK && !trace)
@@ -2436,6 +2590,17 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatchDownsampleOfColourForFrameGene
 {
     FfxScopedLogSuppression suppression;
     return ffxFrameInterpolationDispatchDownsampleOfColour(context, commandList, currentColour);
+}
+
+FFX_API FfxErrorCode ffxFrameInterpolationGetInputTensorChannels(FfxFrameInterpolationContext* context, uint32_t* pChannels)
+{
+    if (!context || !pChannels)
+    {
+        return ffxLogError(FFX_ERROR_INVALID_POINTER, "input-tensor channel query requires a context and pChannels");
+    }
+    const auto* contextPrivate = reinterpret_cast<const FfxArmFrameInterpolationContext_Private*>(context);
+    *pChannels                 = contextPrivate->inputTensorChannels;
+    return FFX_OK;
 }
 
 FFX_API FfxErrorCode ffxFrameInterpolationGetRequiresOfColourDownsample(FfxFrameInterpolationContext* context, bool* pRequired)

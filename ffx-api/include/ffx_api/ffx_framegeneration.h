@@ -117,17 +117,42 @@ struct ffxApiCallbackDescFrameGenerationPresent
 /// @ingroup ffxFrameGeneration
 #define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION 0x00020003u
 
+/// Maximum number of frames NFRU can generate per rendered frame (multi-frame generation, 2x to 6x).
+/// @ingroup ffxFrameGeneration
+#define FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES 5u
+
 /// @ingroup ffxFrameGeneration
 struct ffxApiDispatchDescFrameGeneration
 {
     ffxDispatchDescHeader header;
-    void*                 commandList;         ///< The command list on which to register render commands.
-    struct FfxApiResource presentColor;        ///< The current presentation color, this will be used as source data.
-    struct FfxApiResource outputs[4];          ///< Destination targets (1 for each frame in numGeneratedFrames).
-    uint32_t              numGeneratedFrames;  ///< The number of frames to generate from the passed in color target.
+    void*                 commandList;   ///< The command list on which to register render commands.
+    struct FfxApiResource presentColor;  ///< The current presentation color, this will be used as source data.
+    struct FfxApiResource outputs
+        [4];  ///< Destination targets in presentation order: outputs[k-1] receives generated frame k (k = 1..min(numGeneratedFrames, 4)). Frame 5 goes in a chained ffxApiDispatchDescFrameGenerationExtraOutputs.
+    uint32_t
+        numGeneratedFrames;  ///< Number of frames to generate between the previous and the current rendered frame, in [1, FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES]. Frame k is generated at timestep t = k / (numGeneratedFrames + 1), where t = 0 is the previous rendered frame and t = 1 is presentColor.
     bool                  reset;               ///< A boolean value which when set to true, indicates the camera has moved discontinuously.
     uint64_t
         frameID;  ///< Identifier used to select internal resources when async support is enabled. Must increment by exactly one (1) for each frame. Any non-exactly-one difference will reset the frame generation logic.
+};
+
+/// Number of generated-frame outputs carried directly by ffxApiDispatchDescFrameGeneration::outputs.
+/// @ingroup ffxFrameGeneration
+#define FFX_API_FRAMEGENERATION_INLINE_OUTPUTS 4u
+
+/// @ingroup ffxFrameGeneration
+#define FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_EXTRA_OUTPUTS 0x0002000Au
+
+/// Outputs for generated frames beyond FFX_API_FRAMEGENERATION_INLINE_OUTPUTS, chained to
+/// ffxApiDispatchDescFrameGeneration::header.pNext. Keeps the upstream FFX API layout of the dispatch descriptor.
+/// Required when numGeneratedFrames == 5 (6x); ignored otherwise.
+/// @ingroup ffxFrameGeneration
+struct ffxApiDispatchDescFrameGenerationExtraOutputs
+{
+    ffxDispatchDescHeader header;
+    struct FfxApiResource
+        outputs[FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES -
+                FFX_API_FRAMEGENERATION_INLINE_OUTPUTS];  ///< outputs[i] receives generated frame FFX_API_FRAMEGENERATION_INLINE_OUTPUTS + 1 + i.
 };
 
 typedef ffxReturnCode_t (*FfxApiCallbackFrameGenerationPresentFunc)(ffxApiCallbackDescFrameGenerationPresent* params, void* pUserCtx);
@@ -196,6 +221,14 @@ struct ffxApiConfigureDescFrameGenerationKeyValue
     uint64_t               key;  ///< Configuration key, member of the FfxApiConfigureFrameGenerationKey enumeration.
     uint64_t               u64;  ///< Integer value or enum value to set.
     void*                  ptr;  ///< Pointer to set or pointer to value to set.
+};
+
+/// Keys accepted by ffxApiConfigureDescFrameGenerationKeyValue.
+/// @ingroup ffxFrameGeneration
+enum FfxApiConfigureFrameGenerationKey
+{
+    FFX_API_CONFIGURE_FG_KEY_NUM_GENERATED_FRAMES =
+        0x1000,  ///< u64: number of generated frames per rendered frame used by the frame-generation swapchain path, in [1, FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES]. Default 1. Ignored by the manual dispatch path, which uses ffxApiDispatchDescFrameGeneration::numGeneratedFrames.
 };
 
 /// @ingroup ffxFrameGeneration

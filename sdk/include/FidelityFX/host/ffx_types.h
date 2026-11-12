@@ -1598,11 +1598,17 @@ typedef struct FfxPresentCallbackDescription
 /// A structure describing the parameters to pass to frame generation passes.
 ///
 /// @ingroup SDKTypes
+/// Maximum number of generated frames per rendered frame (multi-frame generation).
+///
+/// @ingroup SDKTypes
+#define FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES 5
+
 typedef struct FfxFrameGenerationDispatchDescription
 {
-    FfxCommandList commandList;            ///< The command list on which to register render commands
-    FfxResource    presentColor;           ///< The current presentation color, this will be used as interpolation source data.
-    FfxResource    outputs[4];             ///< Interpolation destination targets (1 for each frame in numInterpolatedFrames)
+    FfxCommandList commandList;   ///< The command list on which to register render commands
+    FfxResource    presentColor;  ///< The current presentation color, this will be used as interpolation source data.
+    FfxResource    outputs
+        [FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES];  ///< Interpolation destination targets in presentation order (1 for each frame in numInterpolatedFrames)
     uint32_t       numInterpolatedFrames;  ///< The number of frames to interpolate from the passed in color target
     bool           reset;                  ///< A boolean value which when set to true, indicates the camera has moved discontinuously.
     uint64_t       frameID;

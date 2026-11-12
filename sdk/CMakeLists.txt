@@ -187,6 +187,16 @@ if(FFX_NSS OR FFX_ALL)
 endif()
 
 if(FFX_FI OR FFX_ALL)
+	# NFRU data graph compiled into the SDK. Point FFX_NFRU_DATA_GRAPH_FILE at another VGF with the same outputs
+	# (4-channel params + 1-channel gate at half lane) and a 16-channel input, or a 20-channel input with the
+	# multi-frame timestep features, to swap networks without code changes. The file stem must be a valid C identifier
+	# (it names the generated symbols). The quantization parameters come from the model-gym export metadata
+	# (<stem>_metadata.json next to the VGF unless FFX_NFRU_DATA_GRAPH_METADATA says otherwise).
+	set(FFX_NFRU_DATA_GRAPH_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/backends/vk/data_graphs/nfru/nfru_v2_0_0_int8.vgf"
+		CACHE FILEPATH "NFRU data graph (.vgf) compiled into the SDK")
+	set(FFX_NFRU_DATA_GRAPH_METADATA "" CACHE FILEPATH "NFRU data graph quantization metadata (.json); empty selects <vgf stem>_metadata.json")
+	include(${CMAKE_CURRENT_SOURCE_DIR}/src/components/frameinterpolation/NfruDataGraphSelection.cmake)
+
 	message(STATUS "Component FFX_FI=ON")
 	add_subdirectory(${FFX_COMPONENTS_PATH}/frameinterpolation)
 endif()

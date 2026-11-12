@@ -90,8 +90,13 @@ if (NOT ARM_FRAMEINTERPOLATION_DATA_GRAPH_EXT)
 endif()
 
 
-file(GLOB ARM_FRAMEINTERPOLATION_DATA_GRAPHS
-    "data_graphs/nfru/*.${ARM_FRAMEINTERPOLATION_DATA_GRAPH_EXT}")
+if (FFX_NFRU_DATA_GRAPH_FILE)
+    # Only the selected graph is compiled; see FFX_NFRU_DATA_GRAPH_FILE in the backend CMakeLists.
+    set(ARM_FRAMEINTERPOLATION_DATA_GRAPHS "${FFX_NFRU_DATA_GRAPH_FILE}")
+else()
+    file(GLOB ARM_FRAMEINTERPOLATION_DATA_GRAPHS
+        "data_graphs/nfru/*.${ARM_FRAMEINTERPOLATION_DATA_GRAPH_EXT}")
+endif()
 
 compile_data_graphs(
     "${VGF_PARSER_EXECUTABLE}"

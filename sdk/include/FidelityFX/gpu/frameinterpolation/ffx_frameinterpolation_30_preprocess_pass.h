@@ -81,7 +81,8 @@ void WriteToInputTensor(int32_t2     outputPixel,
                         FFX_MIN16_F3 rgb_m1_warp_t_flow,
                         FFX_MIN16_F3 rgb_p1_warp_t_flow,
                         FFX_MIN16_F2 dis_mask,
-                        float2       depth)
+                        float2       depth,
+                        FFX_MIN16_F2 mv_t_f30_m1)
 {
     InputTensorElement_t te;
 
@@ -91,6 +92,23 @@ void WriteToInputTensor(int32_t2     outputPixel,
     te.gbP1MV_rgM1OF = Quantize(FFX_MIN16_F4(rgb_p1_warp_t_mv.gb, rgb_m1_warp_t_flow.rg), QuantParamsSINT().xy);    //gbP1MV_rgM1OF
     te.bM1OF_rgbP1OF = Quantize(FFX_MIN16_F4(rgb_m1_warp_t_flow.b, rgb_p1_warp_t_flow.rgb), QuantParamsSINT().xy);  //bM1OF_rgbP1OF
     te.depth_disMask = Quantize(FFX_MIN16_F4(depth, dis_mask), QuantParamsSINT().xy);                               //depth_disMask
+
+    // Multi-frame graphs (20 input channels) add timestep features, quantized like the other channels:
+    //   16: t, 17: saturate(t * |mv| / 64), 18: saturate((1 - t) * |mv| / 64), 19: 0,
+    // where |mv| is the length of the warped game motion at t in MV/depth-lane pixels. 16-channel graphs never store
+    // this element (StoreInTensor checks the bound layout), so their tensor is unchanged.
+    if (InputTensorChannels() > FFX_FRAMEINTERPOLATION_IN_TENSOR_BASE_CHANNELS)
+    {
+        const FfxFloat32 t         = Timestep();
+        const FfxFloat32 mv_pixels = length(FfxFloat32x2(mv_t_f30_m1) * FfxFloat32x2(MvDepthLaneSize()));
+        const FfxFloat32 inv_range = 1.0f / 64.0f;
+        te.timestep_pad            = Quantize(FFX_MIN16_F4(t, ffxSaturate(t * mv_pixels * inv_range), ffxSaturate((1.0f - t) * mv_pixels * inv_range), 0.0f),
+                                   QuantParamsSINT().xy);  //t_mvT_mv1mT_0
+    }
+    else
+    {
+        te.timestep_pad = int8_t4(0);
+    }
 
     StoreInTensor(outputPixel, te);
 }
@@ -390,7 +408,7 @@ void preprocess(int32_t2 input_pixel)
     //-------------------------------------------------------------------------
     // 6) Write network tensor
     //-------------------------------------------------------------------------
-    WriteToInputTensor(tensor_pixel, rgb_m1_warp_t_mv, rgb_p1_warp_t_mv, rgb_m1_warp_t_flow, rgb_p1_warp_t_flow, dis_mask, depth);
+    WriteToInputTensor(tensor_pixel, rgb_m1_warp_t_mv, rgb_p1_warp_t_mv, rgb_m1_warp_t_flow, rgb_p1_warp_t_flow, dis_mask, depth, mv_t_f30_m1);
 }
 
 #endif

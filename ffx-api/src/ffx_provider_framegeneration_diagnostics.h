@@ -31,6 +31,7 @@ struct NfruLogContextInfo
     uint32_t                     frameGenerationFlags;
     bool                         usesInternalDepthHistory;
     bool                         fp16Supported;
+    uint32_t                     inputTensorChannels;  ///< 16 (original graph) or 20 (timestep channel)
 };
 
 struct NfruCpuProfile

@@ -57,9 +57,35 @@
 /// @ingroup ffxFrameGeneration
 #define FFX_FRAMEINTERPOLATION_CONTEXT_SIZE (FFX_SDK_DEFAULT_CONTEXT_SIZE)
 
+/// Maximum number of frames generated per rendered frame by one dispatch (multi-frame generation, 2x to 6x).
+///
+/// @ingroup ffxFrameGeneration
+#define FFX_FRAMEINTERPOLATION_MAX_GENERATED_FRAMES (FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES)
+
+/// Input-tensor channel count of the original NFRU v2 data graph (no timestep channel).
+///
+/// @ingroup ffxFrameGeneration
+#define FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_BASE (16)
+
+/// Input-tensor channel count of a multi-frame data graph that takes the interpolation timestep as channel 16
+/// (channels 16-19: t, saturate(t * |mv| / 64), saturate((1 - t) * |mv| / 64), 0 with |mv| in MV/depth-lane pixels).
+///
+/// @ingroup ffxFrameGeneration
+#define FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_TIMESTEP (20)
+
 #if defined(__cplusplus)
 extern "C" {
 #endif  // #if defined(__cplusplus)
+
+/// Interpolation timestep of generated frame <c>frameIndex</c> (1-based, presentation order) when
+/// <c>generatedFrameCount</c> frames are generated between the previous rendered frame (t = 0) and the
+/// current rendered frame (t = 1): t = frameIndex / (generatedFrameCount + 1). A single generated frame uses t = 0.5.
+///
+/// @ingroup ffxFrameGeneration
+static inline float ffxFrameInterpolationTimestep(uint32_t frameIndex, uint32_t generatedFrameCount)
+{
+    return (float)frameIndex / (float)(generatedFrameCount + 1u);
+}
 
 /// An enumeration of all the passes which constitute the FSR3 algorithm.
 ///
@@ -282,9 +308,20 @@ typedef struct FfxFrameInterpolationDispatchDescription
     uint64_t
         frameID;  ///< Identifier used to select internal resources when async support is enabled. Must increment by exactly one (1) for each frame. Any non-exactly-one difference will reset the frame generation logic.
 
+    uint32_t
+        numGeneratedFrames;  ///< Frames to generate in [1, FFX_FRAMEINTERPOLATION_MAX_GENERATED_FRAMES]; 0 is treated as 1. Frame k (1-based) is written to output (k = 1) or additionalOutputs[k - 2] at t = k / (numGeneratedFrames + 1).
+    FfxResource additionalOutputs[FFX_FRAMEINTERPOLATION_MAX_GENERATED_FRAMES -
+                                  1];  ///< Outputs for generated frames 2..numGeneratedFrames in presentation order; unused entries are ignored.
 } FfxFrameInterpolationDispatchDescription;
 
 FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext* context, const FfxFrameInterpolationDispatchDescription* params);
+
+/// Query the input-tensor channel count of the data graph selected at context creation.
+/// FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_BASE (16) selects the original layout;
+/// FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_TIMESTEP (20) adds the interpolation timestep as channel 16.
+///
+/// @ingroup ffxFrameGeneration
+FFX_API FfxErrorCode ffxFrameInterpolationGetInputTensorChannels(FfxFrameInterpolationContext* context, uint32_t* pChannels);
 
 /// Dispatch the OF colour downsample pass (pre-OF step for >1080p inputs).
 /// Must be called before optical flow dispatch when the resolution plan selects OF-colour downsampling.

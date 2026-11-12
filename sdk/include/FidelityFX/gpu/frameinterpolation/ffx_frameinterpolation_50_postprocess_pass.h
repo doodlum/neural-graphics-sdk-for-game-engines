@@ -95,6 +95,14 @@ void postprocess(int32_t2 output_pixel)
     //-------------------------------------------------------------------------
     // 4) Colour blending
     //-------------------------------------------------------------------------
+    // Multi-frame graphs (20 input channels): timestep logit prior favouring the candidate frame closer to t
+    // (order m1 MV, p1 MV, m1 flow, p1 flow). Softmax-invariant at t = 0.5; 16-channel graphs skip it.
+    if (InputTensorChannels() > FFX_FRAMEINTERPOLATION_IN_TENSOR_BASE_CHANNELS)
+    {
+        const FfxFloat32 log_m1 = log(1.0f - timestep);
+        const FfxFloat32 log_p1 = log(timestep);
+        params += FFX_MIN16_F4(log_m1, log_p1, log_m1, log_p1);
+    }
     params = Stable_Softmax(params);
 
     FFX_MIN16_F3 rgb_t = FFX_MIN16_F3(0.HF);

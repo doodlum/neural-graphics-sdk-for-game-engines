@@ -210,6 +210,7 @@ struct InternalFgContext
     FfxNfruResolutionPlan resolutionPlan;
     bool                  usesInternalDepthHistory;
     bool                  fp16Supported;
+    uint32_t              inputTensorChannels;
     FfxDimensions2D       opticalFlowSize;
 #if FFX_CAPTURE_ENABLED
     CaptureController* controller;
@@ -218,8 +219,13 @@ struct InternalFgContext
 
 static NfruLogContextInfo GetLogContextInfo(const InternalFgContext* context)
 {
-    return {
-        &context->resolutionPlan, context->opticalFlowSize, context->flags, context->frameGenFlags, context->usesInternalDepthHistory, context->fp16Supported};
+    return {&context->resolutionPlan,
+            context->opticalFlowSize,
+            context->flags,
+            context->frameGenFlags,
+            context->usesInternalDepthHistory,
+            context->fp16Supported,
+            context->inputTensorChannels};
 }
 
 static double elapsedMicroseconds(NfruCpuClock::time_point begin, NfruCpuClock::time_point end)
@@ -683,6 +689,8 @@ static ffxReturnCode_t CreateFgContextResources(InternalFgContext*              
                                                                      FFX_API_RETURN_ERROR_RUNTIME_ERROR);
     }
     owned.frameInterpolation = true;
+    internal_context->inputTensorChannels = FFX_FRAMEINTERPOLATION_INPUT_TENSOR_CHANNELS_BASE;
+    ffxFrameInterpolationGetInputTensorChannels(&internal_context->armFiContext, &internal_context->inputTensorChannels);
     internal_context->diagnostics.LogContextCreated(*desc, GetLogContextInfo(internal_context), ofGridSize);
     return FFX_API_RETURN_OK;
 }
@@ -845,10 +853,23 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Configure(ffxContext* context, cons
 
                 dispatchDesc.commandList        = desc->commandList;
                 dispatchDesc.numGeneratedFrames = desc->numInterpolatedFrames;
-                dispatchDesc.outputs[0]         = Convert(desc->outputs[0]);
-                dispatchDesc.outputs[1]         = Convert(desc->outputs[1]);
-                dispatchDesc.outputs[2]         = Convert(desc->outputs[2]);
-                dispatchDesc.outputs[3]         = Convert(desc->outputs[3]);
+                // Frames beyond the inline outputs travel in a chained extra-outputs descriptor (public layout unchanged).
+                ffx::DispatchDescFrameGenerationExtraOutputs extraOutputs{};
+                for (uint32_t outputIndex = 0; outputIndex < FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES; ++outputIndex)
+                {
+                    if (outputIndex < FFX_API_FRAMEGENERATION_INLINE_OUTPUTS)
+                    {
+                        dispatchDesc.outputs[outputIndex] = Convert(desc->outputs[outputIndex]);
+                    }
+                    else
+                    {
+                        extraOutputs.outputs[outputIndex - FFX_API_FRAMEGENERATION_INLINE_OUTPUTS] = Convert(desc->outputs[outputIndex]);
+                    }
+                }
+                if (desc->numInterpolatedFrames > FFX_API_FRAMEGENERATION_INLINE_OUTPUTS)
+                {
+                    dispatchDesc.header.pNext = &extraOutputs.header;
+                }
                 dispatchDesc.presentColor       = Convert(desc->presentColor);
                 dispatchDesc.reset              = desc->reset;
                 dispatchDesc.frameID            = desc->frameID;
@@ -1049,6 +1070,29 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Query(ffxContext* context, ffxQuery
     return FFX_API_RETURN_OK;
 }
 
+// Output of generated frame (outputIndex + 1): the first FFX_API_FRAMEGENERATION_INLINE_OUTPUTS come from the
+// dispatch descriptor, later ones from a chained ffxApiDispatchDescFrameGenerationExtraOutputs. Null when missing.
+static const FfxApiResource* GetGeneratedOutput(const ffxApiDispatchDescFrameGeneration& desc, uint32_t outputIndex)
+{
+    if (outputIndex < FFX_API_FRAMEGENERATION_INLINE_OUTPUTS)
+    {
+        return &desc.outputs[outputIndex];
+    }
+    if (outputIndex >= FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES)
+    {
+        return nullptr;
+    }
+    for (const ffxApiHeader* it = desc.header.pNext; it; it = it->pNext)
+    {
+        if (it->type == FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_EXTRA_OUTPUTS)
+        {
+            const auto* extra = reinterpret_cast<const ffxApiDispatchDescFrameGenerationExtraOutputs*>(it);
+            return &extra->outputs[outputIndex - FFX_API_FRAMEGENERATION_INLINE_OUTPUTS];
+        }
+    }
+    return nullptr;
+}
+
 static uint64_t getTM1Index(const uint64_t framIndex)
 {
     return 2 * framIndex - 2;
@@ -1129,13 +1173,58 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
                                                                  FFX_API_RETURN_ERROR_PARAMETER);
         }
 
-        const auto& presentColorDescription = desc->presentColor.description;
-        const auto& outputDescription       = desc->outputs[0].description;
-        if (desc->numGeneratedFrames > 0 &&
-            (presentColorDescription.width != outputDescription.width || presentColorDescription.height != outputDescription.height))
+        if (desc->numGeneratedFrames == 0 || desc->numGeneratedFrames > FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES)
         {
-            internal_context->diagnostics.LogFrameSizeMismatch(
-                desc->frameID, presentColorDescription.width, presentColorDescription.height, outputDescription.width, outputDescription.height);
+            char message[160];
+            snprintf(message,
+                     sizeof(message),
+                     "numGeneratedFrames is %u; NFRU generates 1 to %u frames per rendered frame (2x to %ux)",
+                     desc->numGeneratedFrames,
+                     FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES,
+                     FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES + 1);
+            return internal_context->diagnostics.LogRuntimeError(desc->frameID,
+                                                                 "dispatch",
+                                                                 "provider",
+                                                                 "dispatch_validation",
+                                                                 FFX_ERROR_INVALID_ARGUMENT,
+                                                                 "invalid_num_generated_frames",
+                                                                 message,
+                                                                 verbose,
+                                                                 FFX_API_RETURN_ERROR_PARAMETER);
+        }
+        for (uint32_t outputIndex = 0; outputIndex < desc->numGeneratedFrames; ++outputIndex)
+        {
+            const FfxApiResource* output = GetGeneratedOutput(*desc, outputIndex);
+            if (!output || !output->resource || output->description.type != FFX_API_RESOURCE_TYPE_TEXTURE2D)
+            {
+                char message[192];
+                snprintf(message,
+                         sizeof(message),
+                         outputIndex < FFX_API_FRAMEGENERATION_INLINE_OUTPUTS
+                             ? "dispatch requires a valid 2D resource in outputs[%u] for every generated frame"
+                             : "dispatch requires a chained ffxApiDispatchDescFrameGenerationExtraOutputs with a valid 2D resource for generated frame %u",
+                         outputIndex < FFX_API_FRAMEGENERATION_INLINE_OUTPUTS ? outputIndex : outputIndex + 1);
+                return internal_context->diagnostics.LogRuntimeError(desc->frameID,
+                                                                     "dispatch",
+                                                                     "provider",
+                                                                     "dispatch_validation",
+                                                                     FFX_ERROR_INVALID_ARGUMENT,
+                                                                     "invalid_output",
+                                                                     message,
+                                                                     verbose,
+                                                                     FFX_API_RETURN_ERROR_PARAMETER);
+            }
+        }
+
+        const auto& presentColorDescription = desc->presentColor.description;
+        for (uint32_t outputIndex = 0; outputIndex < desc->numGeneratedFrames; ++outputIndex)
+        {
+            const auto& outputDescription = GetGeneratedOutput(*desc, outputIndex)->description;
+            if (presentColorDescription.width != outputDescription.width || presentColorDescription.height != outputDescription.height)
+            {
+                internal_context->diagnostics.LogFrameSizeMismatch(
+                    desc->frameID, presentColorDescription.width, presentColorDescription.height, outputDescription.width, outputDescription.height);
+            }
         }
 
         const bool  firstDispatch        = !internal_context->runtimeState.hasDispatched;
@@ -1318,7 +1407,12 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Dispatch(ffxContext* context, const
             fiDispatchDesc.currentBackBuffer = Convert(desc->presentColor);
             fiDispatchDesc.reset             = effectiveReset || forceHistoryReset;
 
-            fiDispatchDesc.output            = Convert(desc->outputs[0]);
+            fiDispatchDesc.output             = Convert(desc->outputs[0]);
+            fiDispatchDesc.numGeneratedFrames = desc->numGeneratedFrames;
+            for (uint32_t frameIndex = 2; frameIndex <= desc->numGeneratedFrames; ++frameIndex)
+            {
+                fiDispatchDesc.additionalOutputs[frameIndex - 2] = Convert(*GetGeneratedOutput(*desc, frameIndex - 1));
+            }
             fiDispatchDesc.opticalFlowVector = internal_context->backendInterfaceShared.fpGetResource(
                 &internal_context->backendInterfaceShared, internal_context->sharedResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OPTICAL_FLOW_VECTOR]);
 

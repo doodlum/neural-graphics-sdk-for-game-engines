@@ -43,7 +43,18 @@ struct InputTensorElement_t
     int8_t4 gbP1MV_rgM1OF;  // rgb_p1_warp_t_mv.gb, rgb_m1_warp_t_flow.rg
     int8_t4 bM1OF_rgbP1OF;  // rgb_m1_warp_t_flow.b, rgb_p1_warp_t_flow.rgb
     int8_t4 depth_disMask;  // depth_m1_warp_t_mv_norm, depth_p1_warp_t_mv_norm, dis_mask_m1, dis_mask_p1
+    int8_t4 timestep_pad;   // 20-channel graphs only: t, t*|mv|/64, (1-t)*|mv|/64, 0 (quantized); not stored for 16-channel graphs
 };
+
+#define FFX_FRAMEINTERPOLATION_IN_TENSOR_BASE_CHANNELS 16
+
+#if !defined(FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION)
+// Passes without the constant buffer always write their outputs.
+FfxBoolean WriteHistory()
+{
+    return true;
+}
+#endif
 
 ///////////////////////////////////////////////
 // declare CBs and CB accessors
@@ -68,6 +79,7 @@ layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION,
     FfxFloat32x2 _MotionVectorScale;
     FfxFloat32x2 _JitterCancellation;
     FfxFloat32x3 _MvSimilarityThresholds;
+    FfxUInt32    _InputTensorChannels;  ///< 16, or 20 when the graph takes the timestep as channel 16 (packs after the vec3 in std140)
 
     FfxInt32x2 _InputTensorSize;
     FfxInt32   _Reset;
@@ -84,6 +96,7 @@ layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION,
     FfxFloat32x2 _OfInputSizeRcp;
     FfxFloat32   _DepthClipScale;
     FfxFloat32   _DepthClipPower;
+    FfxUInt32    _WriteHistory;  ///< 1 for the first generated frame of a dispatch; storage-image history writes are skipped otherwise
 }
 cbFI;
 
@@ -159,6 +172,26 @@ FfxBoolean Reset()
 FfxFloat32 Timestep()
 {
     return cbFI._Timestep;
+}
+
+FfxUInt32 InputTensorChannels()
+{
+    return cbFI._InputTensorChannels;
+}
+
+// Multi-frame generation repeats the warp and postprocess passes per generated frame. Their history outputs
+// (dynamic mask TP1, depth history, previous colour) do not depend on the timestep, so storage-image variants write
+// them only for the first generated frame. Render-target variants always write (an unwritten colour output would
+// leave the attachment undefined); the values written for later frames are identical.
+FfxBoolean WriteHistory()
+{
+    return cbFI._WriteHistory != 0;
+}
+
+// Input-tensor elements per pixel in int8x4 units (4 for 16 channels, 5 for 20 channels).
+FfxUInt32 InputTensorElementsPerPixel()
+{
+    return cbFI._InputTensorChannels > FFX_FRAMEINTERPOLATION_IN_TENSOR_BASE_CHANNELS ? 5u : 4u;
 }
 
 FfxUInt32 RandomSeed()
@@ -493,47 +526,37 @@ tensorVec_t LoadInTensorData3(FFX_PARAMETER_IN FfxUInt32x2 coord)
 #endif
 #else
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_IN_TENSOR)
+// Packed NHWC int8 tensor viewed as int8x4 groups: pixel p, channels [4g, 4g + 3] live at p * elementsPerPixel + g.
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_IN_TENSOR, std430) readonly buffer InputTensorBuffer_t
 {
-    InputTensorElement_t elementData[];
+    int8_t4 elementData[];
 }
 r_in_tensor;
 
 int8_t4 LoadInTensor(FFX_PARAMETER_IN FfxUInt32x2 coord, FFX_PARAMETER_IN FfxUInt32 channelOffset)
 {
-    FfxUInt32 idx = coord.y * InputTensorSize().x + coord.x;
-    if (channelOffset == 0)
-        return r_in_tensor.elementData[idx].rgbM1MV_rP1MV;
-    else if (channelOffset == 4)
-        return r_in_tensor.elementData[idx].gbP1MV_rgM1OF;
-    else if (channelOffset == 8)
-        return r_in_tensor.elementData[idx].bM1OF_rgbP1OF;
-    else  // channelOffset == 12
-        return r_in_tensor.elementData[idx].depth_disMask;
+    FfxUInt32 idx = (coord.y * InputTensorSize().x + coord.x) * InputTensorElementsPerPixel();
+    return r_in_tensor.elementData[idx + channelOffset / 4u];
 }
 
 int8_t4 LoadInTensorData0(FFX_PARAMETER_IN FfxUInt32x2 coord)
 {
-    FfxUInt32 idx = coord.y * InputTensorSize().x + coord.x;
-    return r_in_tensor.elementData[idx].rgbM1MV_rP1MV;
+    return LoadInTensor(coord, 0u);
 }
 
 int8_t4 LoadInTensorData1(FFX_PARAMETER_IN FfxUInt32x2 coord)
 {
-    FfxUInt32 idx = coord.y * InputTensorSize().x + coord.x;
-    return r_in_tensor.elementData[idx].gbP1MV_rgM1OF;
+    return LoadInTensor(coord, 4u);
 }
 
 int8_t4 LoadInTensorData2(FFX_PARAMETER_IN FfxUInt32x2 coord)
 {
-    FfxUInt32 idx = coord.y * InputTensorSize().x + coord.x;
-    return r_in_tensor.elementData[idx].bM1OF_rgbP1OF;
+    return LoadInTensor(coord, 8u);
 }
 
 int8_t4 LoadInTensorData3(FFX_PARAMETER_IN FfxUInt32x2 coord)
 {
-    FfxUInt32 idx = coord.y * InputTensorSize().x + coord.x;
-    return r_in_tensor.elementData[idx].depth_disMask;
+    return LoadInTensor(coord, 12u);
 }
 #endif
 #endif
@@ -672,7 +695,8 @@ void StoreDepthTm1(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_DEPTH_TM1_NEXT, r32f) uniform image2D rw_depth_tm1_next;
 void StoreDepthTm1Next(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat32 depth)
 {
-    imageStore(rw_depth_tm1_next, iPxPos, FfxFloat32x4(depth, 0.0f, 0.0f, 0.0f));
+    if (WriteHistory())
+        imageStore(rw_depth_tm1_next, iPxPos, FfxFloat32x4(depth, 0.0f, 0.0f, 0.0f));
 }
 #elif defined(FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_DEPTH_TM1_NEXT)
 layout(location = FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_DEPTH_TM1_NEXT) out highp FfxFloat32x4 rw_depth_tm1_next;
@@ -686,7 +710,8 @@ void StoreDepthTm1Next(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxF
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_DYNAMIC_MASK_TP1, r8) uniform highp image2D rw_dynamic_mask_tp1;
 void StoreDynamicMaskTp1(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat32 mask)
 {
-    imageStore(rw_dynamic_mask_tp1, iPxPos, FfxFloat32x4(mask, 0.0f, 0.0f, 1.0f));
+    if (WriteHistory())
+        imageStore(rw_dynamic_mask_tp1, iPxPos, FfxFloat32x4(mask, 0.0f, 0.0f, 1.0f));
 }
 #elif defined(FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_DYNAMIC_MASK_TP1)
 layout(location = FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_DYNAMIC_MASK_TP1) out highp FfxFloat32x4 rw_dynamic_mask_tp1;
@@ -789,20 +814,34 @@ void StoreInTensor(FFX_PARAMETER_IN FfxUInt32x2 coord, FFX_PARAMETER_IN InputTen
     };
 
     tensorWriteARM(rw_in_tensor, FfxUInt32[](0, coord.y, coord.x, 0), t0, tensorOperandsNonTemporalARM);
+
+    if (InputTensorChannels() > FFX_FRAMEINTERPOLATION_IN_TENSOR_BASE_CHANNELS)
+    {
+        int8_t t1[4] = {te.timestep_pad.x, te.timestep_pad.y, te.timestep_pad.z, te.timestep_pad.w};
+        tensorWriteARM(rw_in_tensor, FfxUInt32[](0, coord.y, coord.x, FFX_FRAMEINTERPOLATION_IN_TENSOR_BASE_CHANNELS), t1, tensorOperandsNonTemporalARM);
+    }
 }
 #endif
 #else
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_IN_TENSOR)
+// Packed NHWC int8 tensor viewed as int8x4 groups: pixel p, channels [4g, 4g + 3] live at p * elementsPerPixel + g.
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_IN_TENSOR, std430) writeonly buffer InputTensorBuffer_t
 {
-    InputTensorElement_t data[];
+    int8_t4 data[];
 }
 rw_in_tensor;
 
 void StoreInTensor(FFX_PARAMETER_IN FfxUInt32x2 coord, FFX_PARAMETER_IN InputTensorElement_t te)
 {
-    FfxUInt32 idx          = coord.y * InputTensorSize().x + coord.x;
-    rw_in_tensor.data[idx] = te;
+    FfxUInt32 idx              = (coord.y * InputTensorSize().x + coord.x) * InputTensorElementsPerPixel();
+    rw_in_tensor.data[idx + 0] = te.rgbM1MV_rP1MV;
+    rw_in_tensor.data[idx + 1] = te.gbP1MV_rgM1OF;
+    rw_in_tensor.data[idx + 2] = te.bM1OF_rgbP1OF;
+    rw_in_tensor.data[idx + 3] = te.depth_disMask;
+    if (InputTensorChannels() > FFX_FRAMEINTERPOLATION_IN_TENSOR_BASE_CHANNELS)
+    {
+        rw_in_tensor.data[idx + 4] = te.timestep_pad;
+    }
 }
 #endif
 #endif  //FFX_ARM_FRAMEINTERPOLATION_OPTION_ENABLE_DATA_GRAPH_FI
@@ -831,7 +870,8 @@ layout(set     = 0,
        OUTPUT_IMG_FORMAT) uniform image2D rw_previous_interpolation_source;
 void StorePreviousInterpolationSource(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FFX_MIN16_F4 val)
 {
-    imageStore(rw_previous_interpolation_source, iPxPos, val);
+    if (WriteHistory())
+        imageStore(rw_previous_interpolation_source, iPxPos, val);
 }
 #elif defined(FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_PREVIOUS_INTERPOLATION_SOURCE)
 layout(location = FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_PREVIOUS_INTERPOLATION_SOURCE) out mediump FfxFloat32x4 rw_previous_interpolation_source;
