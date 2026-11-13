@@ -138,6 +138,8 @@ For supported sample targets, fetch the sample dependencies before adding `--bui
 python build.py -t Debug -b vk_linux_x64 --build-samples --cmake-args="-DFFX_DEBUG=OFF"
 ```
 
+To compile a different NFRU network into the SDK (for example a retrained multi-frame-generation graph), pass `-DFFX_NFRU_DATA_GRAPH_FILE=path/to/<name>.vgf`; its quantization metadata is read from `<name>_metadata.json` next to it. See [NFRU - Selecting the data graph](NFRU/NFRU.md#selecting-the-data-graph).
+
 ## Docker builds
 
 Docker supports Linux x64, Linux Arm64, and Android Arm64 targets:

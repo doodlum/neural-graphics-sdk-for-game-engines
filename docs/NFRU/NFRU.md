@@ -7,7 +7,7 @@ replay constraints are documented in the [Dataset Capture guide](../Capture/Capt
 
 Neural Frame Rate Upscaling (NFRU) is a deep‑learning–based frame interpolation technique that increases delivered frame rate between consecutive rendered frames. It combines engine-provided motion vectors, optical-flow–derived correspondence fields, and a neural network to produce temporally consistent and visually smooth interpolated frames. NFRU operates with a known, fixed additional frame of latency, making pacing predictable in real-time graphics on mobile.
 
-> NFRU can be used on its own or alongside an upscaler (such as NSS). When paired with an upscaler, the application renders at a reduced `renderSize`, upscales to `displaySize`, and NFRU generates one additional interpolated frame per rendered frame. When used standalone, `renderSize` and `displaySize` are simply set equal. In both cases NFRU produces one additional interpolated frame per rendered frame.
+> NFRU can be used on its own or alongside an upscaler (such as NSS). When paired with an upscaler, the application renders at a reduced `renderSize`, upscales to `displaySize`, and NFRU generates one to five additional interpolated frames per rendered frame (2x to 6x, see [Multi-frame generation](#multi-frame-generation)). When used standalone, `renderSize` and `displaySize` are simply set equal.
 
 ## Table of Contents
 
@@ -34,6 +34,8 @@ Neural Frame Rate Upscaling (NFRU) is a deep‑learning–based frame interpolat
       - [Motion-vector artifacts](#motion-vector-artifacts)
       - [View-projection matrix and dynamic mask](#view-projection-matrix-and-dynamic-mask)
       - [Candidate alignment](#candidate-alignment)
+  - [Multi-frame generation](#multi-frame-generation)
+  - [Selecting the data graph](#selecting-the-data-graph)
   - [Internal Resolution Capping](#internal-resolution-capping)
   - [Limitations](#limitations)
   - [Presentation Pacing](#presentation-pacing)
@@ -145,7 +147,7 @@ for (uint64_t frameID = 0; running; ++frameID)
     ffx::Dispatch(m_FrameGenContext, dispatch);
 
     submitAndWaitForOutput();     // submit recorded work and synchronize before presentation
-    present(interpolatedFrame);   // generated frame; reset/first dispatch copies realFrame
+    present(interpolatedFrame);   // generated frame(s), outputs[0..N-1]; reset/first dispatch copies realFrame
     present(realFrame);           // rendered frame
 }
 
@@ -368,9 +370,9 @@ More details about [ffxApiDispatchDescFrameGeneration](../../ffx-api/include/ffx
 | `header.type` | Must be [`FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION`](../../ffx-api/include/ffx_api/ffx_framegeneration.h#L107). |
 | `commandList` | The command list on which to register frame generation commands. |
 | `presentColor` | The current frame's presentation color image, used as the source for frame generation. It is a display-resolution image, typically the swap chain image you are about to present. |
-| `outputs` | The destination image(s) that receive the generated frame(s), one entry per generated frame. With `numGeneratedFrames = 1`, only `outputs[0]` is used. Each output must be a display-resolution image matching `presentColor`'s format and coordinate system. |
-| `numGeneratedFrames` | The number of frames to generate from the passed-in color target. NFRU currently generates one interpolated frame per rendered frame, so this is `1`. |
-| `reset` | A boolean which, when true, indicates the camera moved discontinuously or the rendered scene changed. Set it on frames where interpolation against the previous frame is invalid (for example a camera teleport, a cut-scene cut, or the first frame after a level load); such frames are copied from the latest `presentColor` instead of being interpolated. |
+| `outputs` | The destination images that receive the generated frames in presentation order: `outputs[k-1]` receives generated frame k. With `numGeneratedFrames = 1`, only `outputs[0]` is used. For 6x (`numGeneratedFrames = 5`) the fifth output is passed in a chained `ffxApiDispatchDescFrameGenerationExtraOutputs`. Each output must be a display-resolution image matching `presentColor`'s format and coordinate system. |
+| `numGeneratedFrames` | The number of frames to generate between the previous and the current rendered frame, `1` to `FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES` (`5`). Frame k is generated at `t = k / (numGeneratedFrames + 1)`. `0` and values above 5 return `FFX_API_RETURN_ERROR_PARAMETER`. See [Multi-frame generation](#multi-frame-generation). |
+| `reset` | A boolean which, when true, indicates the camera moved discontinuously or the rendered scene changed. Set it on frames where interpolation against the previous frame is invalid (for example a camera teleport, a cut-scene cut, or the first frame after a level load); on such frames every output is a copy of the latest `presentColor` instead of an interpolation. |
 | `frameID` | Identifier used to select internal resources. Must increment by exactly 1 each frame; any other delta resets the frame generation logic. |
 
 ##### Resources
@@ -549,6 +551,93 @@ For dynamic-mask comparisons, see [Incorrect Dynamic Mask: View-Projection Matri
 
 For both-time-direction comparisons and expected alignment, see [Misaligned Candidate Frames](../integration_troubleshooting.md#misaligned-candidate-frames).
 
+## Multi-frame generation
+
+NFRU can generate 1 to 5 frames between two rendered frames (2x to 6x presented frame rate). The per-rendered-frame work (optical flow, colour/depth downsamples, histories) runs once; only the timestep-dependent passes repeat for every generated frame.
+
+### API usage
+
+Set `numGeneratedFrames` to N and supply one output per generated frame, in presentation order. Frames 1 to 4 use the inline `outputs` array; for 6x, chain an `ffxApiDispatchDescFrameGenerationExtraOutputs` for frame 5 (the dispatch descriptor keeps the upstream FFX API layout):
+
+```cpp
+ffx::DispatchDescFrameGeneration dispatch{};
+dispatch.commandList        = commandBuffer;
+dispatch.presentColor       = presentColor;
+dispatch.numGeneratedFrames = N;                       // 1..5
+for (uint32_t k = 0; k < std::min(N, 4u); ++k)
+    dispatch.outputs[k] = generated[k];                // frame k + 1, t = (k + 1) / (N + 1)
+dispatch.reset   = reset;
+dispatch.frameID = frameID;
+
+ffx::DispatchDescFrameGenerationExtraOutputs extra{};  // only needed for N == 5
+extra.outputs[0] = generated[4];
+
+ffx::ReturnCode rc = (N == 5) ? ffx::Dispatch(context, dispatch, extra) : ffx::Dispatch(context, dispatch);
+```
+
+`numGeneratedFrames` of 0 or above 5, or a missing output, returns `FFX_API_RETURN_ERROR_PARAMETER` without recording GPU work; the prepared frame stays dispatchable. On reset, the first dispatch, or a frame-ID discontinuity, every output is a copy of `presentColor`. `FFX_API_FG_DISPATCH_FLAG_DRAW_DEBUG_VIEW` draws the debug view of each timestep into its output. With `FFX_API_FG_DISPATCH_FLAG_ENABLE_DEBUG_CHECKING`, each dispatch logs `event=dispatch_timesteps generated_frames=N multiplier=Mx input_tensor_channels=C timesteps=...`. Dataset capture records `outputs[0]` only.
+
+The frame-generation swapchain path reads the count from `ffxApiConfigureDescFrameGenerationKeyValue` with key `FFX_API_CONFIGURE_FG_KEY_NUM_GENERATED_FRAMES` (applied with the next `ffxConfigure` of `ffxApiConfigureDescFrameGeneration`); it is ignored by the manual dispatch path (`FFX_API_FG_DISPATCH_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY`). Application-recorded interpolation command lists on the swapchain path still produce one frame.
+
+### Timestep convention
+
+Generated frame k (1-based, presentation order) of N is produced at `t_k = k / (N + 1)`, where `t = 0` is the previous rendered frame (TM1) and `t = 1` is the current rendered frame (`presentColor`, TP1). The warps use `uv_m1 = uv + mv * t` and `uv_p1 = uv - mv * (1 - t)` for the backward game motion `mv` (current to previous). N = 1 uses `t = 0.5` and is bit-identical to the single-frame path; frame `(N + 1) / 2` of an odd N also uses `t = 0.5` and produces the same image as N = 1. `ffxFrameInterpolationTimestep(k, N)` returns the value used by the SDK.
+
+| N (multiplier) | Timesteps |
+|---|---|
+| 1 (2x) | 0.5 |
+| 2 (3x) | 0.333, 0.667 |
+| 3 (4x) | 0.25, 0.5, 0.75 |
+| 4 (5x) | 0.2, 0.4, 0.6, 0.8 |
+| 5 (6x) | 0.167, 0.333, 0.5, 0.667, 0.833 |
+
+### Passes per rendered frame and per generated frame
+
+| Runs | Passes |
+|---|---|
+| Once per rendered frame | optical flow (and its OF-colour downsample), pre-warp all-input or colour downsample, warp-input binding, colour/depth/dynamic-mask history ping-pong |
+| Once per generated frame | 00 init warp (clears the scatter targets), 10 MV/depth scatter to t, 11 flow scatter to t, 21 fill holes, 30 preprocess, 31 inpaint pyramid (seed + 4 mips), data graph, 50 inpaint resolve, 50 postprocess into output k, optional debug view |
+
+Pass 10 also produces the dynamic mask TP1 and the depth history, and the postprocess produces the previous-colour history. These do not depend on t; compute variants write them for the first generated frame only, while fragment variants (render targets) rewrite identical values. Each timestep stages its own constant block, and the jobs of each timestep are recorded before the next timestep is scheduled, so a 6x dispatch stays within the backend job limit. The backend adds a barrier for every resource of every job, which orders the reuse of the intermediate images between timesteps.
+
+### Cost model
+
+Let `F` be the per-rendered-frame cost (optical flow, downsamples) and `C` the per-generated-frame cost (the passes above at the preprocess lane, plus the display-resolution postprocess). A dispatch costs about `F + N * C`, so every extra generated frame adds `C`. `C` is dominated by the data graph on the preprocess/tensor lane and the display-resolution postprocess. The 540p lane cap bounds the network cost: at the Steam Deck class `1280x800` with full-size MV/depth, the preprocess lane is capped to `864x540` (tensor `864x544`, params `432x272`, flow lane `320x200`), and because both ratios stay below 1.5x the no-downsample topology is used (no pre-warp downsample pass). A smaller `mvDepthSize` (below 540 lines) shrinks the lane further and reduces `C` proportionally. Measured numbers are in the table below.
+
+Measured with `nfru_mfg.gpu_benchmark_cost_per_generated_frame` (`NFRU_MFG_BENCHMARK=1`): 1280x800 display and MV/depth, default fragment path, Windows, RTX 4070 through the ML emulation layer v0.11.0 (the data graph and optical flow are emulated in compute shaders), wall-clock prepare + dispatch + submit + wait, median of 10 frames:
+
+| N (multiplier) | Median time per rendered frame |
+|---|---|
+| 1 (2x) | 5.7 ms |
+| 2 (3x) | 11.7 ms |
+| 3 (4x) | 16.8 ms |
+| 4 (5x) | 19.6 ms |
+| 5 (6x) | 24.0 ms |
+
+A linear fit gives `F` of about 2.2 ms and `C` of about 4.5 ms per generated frame. Absolute numbers depend on the device and on native versus emulated ML extensions; re-measure on the target. The ratio is the useful part: the per-rendered-frame work is a small fraction, so the cost grows almost linearly with N.
+
+### Debug capture and parity dumps
+
+`ffxApiConfigureDescFrameGenerationKeyValue` with key `FFX_API_CONFIGURE_FG_KEY_DEBUG_CAPTURE` and `ptr` pointing to an `ffxApiFrameGenerationDebugCapture` copies, for every generated frame, the warped motion (QMVD), the filled warped optical flow, the network input tensor, the params and gate outputs and the inpaint result into caller-owned buffers, plus the dynamic-mask, depth and colour histories once per dispatch (`ptr = nullptr` disables it). The layouts are listed with `FfxFrameInterpolationDebugCapture` in `ffx_frameinterpolation.h`; the input tensor needs `FFX_NFRU_DEBUG_CAPTURE_TENSORS=1` in the environment at context creation. `tools/nfru_mfg_dump` replays a model-gym sequence through the SDK for N = 1..5 with this capture and checks the results; see its README.
+
+### Pacing guidance
+
+Present the N generated frames and then the real frame, spaced evenly over the rendered-frame interval (see [Presentation Pacing](#presentation-pacing)). Latency stays one rendered frame for any N. Choose N so that `(F + N * C)` plus the game's own GPU work fits the rendered-frame budget and `(N + 1) x` rendered rate does not exceed the display refresh rate; a 6x multiplier only helps when the base rate is low (for example 20-30 fps rendered on a 90-144 Hz panel) and the GPU has the headroom. On Steam Deck class hardware at `<= 1280x800` the 540p internal lane cap applies, so the per-generated-frame network cost is bounded by an `864x540` lane whatever the render resolution; the display-resolution postprocess (one full-screen pass per generated frame) is the part that scales with `displaySize`. A reduced `mvDepthSize` (for example `640x400`) lowers `C` further at some quality cost.
+
+## Selecting the data graph
+
+The data graph compiled into the SDK is selected at CMake configure time:
+
+```bash
+python build.py -t Release -b vk_linux_x64 --cmake-args="-DFFX_NFRU_DATA_GRAPH_FILE=/path/to/nfru_mfg_int8.vgf"
+```
+
+The file stem names the generated symbols and must be a C identifier. The quantization parameters (input `x`, params output `getitem`, gate output `getitem_1`, SINT and SNORM scale/zero point) are read from the model-gym export metadata `<stem>_metadata.json` next to the VGF, or from `FFX_NFRU_DATA_GRAPH_METADATA`. The default is `sdk/src/backends/vk/data_graphs/nfru/nfru_v2_0_0_int8.vgf`.
+
+The outputs must match the v2 graph (4-channel params and 1-channel gate at half lane). The input-tensor layout is chosen from the graph's input channel count at context creation (`ffxFrameInterpolationGetInputTensorChannels`):
+
+- **16 channels:** the original NFRU v2 layout.
+- **20 channels:** channels 0-15 unchanged, then `t`, `saturate(t * |mv| / 64)`, `saturate((1 - t) * |mv| / 64)` and `0`, where `|mv|` is the length of the warped game motion at t in MV/depth-lane pixels; all quantized with the input SINT parameters like the other channels. The postprocess also adds a timestep logit prior `(log(1 - t), log(t), log(1 - t), log(t))` to the dequantized blend parameters (m1 MV, p1 MV, m1 flow, p1 flow) before the softmax; the prior is softmax-invariant at `t = 0.5`.
 ## Internal Resolution Capping
 
 NFRU derives a fixed set of internal lanes at context creation to bound bandwidth and compute cost. Applications do not configure these lanes manually; they follow `displaySize`, the resolved `mvDepthSize` (`renderSize` when omitted), and the required optical-flow grid:
@@ -589,14 +678,16 @@ Implementation note: samplerless integer fetches in the warp, preprocess, and po
 
 ## Presentation Pacing
 
-NFRU generates one interpolated frame per rendered frame, adding a fixed latency of one frame. The SDK only produces the interpolated image; **how the rendered and generated frames are submitted to the swap chain and timed is entirely the application's responsibility**.
+NFRU generates one to five interpolated frames per rendered frame, adding a fixed latency of one rendered frame. The SDK only produces the interpolated image; **how the rendered and generated frames are submitted to the swap chain and timed is entirely the application's responsibility**.
 
 A typical presentation sequence:
 
 1. Render frame N (optionally upscaling to display resolution with NSS or another upscaler).
 2. Call `ffxDispatch` (prepare + dispatch); NFRU generates the interpolated frame for N.
-3. Present frame N-interpolated first (earlier presentation time).
-4. Present frame N (real frame, later presentation time).
+3. Present the generated frames first, in `outputs` order (earlier presentation times).
+4. Present frame N (real frame, latest presentation time).
+
+With M = `numGeneratedFrames + 1` presents per rendered frame, space them evenly over one rendered-frame interval: present generated frame k at `T_prev + k * (T_cur - T_prev) / M` and the real frame at `T_cur`, where `T_prev` / `T_cur` are the presentation times of the previous and current real frames.
 
 On the first dispatch, an explicit reset, or a skipped/decreasing frame ID,
 the generated output is a copy of the current frame rather than an
