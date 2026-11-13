@@ -80,6 +80,9 @@ namespace unit_test::vk
     bool ClearImage(VulkanContext& context, Image& image, const std::array<float, 4>& clearColor, std::string* errorMessage);
     bool RenderTriangle(VulkanContext& context, Image& image, std::string* errorMessage);
     bool ReadbackRgba8Image(VulkanContext& context, Image& image, std::vector<uint8_t>& rgbaData, std::string* errorMessage);
+    /// Upload tightly packed texel data to mip 0 and leave the image in finalLayout.
+    bool UploadImage(VulkanContext& context, Image& image, const void* data, VkDeviceSize byteSize, VkImageLayout finalLayout, std::string* errorMessage);
+    bool TransitionImageLayout(VulkanContext& context, Image& image, VkImageLayout newLayout, std::string* errorMessage);
 
     ffxCreateBackendVKDesc BuildBackendDesc(const VulkanContext& context);
     FfxApiResource         MakeApiImageResource(const Image& image, uint32_t additionalUsage, uint32_t state);

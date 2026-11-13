@@ -1353,6 +1353,61 @@ namespace unit_test::vk
         return true;
     }
 
+    bool UploadImage(VulkanContext& context, Image& image, const void* data, VkDeviceSize byteSize, VkImageLayout finalLayout, std::string* errorMessage)
+    {
+        Buffer stagingBuffer{};
+        if (!CreateBuffer(context,
+                          byteSize,
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          stagingBuffer,
+                          errorMessage))
+        {
+            return false;
+        }
+        void* mapped = nullptr;
+        if (vkMapMemory(context.device, stagingBuffer.memory, 0, byteSize, 0, &mapped) != VK_SUCCESS)
+        {
+            SetError(errorMessage, "vkMapMemory failed for upload buffer");
+            DestroyBuffer(context, stagingBuffer);
+            return false;
+        }
+        std::memcpy(mapped, data, static_cast<size_t>(byteSize));
+        vkUnmapMemory(context.device, stagingBuffer.memory);
+
+        const VkImageAspectFlags aspectMask = GetImageAspectMask(image.createInfo.format);
+        const bool               ok         = RunOneTimeCommands(
+            context,
+            [&](VkCommandBuffer commandBuffer) {
+                TransitionImage(commandBuffer, image.image, aspectMask, image.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                VkBufferImageCopy copyRegion{};
+                copyRegion.imageSubresource.aspectMask = aspectMask;
+                copyRegion.imageSubresource.layerCount = 1;
+                copyRegion.imageExtent                 = {image.createInfo.extent.width, image.createInfo.extent.height, 1};
+                vkCmdCopyBufferToImage(commandBuffer, stagingBuffer.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+                TransitionImage(commandBuffer, image.image, aspectMask, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, finalLayout);
+            },
+            errorMessage);
+        DestroyBuffer(context, stagingBuffer);
+        if (ok)
+        {
+            image.layout = finalLayout;
+        }
+        return ok;
+    }
+
+    bool TransitionImageLayout(VulkanContext& context, Image& image, VkImageLayout newLayout, std::string* errorMessage)
+    {
+        const VkImageAspectFlags aspectMask = GetImageAspectMask(image.createInfo.format);
+        const bool               ok         = RunOneTimeCommands(
+            context, [&](VkCommandBuffer commandBuffer) { TransitionImage(commandBuffer, image.image, aspectMask, image.layout, newLayout); }, errorMessage);
+        if (ok)
+        {
+            image.layout = newLayout;
+        }
+        return ok;
+    }
+
     ffxCreateBackendVKDesc BuildBackendDesc(const VulkanContext& context)
     {
         ffxCreateBackendVKDesc backendDesc{};

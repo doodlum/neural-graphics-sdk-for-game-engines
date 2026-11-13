@@ -88,7 +88,7 @@ namespace
         uint32_t displayHeight = 192;
         uint32_t renderWidth   = 96;  // render / MV / depth
         uint32_t renderHeight  = 96;
-        bool     readback    = true;
+        bool     readback      = true;
     };
 
     bool RunMfgScene(uint32_t generatedFrames, uint32_t extraFlags, uint32_t frameCount, MfgSceneResult& result, MfgSceneOptions options = {})
@@ -305,18 +305,33 @@ namespace
 // with an SDK build that predates multi-frame generation; N = 1 must stay bit-identical.
 UNIT_TEST_CASE(nfru_mfg, gpu_single_frame_reference_hash)
 {
-    MfgSceneResult result;
-    if (!RunMfgScene(1, 0, 3, result))
+    struct Variant
     {
-        UNIT_TEST_FAIL(result.message);
-    }
-    for (size_t frame = 0; frame < result.outputs.size(); ++frame)
+        const char*     name;
+        uint32_t        flags;
+        MfgSceneOptions options;
+    };
+    // Default fragment path, all-compute path, and the capped 2160p display (all-input downsample topology).
+    const Variant variants[] = {
+        {"fragment_192", 0, {}},
+        {"compute_192", FFX_API_FG_CONTEXT_FLAG_ALL_STAGES_COMPUTE, {}},
+        {"fragment_128x2160", 0, {128, 2160, 64, 1080, true}},
+    };
+    for (const Variant& variant : variants)
     {
-        std::printf("NFRU_MFG_REFERENCE frame=%zu k=1 hash=0x%016" PRIx64 "\n", frame + 1, Fnv1a(result.outputs[frame][0]));
+        MfgSceneResult result;
+        if (!RunMfgScene(1, variant.flags, 3, result, variant.options))
+        {
+            UNIT_TEST_FAIL(std::string(variant.name) + ": " + result.message);
+        }
+        for (size_t frame = 0; frame < result.outputs.size(); ++frame)
+        {
+            std::printf("NFRU_MFG_REFERENCE variant=%s frame=%zu k=1 hash=0x%016" PRIx64 "\n", variant.name, frame + 1, Fnv1a(result.outputs[frame][0]));
+        }
+        UNIT_TEST_CHECK(result.outputs.size() == 3);
+        UNIT_TEST_CHECK(result.outputs[0][0] == result.presentColor);
+        UNIT_TEST_CHECK(HasNonClearPixel(result.outputs[2][0]));
     }
-    UNIT_TEST_CHECK(result.outputs.size() == 3);
-    UNIT_TEST_CHECK(result.outputs[0][0] == result.presentColor);
-    UNIT_TEST_CHECK(HasNonClearPixel(result.outputs[2][0]));
     return true;
 }
 
@@ -717,11 +732,11 @@ UNIT_TEST_CASE(nfru_mfg, gpu_benchmark_cost_per_generated_frame)
     }
     // Steam Deck panel resolution; the 540p internal lane cap applies (preprocess lane 864x540).
     MfgSceneOptions options{};
-    options.displayWidth  = 1280;
-    options.displayHeight = 800;
-    options.renderWidth   = 1280;
-    options.renderHeight  = 800;
-    options.readback    = false;
+    options.displayWidth                                             = 1280;
+    options.displayHeight                                            = 800;
+    options.renderWidth                                              = 1280;
+    options.renderHeight                                             = 800;
+    options.readback                                                 = false;
     double medians[FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES + 1] = {};
     for (uint32_t generated = 1; generated <= FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES; ++generated)
     {
@@ -733,7 +748,8 @@ UNIT_TEST_CASE(nfru_mfg, gpu_benchmark_cost_per_generated_frame)
         std::vector<double> steady(result.frameMilliseconds.begin() + 2, result.frameMilliseconds.end());
         std::sort(steady.begin(), steady.end());
         medians[generated] = steady[steady.size() / 2];
-        std::printf("NFRU_MFG_BENCH size=1280x800 N=%u multiplier=%ux median_ms=%.3f min_ms=%.3f\n", generated, generated + 1, medians[generated], steady.front());
+        std::printf(
+            "NFRU_MFG_BENCH size=1280x800 N=%u multiplier=%ux median_ms=%.3f min_ms=%.3f\n", generated, generated + 1, medians[generated], steady.front());
     }
     // Least-squares fit T(N) = F + N * C over N = 1..5.
     double sumN = 0, sumT = 0, sumNN = 0, sumNT = 0;
