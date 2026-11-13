@@ -131,13 +131,28 @@ class NFRUSample : public vkb::VulkanSampleC
 	/// Make transfer writes visible, then transition all dataset inputs to shader-read layout.
 	void finish_upload_inputs(vkb::core::CommandBufferC &command_buffer, FrameInputs &inputs);
 
-	// NFRU output is not history, so one image is sufficient.
-	ImageResource nfru_output;
-	void          create_nfru_output(VkExtent2D extent);
-	/// Wait for previous consumers, then transition the output to the NFRU write layout.
+	// NFRU outputs are not history, so one image per generated frame is sufficient.
+	// nfru_outputs[k - 1] receives generated frame k (presentation order, t = k / (N + 1)).
+	std::vector<ImageResource> nfru_outputs;
+	VkExtent2D                 nfru_output_extent{};
+	void                       create_nfru_output(VkExtent2D extent);
+	/// Wait for previous consumers, then transition the outputs to the NFRU write layout.
 	void prepare_output(vkb::core::CommandBufferC &command_buffer);
 	/// Publish NFRU writes for display or generated-output readback.
 	void finish_output(vkb::core::CommandBufferC &command_buffer);
+	/// Output shown on screen: the GUI-selected generated frame.
+	const vkb::core::ImageView *displayed_output() const;
+
+	// Multi-frame generation: multiplier M = 2..6 generates N = M - 1 frames per rendered frame.
+	uint32_t nfru_multiplier{2};
+	uint32_t pending_nfru_multiplier{2};
+	uint32_t displayed_generated_frame{1};        ///< 1..N
+	uint32_t generated_frame_count() const
+	{
+		return nfru_multiplier - 1;
+	}
+	/// Recreate outputs and readback buffers after a multiplier change (waits for the device to idle).
+	void apply_pending_multiplier();
 
 	// NFRU context and dispatch
 	ffx::Context nfru_context = nullptr;
@@ -198,7 +213,9 @@ class NFRUSample : public vkb::VulkanSampleC
 	// EXR readback and save
 	struct ReadbackSlot
 	{
-		std::unique_ptr<vkb::core::BufferC> buffer;
+		// One buffer per generated frame (index k - 1); ground-truth readback uses buffers[0].
+		std::vector<std::unique_ptr<vkb::core::BufferC>> buffers;
+		uint32_t                                         buffer_count{1};
 		bool                                need_save{false};
 		uint64_t                            frame_number{0};
 		std::string                         output_dir;

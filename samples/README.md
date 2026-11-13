@@ -253,12 +253,14 @@ adb shell am start-activity \
 |---|---|---|---|
 | `NFRU_DATASET_DIR` | Dataset root directory. Providing this argument enables dataset mode. | Not set | `--app-arg NFRU_DATASET_DIR=path\to\dataset` |
 | `NFRU_DATASET_SEQUENCE` | Dataset sequence identifier. | `0000` | `--app-arg NFRU_DATASET_SEQUENCE=0000` |
-| `NFRU_SAVE_EXR` | Save generated frames. In realtime mode, generated frames are written to `result/nfru/interpolated/` and reference frames to `result/nfru/ground_truth/`. In dataset mode, interpolated frames are written to `<dataset>/result/nfru_x2/<sequence>/`. Realtime saving is disabled on Android. | `0` | `--app-arg NFRU_SAVE_EXR=1` |
+| `NFRU_SAVE_EXR` | Save generated frames. In realtime mode, generated frames are written to `result/nfru/interpolated/` and reference frames to `result/nfru/ground_truth/`. In dataset mode, interpolated frames are written to `<dataset>/result/nfru_x<multiplier>/<sequence>/` (`<frame>.exr` at 2x, `<frame>_<k>.exr` for generated frame k at 3x-6x). Realtime saving supports 2x only and is disabled on Android. | `0` | `--app-arg NFRU_SAVE_EXR=1` |
 | `NFRU_ORBIT_SPEED` | Realtime camera rotation speed in degrees per frame, in `[0, 10]`. | `0.5` | `--app-arg NFRU_ORBIT_SPEED=2` |
 | `NFRU_USE_FRAGMENT` | Selectable-stage path: `0`=compute, `1`=fragment. Fixed downsample stages remain fragment. | `1` | `--app-arg NFRU_USE_FRAGMENT=0` |
 | `NFRU_ENABLE_MV_HINTS` | Enable optical-flow motion vector hints: `0`=disabled, `1`=enabled. | `0` | `--app-arg NFRU_ENABLE_MV_HINTS=1` |
 | `NFRU_DEBUG_VIEW` | Enable the NFRU debug view at startup: `0`=disabled, `1`=enabled. | `0` | `--app-arg NFRU_DEBUG_VIEW=1` |
 | `NFRU_DEBUG_CHECKING` | Enable verbose per-frame NFRU runtime logs: `0`=disabled, `1`=enabled. | `0` | `--app-arg NFRU_DEBUG_CHECKING=1` |
+| `NFRU_MULTIPLIER` | Multi-frame generation: presented frames per rendered frame, `2`-`6` (generates `multiplier - 1` frames at `t = k / multiplier`). Also adjustable in the UI unless EXR saving is enabled. | `2` | `--app-arg NFRU_MULTIPLIER=4` |
+| `NFRU_DISPLAY_FRAME` | Generated frame shown on screen, `1`..`multiplier - 1` (the sample shows one generated frame per rendered frame; it does not pace multiple presents). | `1` | `--app-arg NFRU_DISPLAY_FRAME=2` |
 | `NFRU_MANAGE_HISTORY` | History ownership: `0`=the sample supplies previous color and depth, `1`=the SDK manages history. | `1` | `--app-arg NFRU_MANAGE_HISTORY=0` |
 
 Multiple arguments can be combined with commas:

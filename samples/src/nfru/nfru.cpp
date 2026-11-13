@@ -119,6 +119,8 @@ bool NFRUSample::prepare(const vkb::ApplicationOptions &options)
 	//   NFRU_ENABLE_MV_HINTS  : 0 or 1, use motion vector hints for optical flow
 	//   NFRU_DEBUG_VIEW       : 0 or 1, enable NFRU debug view
 	//   NFRU_DEBUG_CHECKING   : 0 or 1, enable verbose per-frame NFRU runtime logs
+	//   NFRU_MULTIPLIER       : 2..6, presented frames per rendered frame (generates multiplier - 1 frames)
+	//   NFRU_DISPLAY_FRAME    : 1..multiplier-1, generated frame shown on screen (default 1)
 	vkb::AppArgumentReader args{options.app_arguments};
 
 	const std::string dataset_dir_arg = args.get_string("NFRU_DATASET_DIR");
@@ -131,6 +133,22 @@ bool NFRUSample::prepare(const vkb::ApplicationOptions &options)
 	enable_mv_hints          = args.get_bool("NFRU_ENABLE_MV_HINTS", enable_mv_hints);
 	nfru_debug_view          = args.get_bool("NFRU_DEBUG_VIEW", nfru_debug_view);
 	nfru_debug_checking      = args.get_bool("NFRU_DEBUG_CHECKING", nfru_debug_checking);
+	nfru_multiplier          = static_cast<uint32_t>(args.get_int("NFRU_MULTIPLIER", static_cast<int>(nfru_multiplier), 2,
+	                                                               static_cast<int>(FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES) + 1));
+	if (mode == Mode::Realtime && save_exr_enabled && nfru_multiplier != 2)
+	{
+		// Realtime EXR capture renders every other frame as ground truth, which only matches 2x.
+		LOGW("NFRU_SAVE_EXR in realtime mode supports 2x only; using 2x.");
+		nfru_multiplier = 2;
+	}
+	pending_nfru_multiplier   = nfru_multiplier;
+	displayed_generated_frame = static_cast<uint32_t>(args.get_int("NFRU_DISPLAY_FRAME", 1, 1, static_cast<int>(generated_frame_count())));
+	{
+		std::string timesteps;
+		for (uint32_t k = 1; k <= generated_frame_count(); ++k)
+			timesteps += (k > 1 ? "," : "") + std::to_string(static_cast<float>(k) / static_cast<float>(nfru_multiplier));
+		LOGI("NFRU multi-frame generation: multiplier={}x generated_frames={} timesteps={}", nfru_multiplier, generated_frame_count(), timesteps);
+	}
 
 #if defined(__ANDROID__)
 	if (mode == Mode::Realtime)
@@ -195,7 +213,7 @@ bool NFRUSample::prepare(const vkb::ApplicationOptions &options)
 		create_nfru_output(dataset_display_size);
 
 		// Dataset output goes into the dataset directory
-		interp_output_dir = dataset_dir + "/result/nfru_x2/" + dataset_sequence;
+		interp_output_dir = dataset_dir + "/result/nfru_x" + std::to_string(nfru_multiplier) + "/" + dataset_sequence;
 
 		// Readback buffers (used only when save_exr_enabled)
 		if (save_exr_enabled)
@@ -384,10 +402,39 @@ void NFRUSample::create_nfru_output(VkExtent2D extent)
 	if (save_exr_enabled)
 		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
-	nfru_output.image = std::make_unique<vkb::core::Image>(
-	    get_device(), ext3d, VK_FORMAT_R8G8B8A8_UNORM, usage, VMA_MEMORY_USAGE_GPU_ONLY);
-	nfru_output.image->set_debug_name("NFRU Output");
-	nfru_output.view = std::make_unique<vkb::core::ImageView>(*nfru_output.image, VK_IMAGE_VIEW_TYPE_2D);
+	nfru_output_extent = extent;
+	nfru_outputs.clear();
+	nfru_outputs.resize(generated_frame_count());
+	for (uint32_t k = 0; k < generated_frame_count(); ++k)
+	{
+		ImageResource &output = nfru_outputs[k];
+		output.image          = std::make_unique<vkb::core::Image>(
+            get_device(), ext3d, VK_FORMAT_R8G8B8A8_UNORM, usage, VMA_MEMORY_USAGE_GPU_ONLY);
+		output.image->set_debug_name("NFRU Output " + std::to_string(k + 1));
+		output.view = std::make_unique<vkb::core::ImageView>(*output.image, VK_IMAGE_VIEW_TYPE_2D);
+	}
+}
+
+const vkb::core::ImageView *NFRUSample::displayed_output() const
+{
+	const uint32_t index = std::min(displayed_generated_frame, static_cast<uint32_t>(nfru_outputs.size())) - 1;
+	return nfru_outputs[index].view.get();
+}
+
+void NFRUSample::apply_pending_multiplier()
+{
+	if (pending_nfru_multiplier == nfru_multiplier)
+		return;
+
+	// Outputs and readback buffers depend on the generated-frame count; NFRU history is unaffected, so the
+	// context keeps interpolating without a reset.
+	get_device().wait_idle();
+	nfru_multiplier           = pending_nfru_multiplier;
+	displayed_generated_frame = std::min(displayed_generated_frame, generated_frame_count());
+	create_nfru_output(nfru_output_extent);
+	if (save_exr_enabled && !readback_slots.empty())
+		create_readback_buffers(nfru_output_extent, readback_slots.size());
+	LOGI("NFRU multiplier changed to {}x ({} generated frames)", nfru_multiplier, generated_frame_count());
 }
 /*******************************
  * draw
@@ -453,7 +500,7 @@ const vkb::core::ImageView *NFRUSample::draw_realtime(vkb::core::CommandBufferC 
 			return nullptr;
 		}
 		nfru_delta_time_seconds = 0.0f;
-		display_source          = nfru_output.view.get();
+		display_source          = displayed_output();
 	}
 	// EXR save: generated (even) frames go to interp, reference (odd) frames go
 	// to ground truth. Frame 0 is skipped
@@ -463,13 +510,15 @@ const vkb::core::ImageView *NFRUSample::draw_realtime(vkb::core::CommandBufferC 
 		slot.need_save     = true;
 		if (frame_is_generated)
 		{
-			copy_to_readback(command_buffer, *nfru_output.view, *slot.buffer);
+			copy_to_readback(command_buffer, *nfru_outputs[0].view, *slot.buffers[0]);
+			slot.buffer_count = 1;
 			slot.frame_number = scene_frame_index - 1;
 			slot.output_dir   = interp_output_dir;
 		}
 		else
 		{
-			copy_to_readback(command_buffer, *rendered_color, *slot.buffer);
+			copy_to_readback(command_buffer, *rendered_color, *slot.buffers[0]);
+			slot.buffer_count = 1;
 			render_inputs.render_target->set_layout(static_cast<int>(Attachments::Color), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 			slot.frame_number = scene_frame_index;
 			slot.output_dir   = gt_output_dir;
@@ -483,7 +532,7 @@ const vkb::core::ImageView *NFRUSample::draw_realtime(vkb::core::CommandBufferC 
 const vkb::core::ImageView *NFRUSample::draw_dataset(vkb::core::CommandBufferC &command_buffer, uint32_t swapchain_frame_index)
 {
 	if (scene_frame_index >= dataset_loader->total_frames())
-		return nfru_output.view.get();
+		return displayed_output();
 
 	NFRUFrameParams frame_params{};
 	const size_t    current_index  = nfru_frame_index % resource_count;
@@ -528,14 +577,16 @@ const vkb::core::ImageView *NFRUSample::draw_dataset(vkb::core::CommandBufferC &
 	if (frame_should_save)
 	{
 		ReadbackSlot &slot = readback_slots[swapchain_frame_index];
-		copy_to_readback(command_buffer, *nfru_output.view, *slot.buffer);
+		for (uint32_t k = 0; k < generated_frame_count(); ++k)
+			copy_to_readback(command_buffer, *nfru_outputs[k].view, *slot.buffers[k]);
+		slot.buffer_count = generated_frame_count();
 		slot.need_save    = true;
 		slot.frame_number = dataset_loader->interpolated_source_frame(static_cast<int>(scene_frame_index));
 		slot.output_dir   = interp_output_dir;
 	}
 
 	++scene_frame_index;
-	return nfru_output.view.get();
+	return displayed_output();
 }
 
 void NFRUSample::draw(vkb::core::CommandBufferC &command_buffer,
@@ -544,6 +595,8 @@ void NFRUSample::draw(vkb::core::CommandBufferC &command_buffer,
 	uint32_t swapchain_frame_index = get_render_context().get_active_frame_index();
 	auto    &swapchain_views       = swapchain_render_target.get_views();
 	auto     swapchain_extent      = swapchain_render_target.get_extent();
+
+	apply_pending_multiplier();
 
 	// The frame fence guarantees the pending GPU-to-buffer copy is complete.
 	{
@@ -850,13 +903,24 @@ bool NFRUSample::dispatch_nfru(vkb::core::CommandBufferC &command_buffer, FrameI
 		dispatch_description.commandList        = reinterpret_cast<void *>(command_buffer.get_handle());
 		dispatch_description.presentColor       = wrap_resource(*current.color.image,
 		                                                        frag_or_comp_config.input_read_state);
-		dispatch_description.outputs[0]         = wrap_resource(*nfru_output.image,
-		                                                        frag_or_comp_config.output_write_state);
-		dispatch_description.numGeneratedFrames = 1;
+		// Generated frame k (t = k / multiplier) goes to outputs[k - 1]; the 6x fifth frame uses the chained
+		// extra-outputs descriptor so the dispatch descriptor keeps the upstream layout.
+		ffx::DispatchDescFrameGenerationExtraOutputs extra_outputs{};
+		for (uint32_t k = 0; k < generated_frame_count(); ++k)
+		{
+			const FfxApiResource output = wrap_resource(*nfru_outputs[k].image, frag_or_comp_config.output_write_state);
+			if (k < FFX_API_FRAMEGENERATION_INLINE_OUTPUTS)
+				dispatch_description.outputs[k] = output;
+			else
+				extra_outputs.outputs[k - FFX_API_FRAMEGENERATION_INLINE_OUTPUTS] = output;
+		}
+		dispatch_description.numGeneratedFrames = generated_frame_count();
 		dispatch_description.reset              = reset;
 		dispatch_description.frameID            = nfru_frame_index;
 
-		auto result = ffx::Dispatch(nfru_context, dispatch_description);
+		auto result = generated_frame_count() > FFX_API_FRAMEGENERATION_INLINE_OUTPUTS ?
+		                  ffx::Dispatch(nfru_context, dispatch_description, extra_outputs) :
+		                  ffx::Dispatch(nfru_context, dispatch_description);
 		if (result != ffx::ReturnCode::Ok)
 		{
 			LOGE("NFRU Dispatch failed (fid={}): {}", nfru_frame_index, static_cast<uint32_t>(result));
@@ -906,6 +970,26 @@ void NFRUSample::draw_gui()
 			    ImGui::TextColored({1.0f, 0.85f, 0.4f, 1.0f}, "Original");
 
 		    ImGui::Separator();
+
+		    // Multi-frame generation: multiplier 2x..6x generates multiplier - 1 frames per rendered frame.
+		    {
+			    int multiplier = static_cast<int>(pending_nfru_multiplier);
+			    if (save_exr_enabled)
+			    {
+				    ImGui::Text("Multiplier: %ux (fixed while saving EXR)", nfru_multiplier);
+			    }
+			    else if (ImGui::SliderInt("Multiplier (x)", &multiplier, 2, static_cast<int>(FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES) + 1))
+			    {
+				    pending_nfru_multiplier = static_cast<uint32_t>(multiplier);
+			    }
+			    int displayed = static_cast<int>(displayed_generated_frame);
+			    if (generated_frame_count() > 1 &&
+			        ImGui::SliderInt("Displayed generated frame", &displayed, 1, static_cast<int>(generated_frame_count())))
+			    {
+				    displayed_generated_frame = static_cast<uint32_t>(displayed);
+			    }
+			    ImGui::Text("t = %.3f", static_cast<float>(displayed_generated_frame) / static_cast<float>(nfru_multiplier));
+		    }
 
 		    bool debug_view_prev = nfru_debug_view;
 		    ImGui::Checkbox("NFRU Debug View", &nfru_debug_view);
@@ -1086,25 +1170,28 @@ void NFRUSample::prepare_output(vkb::core::CommandBufferC &command_buffer)
 	// Prepare the NFRU output for this dispatch:
 	// UNDEFINED on first use, or SHADER_READ_ONLY_OPTIMAL after display/readback,
 	// to the selected compute or fragment output-write layout.
-	vkb::ImageMemoryBarrier barrier{};
-	if (!nfru_output.initialized)
+	for (ImageResource &output : nfru_outputs)
 	{
-		// No sample or SDK operation has used this output image yet.
-		barrier.old_layout      = VK_IMAGE_LAYOUT_UNDEFINED;
-		barrier.src_access_mask = 0;
-		barrier.src_stage_mask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-	}
-	else
-	{
-		barrier.old_layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		barrier.src_access_mask = VK_ACCESS_SHADER_READ_BIT;
-		barrier.src_stage_mask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-	}
+		vkb::ImageMemoryBarrier barrier{};
+		if (!output.initialized)
+		{
+			// No sample or SDK operation has used this output image yet.
+			barrier.old_layout      = VK_IMAGE_LAYOUT_UNDEFINED;
+			barrier.src_access_mask = 0;
+			barrier.src_stage_mask  = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+		}
+		else
+		{
+			barrier.old_layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			barrier.src_access_mask = VK_ACCESS_SHADER_READ_BIT;
+			barrier.src_stage_mask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		}
 
-	barrier.new_layout      = frag_or_comp_config.output_write_layout;
-	barrier.dst_access_mask = frag_or_comp_config.output_write_access;
-	barrier.dst_stage_mask  = frag_or_comp_config.output_write_stage;
-	command_buffer.image_memory_barrier(*nfru_output.view, barrier);
+		barrier.new_layout      = frag_or_comp_config.output_write_layout;
+		barrier.dst_access_mask = frag_or_comp_config.output_write_access;
+		barrier.dst_stage_mask  = frag_or_comp_config.output_write_stage;
+		command_buffer.image_memory_barrier(*output.view, barrier);
+	}
 }
 
 void NFRUSample::finish_output(vkb::core::CommandBufferC &command_buffer)
@@ -1128,8 +1215,11 @@ void NFRUSample::finish_output(vkb::core::CommandBufferC &command_buffer)
 		barrier.dst_access_mask = VK_ACCESS_SHADER_READ_BIT;
 		barrier.dst_stage_mask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 	}
-	command_buffer.image_memory_barrier(*nfru_output.view, barrier);
-	nfru_output.initialized = true;
+	for (ImageResource &output : nfru_outputs)
+	{
+		command_buffer.image_memory_barrier(*output.view, barrier);
+		output.initialized = true;
+	}
 }
 
 void NFRUSample::initialize_external_history(vkb::core::CommandBufferC &command_buffer, FrameInputs &previous)
@@ -1202,9 +1292,14 @@ void NFRUSample::create_readback_buffers(VkExtent2D extent, size_t count)
 	    .with_vma_usage(VMA_MEMORY_USAGE_GPU_TO_CPU)
 	    .with_vma_flags(VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 	for (ReadbackSlot &slot : readback_slots)
-		slot.buffer = builder.build_unique(get_device());
+	{
+		slot.buffers.clear();
+		for (uint32_t k = 0; k < generated_frame_count(); ++k)
+			slot.buffers.push_back(builder.build_unique(get_device()));
+		slot.need_save = false;
+	}
 
-	LOGI("Created {} NFRU EXR readback buffers ({} bytes each)", count, buffer_size);
+	LOGI("Created {} x {} NFRU EXR readback buffers ({} bytes each)", count, generated_frame_count(), buffer_size);
 }
 
 void NFRUSample::copy_to_readback(vkb::core::CommandBufferC  &command_buffer,
@@ -1244,12 +1339,22 @@ bool NFRUSample::save_completed_readback(ReadbackSlot &slot, VkExtent2D extent)
 
 	slot.need_save = false;
 
-	char filename[32];
-	snprintf(filename, sizeof(filename), "%04llu.exr", static_cast<unsigned long long>(slot.frame_number));
-	slot.buffer->invalidate();
-	return vkb::sample::exr::save_vk_format_to_exr((slot.output_dir + "/" + filename).c_str(),
-	                                               VK_FORMAT_R8G8B8A8_UNORM, slot.buffer->get_data(),
-	                                               static_cast<size_t>(slot.buffer->get_size()), extent);
+	for (uint32_t k = 0; k < slot.buffer_count; ++k)
+	{
+		// 2x keeps the original <frame>.exr naming; multi-frame outputs add the generated-frame index (1-based).
+		char filename[48];
+		if (slot.buffer_count == 1)
+			snprintf(filename, sizeof(filename), "%04llu.exr", static_cast<unsigned long long>(slot.frame_number));
+		else
+			snprintf(filename, sizeof(filename), "%04llu_%u.exr", static_cast<unsigned long long>(slot.frame_number), k + 1);
+		auto &buffer = *slot.buffers[k];
+		buffer.invalidate();
+		if (!vkb::sample::exr::save_vk_format_to_exr((slot.output_dir + "/" + filename).c_str(),
+		                                             VK_FORMAT_R8G8B8A8_UNORM, buffer.get_data(),
+		                                             static_cast<size_t>(buffer.get_size()), extent))
+			return false;
+	}
+	return true;
 }
 
 std::unique_ptr<vkb::VulkanSampleC> create_nfru()
