@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -78,12 +79,22 @@ namespace
         std::vector<uint8_t>                           presentColor;
         bool                                           skipped = false;
         std::string                                    message;
+        std::vector<double>                            frameMilliseconds;  // prepare + dispatch + submit + wait, per frame
     };
 
-    bool RunMfgScene(uint32_t generatedFrames, uint32_t extraFlags, uint32_t frameCount, MfgSceneResult& result)
+    struct MfgSceneOptions
     {
-        constexpr uint32_t kDisplay = 192;
-        constexpr uint32_t kRender  = 96;
+        uint32_t displayWidth  = 192;
+        uint32_t displayHeight = 192;
+        uint32_t renderWidth   = 96;  // render / MV / depth
+        uint32_t renderHeight  = 96;
+        bool     readback    = true;
+    };
+
+    bool RunMfgScene(uint32_t generatedFrames, uint32_t extraFlags, uint32_t frameCount, MfgSceneResult& result, MfgSceneOptions options = {})
+    {
+        const uint32_t kDisplayW = options.displayWidth, kDisplayH = options.displayHeight;
+        const uint32_t kRenderW = options.renderWidth, kRenderH = options.renderHeight;
 
         unit_test::vk::VulkanContext vkContext{};
         std::string                  errorMessage;
@@ -120,8 +131,8 @@ namespace
         createDesc.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
         createDesc.header.pNext     = reinterpret_cast<ffxApiHeader*>(&backendDesc);
         createDesc.flags            = flags;
-        createDesc.displaySize      = {kDisplay, kDisplay};
-        createDesc.renderSize       = {kRender, kRender};
+        createDesc.displaySize      = {kDisplayW, kDisplayH};
+        createDesc.renderSize       = {kRenderW, kRenderH};
         createDesc.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
         createDesc.fpMessage        = IgnoreApiMessage;
         unit_test::vk::SetIdentityMatrix(createDesc.initialViewProjection);
@@ -140,14 +151,14 @@ namespace
         const VkImageUsageFlags dataUsage =
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 
-        ok = ok && unit_test::vk::CreateImage2D(vkContext, kDisplay, kDisplay, VK_FORMAT_R8G8B8A8_UNORM, colourUsage, presentColor, &errorMessage);
-        ok = ok && unit_test::vk::CreateImage2D(vkContext, kRender, kRender, VK_FORMAT_R32_SFLOAT, dataUsage, depth, &errorMessage);
-        ok = ok && unit_test::vk::CreateImage2D(vkContext, kRender, kRender, VK_FORMAT_R16G16_SFLOAT, dataUsage, motionVectors, &errorMessage);
-        ok = ok && unit_test::vk::CreateImage2D(vkContext, kRender, kRender, VK_FORMAT_R32_SFLOAT, dataUsage, depthTm1, &errorMessage);
-        ok = ok && unit_test::vk::CreateImage2D(vkContext, kDisplay, kDisplay, VK_FORMAT_R8G8B8A8_UNORM, colourUsage, colorTm1, &errorMessage);
+        ok = ok && unit_test::vk::CreateImage2D(vkContext, kDisplayW, kDisplayH, VK_FORMAT_R8G8B8A8_UNORM, colourUsage, presentColor, &errorMessage);
+        ok = ok && unit_test::vk::CreateImage2D(vkContext, kRenderW, kRenderH, VK_FORMAT_R32_SFLOAT, dataUsage, depth, &errorMessage);
+        ok = ok && unit_test::vk::CreateImage2D(vkContext, kRenderW, kRenderH, VK_FORMAT_R16G16_SFLOAT, dataUsage, motionVectors, &errorMessage);
+        ok = ok && unit_test::vk::CreateImage2D(vkContext, kRenderW, kRenderH, VK_FORMAT_R32_SFLOAT, dataUsage, depthTm1, &errorMessage);
+        ok = ok && unit_test::vk::CreateImage2D(vkContext, kDisplayW, kDisplayH, VK_FORMAT_R8G8B8A8_UNORM, colourUsage, colorTm1, &errorMessage);
         for (auto& output : outputs)
         {
-            ok = ok && unit_test::vk::CreateImage2D(vkContext, kDisplay, kDisplay, VK_FORMAT_R8G8B8A8_UNORM, colourUsage, output, &errorMessage);
+            ok = ok && unit_test::vk::CreateImage2D(vkContext, kDisplayW, kDisplayH, VK_FORMAT_R8G8B8A8_UNORM, colourUsage, output, &errorMessage);
         }
         ok = ok && unit_test::vk::RenderTriangle(vkContext, presentColor, &errorMessage);
         ok = ok && unit_test::vk::RenderTriangle(vkContext, colorTm1, &errorMessage);
@@ -187,7 +198,7 @@ namespace
             prepareDesc.header.type             = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
             prepareDesc.frameID                 = frame;
             prepareDesc.commandList             = commandBuffer;
-            prepareDesc.motionVectorScale       = {static_cast<float>(kRender), static_cast<float>(kRender)};
+            prepareDesc.motionVectorScale       = {static_cast<float>(kRenderW), static_cast<float>(kRenderH)};
             prepareDesc.frameTimeDelta          = 16.6f;
             prepareDesc.cameraNear              = 0.1f;
             prepareDesc.cameraFar               = 1000.0f;
@@ -233,9 +244,11 @@ namespace
             dispatchDesc.reset              = frame == 1;
             dispatchDesc.frameID            = frame;
 
+            const auto            frameStart     = std::chrono::steady_clock::now();
             const ffxReturnCode_t prepareResult  = ffxDispatch(&context, &prepareDesc.header);
             const ffxReturnCode_t dispatchResult = ffxDispatch(&context, &dispatchDesc.header);
             const bool            submitted      = unit_test::vk::SubmitCommandBuffer(vkContext, commandBuffer, &errorMessage);
+            result.frameMilliseconds.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart).count());
             if (prepareResult != FFX_API_RETURN_OK || dispatchResult != FFX_API_RETURN_OK || !submitted)
             {
                 char message[160];
@@ -245,8 +258,8 @@ namespace
                 break;
             }
 
-            std::vector<std::vector<uint8_t>> frameOutputs(generatedFrames);
-            for (uint32_t k = 0; ok && k < generatedFrames; ++k)
+            std::vector<std::vector<uint8_t>> frameOutputs(options.readback ? generatedFrames : 0);
+            for (uint32_t k = 0; ok && options.readback && k < generatedFrames; ++k)
             {
                 ok = unit_test::vk::ReadbackRgba8Image(vkContext, outputs[k], frameOutputs[k], &errorMessage);
             }
@@ -689,6 +702,52 @@ UNIT_TEST_CASE(nfru_mfg, gpu_every_multiplier_dispatches)
             UNIT_TEST_CHECK(HasNonClearPixel(output));
         }
     }
+    return true;
+}
+
+// Wall-clock cost per generated frame (prepare + dispatch + submit + wait) at Steam Deck resolution. Opt-in with
+// NFRU_MFG_BENCHMARK=1: under the ML emulation layer the data graph is emulated, so the absolute numbers are not
+// representative of hardware, only the fixed / per-timestep split.
+UNIT_TEST_CASE(nfru_mfg, gpu_benchmark_cost_per_generated_frame)
+{
+    const char* enabled = std::getenv("NFRU_MFG_BENCHMARK");
+    if (!enabled || std::string(enabled) != "1")
+    {
+        UNIT_TEST_SKIP("set NFRU_MFG_BENCHMARK=1 to run");
+    }
+    // Steam Deck panel resolution; the 540p internal lane cap applies (preprocess lane 864x540).
+    MfgSceneOptions options{};
+    options.displayWidth  = 1280;
+    options.displayHeight = 800;
+    options.renderWidth   = 1280;
+    options.renderHeight  = 800;
+    options.readback    = false;
+    double medians[FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES + 1] = {};
+    for (uint32_t generated = 1; generated <= FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES; ++generated)
+    {
+        MfgSceneResult result;
+        if (!RunMfgScene(generated, 0, 12, result, options))
+        {
+            UNIT_TEST_FAIL(result.message);
+        }
+        std::vector<double> steady(result.frameMilliseconds.begin() + 2, result.frameMilliseconds.end());
+        std::sort(steady.begin(), steady.end());
+        medians[generated] = steady[steady.size() / 2];
+        std::printf("NFRU_MFG_BENCH size=1280x800 N=%u multiplier=%ux median_ms=%.3f min_ms=%.3f\n", generated, generated + 1, medians[generated], steady.front());
+    }
+    // Least-squares fit T(N) = F + N * C over N = 1..5.
+    double sumN = 0, sumT = 0, sumNN = 0, sumNT = 0;
+    for (uint32_t n = 1; n <= FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES; ++n)
+    {
+        sumN += n;
+        sumT += medians[n];
+        sumNN += double(n) * n;
+        sumNT += n * medians[n];
+    }
+    const double count     = FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES;
+    const double perFrame  = (count * sumNT - sumN * sumT) / (count * sumNN - sumN * sumN);
+    const double fixedCost = (sumT - perFrame * sumN) / count;
+    std::printf("NFRU_MFG_BENCH fit fixed_ms=%.3f per_generated_frame_ms=%.3f\n", fixedCost, perFrame);
     return true;
 }
 
