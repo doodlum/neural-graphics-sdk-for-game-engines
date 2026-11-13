@@ -323,6 +323,40 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
 /// @ingroup ffxFrameGeneration
 FFX_API FfxErrorCode ffxFrameInterpolationGetInputTensorChannels(FfxFrameInterpolationContext* context, uint32_t* pChannels);
 
+/// Debug capture of internal frame-interpolation state (parity testing). Every destination is a buffer; a null
+/// resource skips that item. Per-timestep items hold one tightly packed slice per generated frame k at byte offset
+/// (k - 1) * sliceSize, where sliceSize = width * height * bytesPerTexel of the source:
+///   warpedMotionQData: R32_UINT, MV/depth lane (packed motion/depth scattered to t_k, "QMVD")
+///   warpedFilledFlow:  R16G16_FLOAT, flow lane (optical flow scattered to t_k and hole-filled)
+///   inputTensor:       int8 NHWC, padded tensor lane x input channels (needs FFX_NFRU_DEBUG_CAPTURE_TENSORS=1
+///                      in the environment at context creation so the tensor has a buffer alias)
+///   paramsTensor:      int8 x 4 (SNORM view of the SINT data), params lane
+///   gateTensor:        int8 x 1, params lane
+///   inpaintResult:     R8G8B8A8_UNORM, flow lane
+/// History items are captured once per dispatch, after the last generated frame and before the ping-pong:
+///   dynamicMaskTp1 (R8_UNORM, MV/depth lane), depthHistory (R32_FLOAT, MV/depth lane; internal depth history
+///   only), colourHistory (backbuffer format, display size; MANAGE_PREVIOUS_COLOR only).
+/// The structure is borrowed: keep it and its resources alive while capture is enabled.
+///
+/// @ingroup ffxFrameGeneration
+typedef struct FfxFrameInterpolationDebugCapture
+{
+    FfxResource warpedMotionQData;
+    FfxResource warpedFilledFlow;
+    FfxResource inputTensor;
+    FfxResource paramsTensor;
+    FfxResource gateTensor;
+    FfxResource inpaintResult;
+    FfxResource dynamicMaskTp1;
+    FfxResource depthHistory;
+    FfxResource colourHistory;
+} FfxFrameInterpolationDebugCapture;
+
+/// Enable (non-null) or disable (null) debug capture for the following dispatches. Debug only.
+///
+/// @ingroup ffxFrameGeneration
+FFX_API FfxErrorCode ffxFrameInterpolationSetDebugCapture(FfxFrameInterpolationContext* context, const FfxFrameInterpolationDebugCapture* capture);
+
 /// Dispatch the OF colour downsample pass (pre-OF step for >1080p inputs).
 /// Must be called before optical flow dispatch when the resolution plan selects OF-colour downsampling.
 /// The downsampled colour is stored internally; retrieve it with ffxFrameInterpolationGetDownsampledOfColourP1().

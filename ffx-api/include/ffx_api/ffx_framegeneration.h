@@ -227,8 +227,27 @@ struct ffxApiConfigureDescFrameGenerationKeyValue
 /// @ingroup ffxFrameGeneration
 enum FfxApiConfigureFrameGenerationKey
 {
+    FFX_API_CONFIGURE_FG_KEY_DEBUG_CAPTURE =
+        0x1001,  ///< ptr: const ffxApiFrameGenerationDebugCapture* (debug/parity testing; null disables). Copied by the SDK; the buffers must stay alive while enabled.
     FFX_API_CONFIGURE_FG_KEY_NUM_GENERATED_FRAMES =
         0x1000,  ///< u64: number of generated frames per rendered frame used by the frame-generation swapchain path, in [1, FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES]. Default 1. Ignored by the manual dispatch path, which uses ffxApiDispatchDescFrameGeneration::numGeneratedFrames.
+};
+
+/// Debug capture of NFRU internal state per generated frame (FFX_API_CONFIGURE_FG_KEY_DEBUG_CAPTURE). All destinations
+/// are buffers; null resources are skipped. See FfxFrameInterpolationDebugCapture in
+/// FidelityFX/host/ffx_frameinterpolation.h for the layout of each item.
+/// @ingroup ffxFrameGeneration
+struct ffxApiFrameGenerationDebugCapture
+{
+    struct FfxApiResource warpedMotionQData;
+    struct FfxApiResource warpedFilledFlow;
+    struct FfxApiResource inputTensor;
+    struct FfxApiResource paramsTensor;
+    struct FfxApiResource gateTensor;
+    struct FfxApiResource inpaintResult;
+    struct FfxApiResource dynamicMaskTp1;
+    struct FfxApiResource depthHistory;
+    struct FfxApiResource colourHistory;
 };
 
 /// @ingroup ffxFrameGeneration

@@ -31,6 +31,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include "FidelityFX/host/ffx_frameinterpolation.h"
@@ -883,7 +884,9 @@ static FfxErrorCode frameinterpolationCreate(FfxArmFrameInterpolationContext_Pri
     const bool preprocessSupportTensor = preprocessUseFragment ? capabilities.fragmentSupportTensor : capabilities.computeSupportTensor;
     const bool debugViewUseFragment    = (context->pipelineFlags & FRAMEINTERPOLATION_SHADER_PERMUTATION_DEBUG_VIEW_COMPUTE) == 0;
     const bool debugViewSupportTensor  = debugViewUseFragment ? capabilities.fragmentSupportTensor : capabilities.computeSupportTensor;
-    const bool inTensorBufferAliased   = !preprocessSupportTensor || !debugViewSupportTensor;
+    // FFX_NFRU_DEBUG_CAPTURE_TENSORS=1 (debug only) adds the buffer alias so the input tensor can be captured.
+    const char* debugCaptureTensors  = std::getenv("FFX_NFRU_DEBUG_CAPTURE_TENSORS");
+    const bool inTensorBufferAliased = !preprocessSupportTensor || !debugViewSupportTensor || (debugCaptureTensors != nullptr && debugCaptureTensors[0] == '1');
 
     const FfxResourceFlags inputTensorFlags = inTensorBufferAliased ? FFX_RESOURCE_FLAGS_BUFFER_ALIASED : FFX_RESOURCE_FLAGS_NONE;
     // Each resource is written by exactly one stage, so use the corresponding stage's usage flag.
@@ -2096,6 +2099,95 @@ static FfxErrorCode dispatchFrameInterpolation(FfxFrameInterpolationContext*    
         contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUTPUT] = generatedOutputs[generatedFrameIndex - 1];
     };
 
+    // Debug capture (ffxFrameInterpolationSetDebugCapture): copy internal state into caller buffers as copy jobs,
+    // so the backend orders them with the passes that produce and consume the resources.
+    enum CaptureItem
+    {
+        CaptureQData,
+        CaptureFilledFlow,
+        CaptureInputTensor,
+        CaptureParams,
+        CaptureGate,
+        CaptureInpaint,
+        CaptureDynamicMask,
+        CaptureDepthHistory,
+        CaptureColourHistory,
+        CaptureItemCount
+    };
+    FfxResourceInternal captureTargets[CaptureItemCount] = {};
+    bool                captureEnabled[CaptureItemCount] = {};
+    if (const FfxFrameInterpolationDebugCapture* capture = contextPrivate->debugCapture)
+    {
+        const FfxResource* targets[CaptureItemCount] = {&capture->warpedMotionQData,
+                                                        &capture->warpedFilledFlow,
+                                                        &capture->inputTensor,
+                                                        &capture->paramsTensor,
+                                                        &capture->gateTensor,
+                                                        &capture->inpaintResult,
+                                                        &capture->dynamicMaskTp1,
+                                                        &capture->depthHistory,
+                                                        &capture->colourHistory};
+        for (uint32_t item = 0; item < CaptureItemCount; ++item)
+        {
+            if (targets[item]->resource != nullptr)
+            {
+                FFX_VALIDATE(contextPrivate->contextDescription.backendInterface.fpRegisterResource(
+                    &contextPrivate->contextDescription.backendInterface, targets[item], contextPrivate->effectContextId, &captureTargets[item]));
+                captureEnabled[item] = true;
+            }
+        }
+    }
+    const auto scheduleCapture =
+        [&](CaptureItem item, FfxResourceInternal source, uint32_t sliceIndex, uint32_t sliceBytes, bool bufferSource) -> FfxErrorCode {
+        if (!captureEnabled[item] || source.internalIndex == 0)
+        {
+            return FFX_OK;
+        }
+        FfxGpuJobDescription copyJob        = {FFX_GPU_JOB_COPY};
+        copyJob.copyJobDescriptor.src       = source;
+        copyJob.copyJobDescriptor.dst       = captureTargets[item];
+        copyJob.copyJobDescriptor.dstOffset = sliceIndex * sliceBytes;
+        copyJob.copyJobDescriptor.size      = bufferSource ? sliceBytes : 0;
+        return contextPrivate->contextDescription.backendInterface.fpScheduleGpuJob(&contextPrivate->contextDescription.backendInterface, &copyJob);
+    };
+    const auto scheduleTimestepCaptures = [&](uint32_t generatedFrameIndex) -> FfxErrorCode {
+        const uint32_t slice       = generatedFrameIndex - 1;
+        const uint32_t laneTexels  = mvDepthLane.width * mvDepthLane.height;
+        const uint32_t flowTexels  = flowLane.width * flowLane.height;
+        const uint32_t paramTexels = contextPrivate->paramsLane.width * contextPrivate->paramsLane.height;
+        FFX_VALIDATE(scheduleCapture(
+            CaptureQData, contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_WARP_MOTION_QDATA_TP1], slice, laneTexels * 4, false));
+        FFX_VALIDATE(scheduleCapture(
+            CaptureFilledFlow, contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_WARP_FILLED_FLOW_TM1], slice, flowTexels * 4, false));
+        FFX_VALIDATE(scheduleCapture(CaptureInputTensor,
+                                     contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_IN_TENSOR],
+                                     slice,
+                                     contextPrivate->dataGraphWidth * contextPrivate->dataGraphHeight * contextPrivate->inputTensorChannels,
+                                     true));
+        FFX_VALIDATE(scheduleCapture(
+            CaptureParams, contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUT_PARAMS_TENSOR], slice, paramTexels * 4, false));
+        FFX_VALIDATE(scheduleCapture(
+            CaptureGate, contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_OUT_PARAMS_GATE_TENSOR], slice, paramTexels, false));
+        FFX_VALIDATE(scheduleCapture(
+            CaptureInpaint, contextPrivate->srvResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINT_RESULT], slice, flowTexels * 4, false));
+        return FFX_OK;
+    };
+    const auto scheduleHistoryCaptures = [&]() -> FfxErrorCode {
+        FFX_VALIDATE(
+            scheduleCapture(CaptureDynamicMask, contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_DYNAMIC_MASK_TP1], 0, 0, false));
+        FFX_VALIDATE(
+            scheduleCapture(CaptureDepthHistory, contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_DEPTH_TM1_NEXT], 0, 0, false));
+        if (contextPrivate->contextDescription.flags & FFX_FG_CONTEXT_FLAG_MANAGE_PREVIOUS_COLOR)
+        {
+            FFX_VALIDATE(scheduleCapture(CaptureColourHistory,
+                                         contextPrivate->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_PREVIOUS_INTERPOLATION_SOURCE_BACKUP],
+                                         0,
+                                         0,
+                                         false));
+        }
+        return FFX_OK;
+    };
+
     // set optical flow buffers
     if (params->opticalFlowScale.x > 0)
     {
@@ -2370,6 +2462,8 @@ static FfxErrorCode dispatchFrameInterpolation(FfxFrameInterpolationContext*    
                     }
                 }
 
+                FFX_VALIDATE(scheduleTimestepCaptures(frameIndex));
+
                 // Record this timestep's jobs before scheduling the next one; the final timestep is recorded below
                 // together with the history copy.
                 if (frameIndex < numGeneratedFrames)
@@ -2404,6 +2498,8 @@ static FfxErrorCode dispatchFrameInterpolation(FfxFrameInterpolationContext*    
                 trace->preScheduleUs = elapsedMicroseconds(preScheduleStart, NfruCpuClock::now());
             }
         }
+
+        FFX_VALIDATE(scheduleHistoryCaptures());
 
         // schedule optical flow and frame interpolation
         setTraceStage(FfxNfruFiStage::RecordCommands);
@@ -2600,6 +2696,16 @@ FFX_API FfxErrorCode ffxFrameInterpolationGetInputTensorChannels(FfxFrameInterpo
     }
     const auto* contextPrivate = reinterpret_cast<const FfxArmFrameInterpolationContext_Private*>(context);
     *pChannels                 = contextPrivate->inputTensorChannels;
+    return FFX_OK;
+}
+
+FFX_API FfxErrorCode ffxFrameInterpolationSetDebugCapture(FfxFrameInterpolationContext* context, const FfxFrameInterpolationDebugCapture* capture)
+{
+    if (!context)
+    {
+        return ffxLogError(FFX_ERROR_INVALID_POINTER, "debug capture requires a context");
+    }
+    reinterpret_cast<FfxArmFrameInterpolationContext_Private*>(context)->debugCapture = capture;
     return FFX_OK;
 }
 

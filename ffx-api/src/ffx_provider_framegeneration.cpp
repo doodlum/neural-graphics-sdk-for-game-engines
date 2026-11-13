@@ -210,8 +210,9 @@ struct InternalFgContext
     FfxNfruResolutionPlan resolutionPlan;
     bool                  usesInternalDepthHistory;
     bool                  fp16Supported;
-    uint32_t              inputTensorChannels;
-    uint32_t              swapchainGeneratedFrames = 1;  ///< FFX_API_CONFIGURE_FG_KEY_NUM_GENERATED_FRAMES (swapchain path)
+    uint32_t                          inputTensorChannels;
+    uint32_t                          swapchainGeneratedFrames = 1;  ///< FFX_API_CONFIGURE_FG_KEY_NUM_GENERATED_FRAMES (swapchain path)
+    FfxFrameInterpolationDebugCapture debugCapture;                  ///< FFX_API_CONFIGURE_FG_KEY_DEBUG_CAPTURE (borrowed by the FI context)
     FfxDimensions2D       opticalFlowSize;
 #if FFX_CAPTURE_ENABLED
     CaptureController* controller;
@@ -999,6 +1000,27 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Configure(ffxContext* context, cons
             }
             internal_context->swapchainGeneratedFrames = static_cast<uint32_t>(keyValue->u64);
             return FFX_API_RETURN_OK;
+        }
+        if (keyValue->key == FFX_API_CONFIGURE_FG_KEY_DEBUG_CAPTURE)
+        {
+            const auto* capture = static_cast<const ffxApiFrameGenerationDebugCapture*>(keyValue->ptr);
+            if (capture == nullptr)
+            {
+                return ffxFrameInterpolationSetDebugCapture(&internal_context->armFiContext, nullptr) == FFX_OK ? FFX_API_RETURN_OK
+                                                                                                                : FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+            }
+            FfxFrameInterpolationDebugCapture& stored = internal_context->debugCapture;
+            stored.warpedMotionQData                  = Convert(capture->warpedMotionQData);
+            stored.warpedFilledFlow                   = Convert(capture->warpedFilledFlow);
+            stored.inputTensor                        = Convert(capture->inputTensor);
+            stored.paramsTensor                       = Convert(capture->paramsTensor);
+            stored.gateTensor                         = Convert(capture->gateTensor);
+            stored.inpaintResult                      = Convert(capture->inpaintResult);
+            stored.dynamicMaskTp1                     = Convert(capture->dynamicMaskTp1);
+            stored.depthHistory                       = Convert(capture->depthHistory);
+            stored.colourHistory                      = Convert(capture->colourHistory);
+            return ffxFrameInterpolationSetDebugCapture(&internal_context->armFiContext, &stored) == FFX_OK ? FFX_API_RETURN_OK
+                                                                                                            : FFX_API_RETURN_ERROR_RUNTIME_ERROR;
         }
         ffxLogMessage(ffxLogComponentName(), FFX_MESSAGE_TYPE_ERROR, "unsupported frame-generation configure key");
         return FFX_API_RETURN_ERROR_PARAMETER;

@@ -191,6 +191,8 @@ typedef struct FfxArmFrameInterpolationContext_Private
     uint32_t dataGraphHeight;
     uint32_t inputTensorChannels;  // 16 or 20, read from the data graph's input tensor shape at creation
 
+    const struct FfxFrameInterpolationDebugCapture* debugCapture;  // borrowed, null when disabled
+
     uint64_t       previousFrameID;
     uint64_t       dispatchCount;
     FfxFloat32x4x4 lastFrameViewProjection;
