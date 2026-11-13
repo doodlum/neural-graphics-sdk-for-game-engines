@@ -419,8 +419,12 @@ static VkDeviceContext sVkDeviceContext = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NU
 #define MAX_DESCRIPTOR_SET_LAYOUTS  (32)
 #define MAX_DESCRIPTOR_SETS         (2)
 #define MAX_RENDER_PASS_COUNT       (FFX_MAX_QUEUED_FRAMES)
-#define MAX_IMAGE_VIEW_COUNT        (FFX_MAX_QUEUED_FRAMES * 4)
-#define MAX_FRAME_BUFFER_COUNT      (FFX_MAX_QUEUED_FRAMES)
+// Render-target views and framebuffers are cached per pipeline and evicted LRU. Multi-frame generation renders a
+// pass into up to FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES different (per-dispatch registered) outputs within one
+// command buffer, so the caches keep FFX_MAX_QUEUED_FRAMES dispatches' worth of entries; a smaller cache destroys a
+// framebuffer or view still referenced by the command buffer being recorded or by a frame in flight.
+#define MAX_IMAGE_VIEW_COUNT        (FFX_MAX_QUEUED_FRAMES * 4 * FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES)
+#define MAX_FRAME_BUFFER_COUNT      (FFX_MAX_QUEUED_FRAMES * FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES)
 #define MAX_GRAPHICS_PIPELINE_COUNT (FFX_MAX_QUEUED_FRAMES)
 
 #define FFX_MAX_BINDLESS_DESCRIPTOR_COUNT (65536)
@@ -3134,7 +3138,7 @@ FfxErrorCode CreateTensorResourceVK(FfxInterface*                       backendI
             VK_IMAGE_TILING_OPTIMAL,  // See VUID-VkImageCreateInfo-tiling-09711
                                       // If tiling is VK_IMAGE_TILING_LINEAR then VK_IMAGE_USAGE_TENSOR_ALIASING_BIT_ARM must not be set in usage
             (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TENSOR_ALIASING_BIT_ARM |  // Aliasing bit required when using optimal tiling.
-             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
+             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),  // TRANSFER_SRC: debug capture
             VK_SHARING_MODE_EXCLUSIVE,
             0,        // queueFamilyIndexCount
             nullptr,  // pQueueFamilyIndices
@@ -7935,11 +7939,45 @@ static FfxErrorCode executeGpuJobCopy(BackendContext_VK* backendContext, FfxGpuJ
     BackendContext_VK::Resource ffxResourceSrc = backendContext->pResources[job->copyJobDescriptor.src.internalIndex];
     BackendContext_VK::Resource ffxResourceDst = backendContext->pResources[job->copyJobDescriptor.dst.internalIndex];
 
+    // Tensor sources (debug capture) are copied through their buffer or image alias.
+    if (ffxResourceSrc.resourceDescription.type == FFX_RESOURCE_TYPE_TENSOR)
+    {
+        if (ffxResourceSrc.aliasedTensorBufferResource != VK_NULL_HANDLE)
+        {
+            ffxResourceSrc.resourceDescription.type = FFX_RESOURCE_TYPE_BUFFER;
+            ffxResourceSrc.bufferResource           = ffxResourceSrc.aliasedTensorBufferResource;
+        }
+        else if (ffxResourceSrc.aliasedTensorImageResource != VK_NULL_HANDLE)
+        {
+            ffxResourceSrc.resourceDescription.type     = FFX_RESOURCE_TYPE_TEXTURE2D;
+            ffxResourceSrc.resourceDescription.mipCount = 1;
+            ffxResourceSrc.resourceDescription.usage    = FFX_RESOURCE_USAGE_READ_ONLY;
+            ffxResourceSrc.imageResource                = ffxResourceSrc.aliasedTensorImageResource;
+        }
+        else
+        {
+            return ffxLogError(FFX_ERROR_INVALID_ARGUMENT, "a tensor without a buffer or image alias cannot be copied");
+        }
+    }
+
     addBarrier(backendContext, vkCommandBuffer, &job->copyJobDescriptor.src, FFX_RESOURCE_STATE_COPY_SRC);
     addBarrier(backendContext, vkCommandBuffer, &job->copyJobDescriptor.dst, FFX_RESOURCE_STATE_COPY_DEST);
     flushBarriers(backendContext, vkCommandBuffer);
 
-    if (ffxResourceSrc.resourceDescription.type == FFX_RESOURCE_TYPE_BUFFER && ffxResourceDst.resourceDescription.type == FFX_RESOURCE_TYPE_BUFFER)
+    if (ffxResourceSrc.resourceDescription.type != FFX_RESOURCE_TYPE_BUFFER && ffxResourceDst.resourceDescription.type == FFX_RESOURCE_TYPE_BUFFER)
+    {
+        // Image to buffer (debug capture): mip 0, tightly packed at dstOffset.
+        VkBufferImageCopy bufferImageCopy               = {};
+        bufferImageCopy.bufferOffset                    = job->copyJobDescriptor.dstOffset;
+        bufferImageCopy.imageSubresource.aspectMask     = getImageAspect(ffxResourceSrc.resourceDescription.usage);
+        bufferImageCopy.imageSubresource.mipLevel       = 0;
+        bufferImageCopy.imageSubresource.baseArrayLayer = 0;
+        bufferImageCopy.imageSubresource.layerCount     = 1;
+        bufferImageCopy.imageExtent                     = {ffxResourceSrc.resourceDescription.width, ffxResourceSrc.resourceDescription.height, 1};
+        VulkanWrapper().vkCmdCopyImageToBuffer(
+            vkCommandBuffer, ffxResourceSrc.imageResource, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ffxResourceDst.bufferResource, 1, &bufferImageCopy);
+    }
+    else if (ffxResourceSrc.resourceDescription.type == FFX_RESOURCE_TYPE_BUFFER && ffxResourceDst.resourceDescription.type == FFX_RESOURCE_TYPE_BUFFER)
     {
         VkBuffer vkResourceSrc = ffxResourceSrc.bufferResource;
         VkBuffer vkResourceDst = ffxResourceDst.bufferResource;
