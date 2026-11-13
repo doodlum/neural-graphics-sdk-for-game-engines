@@ -39,6 +39,7 @@
 #ifdef ENABLE_EXR_EXPORT
 #include <tinyexr/tinyexr.h>
 #endif
+#include <algorithm>
 #include <vector>
 #include <mutex>
 
@@ -169,7 +170,8 @@ VkImageMemoryBarrier getImageMemoryBarrier(VkImage       image,
 
 struct ImageBarrierHelper
 {
-    static const uint32_t Capacity           = 3;
+    // Backbuffer, UI and one interpolation output per generated frame (multi-frame generation).
+    static const uint32_t Capacity           = 3 + FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES;
     VkImageMemoryBarrier  barriers[Capacity] = {};
     uint32_t              count              = 0;
 
@@ -926,9 +928,9 @@ VkResult compositeSwapChainFrame(FrameinterpolationPresentInfo* pPresenter,
         ImageBarrierHelper preCallbackBarriers;
         if (pPresenter->interpolationQueue.familyIndex != compositionQueue.familyIndex)
         {
-            if (frameType == PacingData::FrameType::Interpolated_1)
+            if (frameType != PacingData::FrameType::Real)
             {
-                // this is the interpolation buffer
+                // this is an interpolation buffer
                 preCallbackBarriers.add(static_cast<VkImage>(frameInfo.resource.resource),
                                         InterpolationBufferTransferState.accessMask,
                                         InterpolationBufferTransferState.accessMask,
@@ -1631,10 +1633,14 @@ DWORD WINAPI interpolationThread(LPVOID param)
 
                     // set presentation time: reduce based on variance and subract safety margin so we don't lock on a framerate lower than necessary
                     int64_t       qpcSafetyMargin = int64_t(qpcFrequency * presenter->safetyMarginInSec);
-                    const int64_t conservativeAvg = int64_t(frameTime.getAverage() * 0.5 - frameTime.getVariance() * presenter->varianceFactor);
+                    // N generated frames + the real frame share one rendered-frame interval: present every 1 / (N + 1) of it.
+                    const double  presentsPerFrame = double(std::max<uint32_t>(1u, entry.numInterpolatedFrames) + 1u);
+                    const int64_t conservativeAvg  = int64_t(frameTime.getAverage() / presentsPerFrame - frameTime.getVariance() * presenter->varianceFactor);
                     const int64_t deltaToUse      = conservativeAvg > qpcSafetyMargin ? (conservativeAvg - qpcSafetyMargin) : 0;
-                    entry.frames[PacingData::FrameType::Interpolated_1].presentQpcDelta = deltaToUse;
-                    entry.frames[PacingData::FrameType::Real].presentQpcDelta           = deltaToUse;
+                    for (uint32_t frameType = 0; frameType < PacingData::FrameType::Count; ++frameType)
+                    {
+                        entry.frames[frameType].presentQpcDelta = deltaToUse;
+                    }
 
                     // schedule presents
                     EnterCriticalSection(&presenter->scheduledFrameCriticalSection);
@@ -1732,10 +1738,14 @@ void* interpolationThread(void* param)
 
                     // set presentation time: reduce based on variance and subract safety margin so we don't lock on a framerate lower than necessary
                     int64_t qpcSafetyMargin = int64_t(qpcFrequency * presenter->safetyMarginInSec);
-                    const int64_t conservativeAvg = int64_t(frameTime.getAverage() * 0.5 - frameTime.getVariance() * presenter->varianceFactor);
+                    // N generated frames + the real frame share one rendered-frame interval: present every 1 / (N + 1) of it.
+                    const double  presentsPerFrame = double(std::max<uint32_t>(1u, entry.numInterpolatedFrames) + 1u);
+                    const int64_t conservativeAvg  = int64_t(frameTime.getAverage() / presentsPerFrame - frameTime.getVariance() * presenter->varianceFactor);
                     const int64_t deltaToUse = conservativeAvg > qpcSafetyMargin ? (conservativeAvg - qpcSafetyMargin) : 0;
-                    entry.frames[PacingData::FrameType::Interpolated_1].presentQpcDelta = deltaToUse;
-                    entry.frames[PacingData::FrameType::Real].presentQpcDelta = deltaToUse;
+                    for (uint32_t frameType = 0; frameType < PacingData::FrameType::Count; ++frameType)
+                    {
+                        entry.frames[frameType].presentQpcDelta = deltaToUse;
+                    }
                     // schedule presents
                     pthread_mutex_lock(&presenter->scheduledFrameMutex);
                     presenter->scheduledPresents = entry;
@@ -2188,12 +2198,12 @@ VkResult FrameInterpolationSwapChainVK::init(const VkSwapchainCreateInfoKHR* pCr
     }
     // No need to set the layout of the images as vulkan API states that a presentable image starts out at an undefined layout.
 
-    for (uint32_t i = 0; i < FFX_COUNTOF(interpolationOutputs); ++i)
-    {
-        res = createImage(
-            interpolationOutputs[i], info, presentInfo.realSwapchainImageDescription.format, "AMD FSR Interpolation Output %d", i, memProperties, pAllocator);
-        EXIT_ON_VKRESULT_NOT_SUCCESS(res);
-    }
+    // One output per buffer set is created now; outputs for additional generated frames are created when a
+    // multi-frame configuration first needs them (ensureInterpolationOutputs).
+    interpolationOutputCreateInfo = info;
+    interpolationOutputAllocator  = pAllocator;
+    res                           = ensureInterpolationOutputs(1);
+    EXIT_ON_VKRESULT_NOT_SUCCESS(res);
 
     if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
     {
@@ -2279,9 +2289,12 @@ void FrameInterpolationSwapChainVK::destroySwapchain(VkDevice device, const VkAl
         destroyImage(replacementSwapBuffers[i], pAllocator);
     }
 
-    for (uint32_t i = 0; i < FFX_COUNTOF(interpolationOutputs); ++i)
+    for (auto& outputSet : interpolationOutputs)
     {
-        destroyImage(interpolationOutputs[i], pAllocator);
+        for (ReplacementResource& output : outputSet)
+        {
+            destroyImage(output, pAllocator);
+        }
     }
 
     destroyImage(presentInfo.compositionOutput, pAllocator);
@@ -2352,7 +2365,8 @@ void FrameInterpolationSwapChainVK::setFrameGenerationConfig(FfxFrameGenerationC
         if (presentInfo.interpolationQueue.queue != inputInterpolationQueue.queue || interpolationEnabled != config->frameGenerationEnabled ||
             presentCallback != inputPresentCallback || presentCallbackContext != inputPresentCallbackCtx ||
             frameGenerationCallback != config->frameGenerationCallback || frameGenerationCallbackContext != config->frameGenerationCallbackContext ||
-            drawDebugPacingLines != config->drawDebugPacingLines)
+            drawDebugPacingLines != config->drawDebugPacingLines ||
+            std::min<uint32_t>(std::max<uint32_t>(config->numGeneratedFrames, 1u), FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES) != numGeneratedFrames)
         {
             applyChangesNow = true;
         }
@@ -2371,6 +2385,18 @@ void FrameInterpolationSwapChainVK::setFrameGenerationConfig(FfxFrameGenerationC
         drawDebugPacingLines    = config->drawDebugPacingLines;
         dumpGeneratedFrame      = config->dumpGeneratedFrame;
         dumpGeneratedFramePath  = config->dumpGeneratedFramePath;
+
+        // Multi-frame generation: 1..FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES generated frames per rendered frame.
+        const uint32_t requestedGeneratedFrames =
+            std::min<uint32_t>(std::max<uint32_t>(config->numGeneratedFrames, 1u), FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES);
+        if (requestedGeneratedFrames != numGeneratedFrames)
+        {
+            waitForPresents();
+            if (ensureInterpolationOutputs(requestedGeneratedFrames) == VK_SUCCESS)
+            {
+                numGeneratedFrames = requestedGeneratedFrames;
+            }
+        }
 
         if (presentInfo.interpolationQueue.queue != inputInterpolationQueue.queue)
         {
@@ -2454,18 +2480,48 @@ bool FrameInterpolationSwapChainVK::waitForPresents()
 
 FfxResource FrameInterpolationSwapChainVK::interpolationOutput(int index)
 {
-    index = interpolationBufferIndex;
+    FFX_ASSERT(index >= 0 && index < FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES);
+    const ReplacementResource& output          = interpolationOutputs[interpolationBufferIndex][index];
+    FfxResourceDescription     interpolateDesc = output.description;
+    return ffxGetResourceVK(output.image, interpolateDesc, nullptr, FFX_RESOURCE_STATE_GENERIC_UAV);
+}
 
-    FfxResourceDescription interpolateDesc = interpolationOutputs[index].description;
-    return ffxGetResourceVK(interpolationOutputs[index].image, interpolateDesc, nullptr, FFX_RESOURCE_STATE_GENERIC_UAV);
+VkResult FrameInterpolationSwapChainVK::ensureInterpolationOutputs(uint32_t generatedFrames)
+{
+    VkPhysicalDeviceMemoryProperties memProperties;
+    VulkanWrapper().vkGetPhysicalDeviceMemoryProperties(presentInfo.physicalDevice, &memProperties);
+    for (uint32_t set = 0; set < FFX_COUNTOF(interpolationOutputs); ++set)
+    {
+        for (uint32_t frame = 0; frame < generatedFrames && frame < FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES; ++frame)
+        {
+            if (interpolationOutputs[set][frame].image != VK_NULL_HANDLE)
+            {
+                continue;
+            }
+            VkResult res = createImage(interpolationOutputs[set][frame],
+                                       interpolationOutputCreateInfo,
+                                       presentInfo.realSwapchainImageDescription.format,
+                                       "AMD FSR Interpolation Output %d",
+                                       set * FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES + frame,
+                                       memProperties,
+                                       interpolationOutputAllocator);
+            if (res != VK_SUCCESS)
+            {
+                return res;
+            }
+        }
+    }
+    return VK_SUCCESS;
 }
 
 void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t              currentBackBufferIndex,
-                                                                  FfxResource*          pInterpolatedFrame,
+                                                                  FfxResource*          pInterpolatedFrames,
+                                                                  uint32_t*             pInterpolatedFrameCount,
                                                                   FfxResource*          pRealFrame,
                                                                   SubmissionSemaphores& semaphoresToWait)
 {
-    FFX_ASSERT(pInterpolatedFrame);
+    FFX_ASSERT(pInterpolatedFrames);
+    FFX_ASSERT(pInterpolatedFrameCount);
     FFX_ASSERT(pRealFrame);
 
     VkImage                currentBackBuffer = replacementSwapBuffers[currentBackBufferIndex].image;
@@ -2474,16 +2530,23 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t      
 
     *pRealFrame = backbuffer;
 
-    // interpolation queue must wait for output resource to become available
+    // Application-recorded interpolation command lists write a single output; multi-frame generation needs the
+    // frame-generation callback path.
+    auto           pRegisteredCommandList = registeredInterpolationCommandLists[currentBackBufferIndex];
+    const uint32_t generatedFrames        = pRegisteredCommandList != nullptr ? 1u : numGeneratedFrames;
+    *pInterpolatedFrameCount              = 0;
+
+    // interpolation queue must wait for the output set to become available (its last generated frame presented)
+    const uint64_t outputSetAvailable = interpolationOutputs[interpolationBufferIndex][0].availabilitySemaphoreValue;
     if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnPresentQueue)
     {
         // in those cases, interpolation output is available after composition
-        semaphoresToWait.add(presentInfo.compositionSemaphore, interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue);
+        semaphoresToWait.add(presentInfo.compositionSemaphore, outputSetAvailable);
     }
     else if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
     {
         // when there is a copy on the present queue from the present thread, the interpolation output will be available when the present semaphore is signaled
-        semaphoresToWait.add(presentInfo.presentSemaphore, interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue);
+        semaphoresToWait.add(presentInfo.presentSemaphore, outputSetAvailable);
     }
 
     // check necessary transitions
@@ -2500,10 +2563,12 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t      
     }
 
     // interpolation texture previous content doesn't matter here so we can use an undefined source layout
-    preInterpolationBarriers.add(
-        interpolationOutputs[interpolationBufferIndex].image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    for (uint32_t frame = 0; frame < generatedFrames; ++frame)
+    {
+        preInterpolationBarriers.add(
+            interpolationOutputs[interpolationBufferIndex][frame].image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    }
 
-    auto pRegisteredCommandList = registeredInterpolationCommandLists[currentBackBufferIndex];
     if (pRegisteredCommandList != nullptr)
     {
         SubmissionSemaphores semaphoresToSignal;
@@ -2527,24 +2592,26 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t      
         FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS, "dispatchInterpolationCommands failed with error %d", res);
 
         frameInterpolationResetCondition = false;
-        *pInterpolatedFrame              = interpolationOutput();
+        pInterpolatedFrames[0]           = interpolationOutput(0);
+        *pInterpolatedFrameCount         = 1;
     }
     else
     {
         VkCommands*     interpolationCommandList = presentInfo.commandPool.get(presentInfo.device, presentInfo.interpolationQueue, "interpolationCommandList");
         VkCommandBuffer interpolationCommandBuffer = interpolationCommandList->reset();
 
-        FfxResource interpolatedResource = interpolationOutput();
-        VkImage     interpolatedImage    = static_cast<VkImage>(interpolatedResource.resource);
-
-        FFX_ASSERT_MESSAGE(interpolationOutputs[interpolationBufferIndex].image == interpolatedImage, "Error when querying interpolation output");
-
+        // Generated frame k (presentation order, t = k / (N + 1)) goes to output k - 1 of the current set.
         FfxFrameGenerationDispatchDescription desc{};
-        desc.commandList           = ffxGetCommandListVK(interpolationCommandBuffer);
-        desc.outputs[0]            = interpolatedResource;
+        desc.commandList = ffxGetCommandListVK(interpolationCommandBuffer);
+        for (uint32_t frame = 0; frame < generatedFrames; ++frame)
+        {
+            desc.outputs[frame] = interpolationOutput(static_cast<int>(frame));
+            FFX_ASSERT_MESSAGE(interpolationOutputs[interpolationBufferIndex][frame].image == static_cast<VkImage>(desc.outputs[frame].resource),
+                               "Error when querying interpolation output");
+        }
         desc.presentColor          = backbuffer;
         desc.reset                 = frameInterpolationResetCondition;
-        desc.numInterpolatedFrames = 1;
+        desc.numInterpolatedFrames = generatedFrames;
         desc.frameID               = currentFrameID;
 
         // execute the necessary transitions
@@ -2569,13 +2636,16 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t      
             if (presentInfo.interpolationQueue.familyIndex != compositionQueueFamily)
             {
                 // interpolation output queue family ownership transfer
-                postInterpolationBarriers.add(interpolatedImage,
-                                              InterpolationBufferTransferState.accessMask,
-                                              InterpolationBufferTransferState.accessMask,
-                                              InterpolationBufferTransferState.layout,
-                                              InterpolationBufferTransferState.layout,
-                                              presentInfo.interpolationQueue.familyIndex,
-                                              compositionQueueFamily);
+                for (uint32_t frame = 0; frame < generatedFrames; ++frame)
+                {
+                    postInterpolationBarriers.add(static_cast<VkImage>(desc.outputs[frame].resource),
+                                                  InterpolationBufferTransferState.accessMask,
+                                                  InterpolationBufferTransferState.accessMask,
+                                                  InterpolationBufferTransferState.layout,
+                                                  InterpolationBufferTransferState.layout,
+                                                  presentInfo.interpolationQueue.familyIndex,
+                                                  compositionQueueFamily);
+                }
 
                 // backbuffer queue family ownership transfer
                 if (!presentInterpolatedOnly)
@@ -2601,11 +2671,14 @@ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t      
             interpolationCommandList->drop();
         }
 
-        // reset condition if at least one frame was interpolated
-        *pInterpolatedFrame = interpolationOutput();
-        if (frameInterpolationResetCondition)
+        // A reset dispatch only copies the real frame into the outputs: present nothing generated this frame.
+        if (!frameInterpolationResetCondition)
         {
-            pInterpolatedFrame->resource = nullptr;
+            for (uint32_t frame = 0; frame < generatedFrames; ++frame)
+            {
+                pInterpolatedFrames[frame] = desc.outputs[frame];
+            }
+            *pInterpolatedFrameCount = generatedFrames;
         }
         frameInterpolationResetCondition = false;
     }
@@ -2682,8 +2755,9 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
     SubmissionSemaphores ToWaitInterpolationQueue;
     ToWaitInterpolationQueue.add(presentInfo.gameSemaphore, gameSemaphoreValue);
 
-    FfxResource interpolatedFrame{}, realFrame{};
-    dispatchInterpolationCommands(currentBackBufferIndex, &interpolatedFrame, &realFrame, ToWaitInterpolationQueue);
+    FfxResource interpolatedFrames[FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES]{}, realFrame{};
+    uint32_t    interpolatedFrameCount = 0;
+    dispatchInterpolationCommands(currentBackBufferIndex, interpolatedFrames, &interpolatedFrameCount, &realFrame, ToWaitInterpolationQueue);
 #ifdef FFX_PLATFORM_WINDOWS
     EnterCriticalSection(&presentInfo.scheduledFrameCriticalSection);
 #elif FFX_PLATFORM_ANDROID || FFX_PLATFORM_LINUX
@@ -2708,24 +2782,32 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
     entry.usePremulAlphaComposite          = (presentInfo.uiCompositionFlags & FFX_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA) != 0;
     entry.currentFrameID                   = currentFrameID;
 
-    // interpolated
-    PacingData::FrameInfo& fiInterpolated = entry.frames[PacingData::FrameType::Interpolated_1];
-    if (interpolatedFrame.resource != nullptr)
+    // interpolated: generated frames 1..N in presentation order, evenly paced before the real frame
+    entry.numInterpolatedFrames = std::max<uint32_t>(1u, interpolatedFrameCount);
+    for (uint32_t frame = 0; frame < interpolatedFrameCount; ++frame)
     {
+        PacingData::FrameInfo& fiInterpolated = entry.frames[PacingData::FrameType::Interpolated_1 + frame];
+        if (interpolatedFrames[frame].resource == nullptr)
+        {
+            continue;
+        }
         fiInterpolated.doPresent                            = true;
-        fiInterpolated.resource                             = interpolatedFrame;
+        fiInterpolated.resource                             = interpolatedFrames[frame];
         fiInterpolated.interpolationCompletedSemaphoreValue = interpolationSemaphoreValue;
         fiInterpolated.presentIndex                         = ++framesSentForPresentation;
-    }
 
-    if (dumpGeneratedFrame && dumpGeneratedFramePath != nullptr && fiInterpolated.doPresent)
-    {
-        std::string basePath(dumpGeneratedFramePath);
-        uint64_t    frameID = 2 * currentFrameID - 1;
+        if (dumpGeneratedFrame && dumpGeneratedFramePath != nullptr)
+        {
+            // Presentation index of this generated frame: (N + 1) presents per rendered frame, real frame last.
+            std::string    basePath(dumpGeneratedFramePath);
+            const uint64_t presentsPerFrame = interpolatedFrameCount + 1;
+            const uint64_t frameID          = presentsPerFrame * currentFrameID - presentsPerFrame + 1 + frame;
 
-        dumpResourceAsyncNoCmdBuffer(
-            presentInfo.device, presentInfo.physicalDevice, presentInfo.interpolationQueue.queue, interpolatedFrame, basePath.c_str(), frameID);
+            dumpResourceAsyncNoCmdBuffer(
+                presentInfo.device, presentInfo.physicalDevice, presentInfo.interpolationQueue.queue, interpolatedFrames[frame], basePath.c_str(), frameID);
+        }
     }
+    const uint64_t lastInterpolatedPresentIndex = framesSentForPresentation;
 
     // real
     if (!presentInterpolatedOnly)
@@ -2743,7 +2825,9 @@ VkResult FrameInterpolationSwapChainVK::presentInterpolated(const VkPresentInfoK
     entry.replacementBufferSemaphoreSignal = framesSentForPresentation;
     entry.numFramesToPresent               = static_cast<uint32_t>(framesSentForPresentation - entry.numFramesSentForPresentationBase);
 
-    interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue = entry.numFramesSentForPresentationBase + fiInterpolated.doPresent;
+    // The output set can be rewritten once its last generated frame has been composed / presented.
+    interpolationOutputs[interpolationBufferIndex][0].availabilitySemaphoreValue =
+        interpolatedFrameCount > 0 ? lastInterpolatedPresentIndex : entry.numFramesSentForPresentationBase;
 
     if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
     {

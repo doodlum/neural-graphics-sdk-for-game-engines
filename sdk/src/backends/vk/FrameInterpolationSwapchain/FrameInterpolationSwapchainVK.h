@@ -100,10 +100,16 @@ typedef struct PacingData
     uint64_t numFramesSentForPresentationBase;
     uint32_t numFramesToPresent;
     uint64_t currentFrameID;
+    uint32_t numInterpolatedFrames;  ///< Generated frames scheduled in this entry (multi-frame generation: 1..5)
 
+    // Presentation order: Interpolated_1 .. Interpolated_N (N = numInterpolatedFrames), then Real.
     typedef enum FrameType
     {
         Interpolated_1,
+        Interpolated_2,
+        Interpolated_3,
+        Interpolated_4,
+        Interpolated_5,
         Real,
         Count
     } FrameType;
@@ -125,6 +131,8 @@ typedef struct PacingData
         memset(this, 0, sizeof(PacingData));
     }
 } PacingData;
+
+static_assert(PacingData::FrameType::Real == FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES, "one pacing slot per generated frame");
 
 typedef struct ReplacementResource
 {
@@ -250,7 +258,7 @@ public:
     void            setFrameGenerationConfig(FfxFrameGenerationConfig const* config);
     void            setFramePacingTuning(const FfxSwapchainFramePacingTuning* framePacingTuning);
     bool            waitForPresents();
-    FfxResource     interpolationOutput(int index = 0);
+    FfxResource     interpolationOutput(int index = 0);  ///< Output of generated frame index + 1 in the current buffer set
     VkCommandBuffer getInterpolationCommandList();
     void            registerUiResource(const FfxResource& uiResource, uint32_t flags);
     void            setWaitCallback(FfxWaitCallbackFunc waitCallbackFunc);
@@ -278,7 +286,8 @@ private:
     VkResult queuePresentNonInterpolated(VkCommands* pCommands, uint32_t imageIndex, SubmissionSemaphores& semaphoresToWait);
 
     void     dispatchInterpolationCommands(uint32_t              currentBackBufferIndex,
-                                           FfxResource*          pInterpolatedFrame,
+                                           FfxResource*          pInterpolatedFrames,      ///< FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES entries
+                                           uint32_t*             pInterpolatedFrameCount,  ///< generated frames to present (0 on reset)
                                            FfxResource*          pRealFrame,
                                            SubmissionSemaphores& semaphoresToWait);
     void     discardOutstandingInterpolationCommandLists();
@@ -317,7 +326,13 @@ private:
 
     uint32_t            gameBufferCount                                                             = 0;
     ReplacementResource replacementSwapBuffers[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT] = {};
-    ReplacementResource interpolationOutputs[2]                                                     = {};
+    // Double-buffered sets of interpolation outputs, one image per generated frame (multi-frame generation).
+    // Images beyond the first are created on demand when more generated frames are configured.
+    ReplacementResource          interpolationOutputs[2][FFX_FRAMEGENERATION_MAX_GENERATED_FRAMES] = {};
+    uint32_t                     numGeneratedFrames                                                = 1;
+    VkImageCreateInfo            interpolationOutputCreateInfo                                     = {};
+    const VkAllocationCallbacks* interpolationOutputAllocator                                      = nullptr;
+    VkResult                     ensureInterpolationOutputs(uint32_t generatedFrames);
     ReplacementResource uiReplacementBuffer                                                         = {};
     uint32_t            replacementSwapBufferIndex                                                  = 0;
     uint32_t            interpolationBufferIndex                                                    = 0;

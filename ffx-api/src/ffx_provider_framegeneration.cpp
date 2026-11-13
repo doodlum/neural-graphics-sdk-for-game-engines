@@ -211,6 +211,7 @@ struct InternalFgContext
     bool                  usesInternalDepthHistory;
     bool                  fp16Supported;
     uint32_t              inputTensorChannels;
+    uint32_t              swapchainGeneratedFrames = 1;  ///< FFX_API_CONFIGURE_FG_KEY_NUM_GENERATED_FRAMES (swapchain path)
     FfxDimensions2D       opticalFlowSize;
 #if FFX_CAPTURE_ENABLED
     CaptureController* controller;
@@ -912,6 +913,7 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Configure(ffxContext* context, cons
         }
 
         config.frameGenerationEnabled  = desc->frameGenerationEnabled;
+        config.numGeneratedFrames      = internal_context->swapchainGeneratedFrames;
         config.onlyPresentInterpolated = desc->onlyPresentGenerated;
         config.swapChain               = desc->swapChain;
 
@@ -984,6 +986,22 @@ ffxReturnCode_t ffxProvider_FrameGeneration::Configure(ffxContext* context, cons
         }
 
         return FFX_API_RETURN_OK;
+    }
+    else if (auto keyValue = ffx::DynamicCast<ffxApiConfigureDescFrameGenerationKeyValue>(header))
+    {
+        if (keyValue->key == FFX_API_CONFIGURE_FG_KEY_NUM_GENERATED_FRAMES)
+        {
+            // Swapchain path: generated frames per rendered frame, applied with the next frame-generation configure.
+            if (keyValue->u64 == 0 || keyValue->u64 > FFX_API_FRAMEGENERATION_MAX_GENERATED_FRAMES)
+            {
+                ffxLogMessage(ffxLogComponentName(), FFX_MESSAGE_TYPE_ERROR, "FFX_API_CONFIGURE_FG_KEY_NUM_GENERATED_FRAMES must be in [1, 5]");
+                return FFX_API_RETURN_ERROR_PARAMETER;
+            }
+            internal_context->swapchainGeneratedFrames = static_cast<uint32_t>(keyValue->u64);
+            return FFX_API_RETURN_OK;
+        }
+        ffxLogMessage(ffxLogComponentName(), FFX_MESSAGE_TYPE_ERROR, "unsupported frame-generation configure key");
+        return FFX_API_RETURN_ERROR_PARAMETER;
     }
     else
     {
