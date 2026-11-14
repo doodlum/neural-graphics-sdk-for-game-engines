@@ -608,13 +608,13 @@ Measured with `nfru_mfg.gpu_benchmark_cost_per_generated_frame` (`NFRU_MFG_BENCH
 
 | N (multiplier) | Median time per rendered frame |
 |---|---|
-| 1 (2x) | 5.7 ms |
-| 2 (3x) | 11.7 ms |
-| 3 (4x) | 16.8 ms |
-| 4 (5x) | 19.6 ms |
-| 5 (6x) | 24.0 ms |
+| 1 (2x) | 5.9 ms |
+| 2 (3x) | 11.0 ms |
+| 3 (4x) | 14.5 ms |
+| 4 (5x) | 19.1 ms |
+| 5 (6x) | 23.8 ms |
 
-A linear fit gives `F` of about 2.2 ms and `C` of about 4.5 ms per generated frame. Absolute numbers depend on the device and on native versus emulated ML extensions; re-measure on the target. The ratio is the useful part: the per-rendered-frame work is a small fraction, so the cost grows almost linearly with N.
+Measured with the default `nfru_mfg_v1_int8` graph. A linear fit gives `F` of about 1.7 ms and `C` of about 4.4 ms per generated frame. Absolute numbers depend on the device and on native versus emulated ML extensions; re-measure on the target. The ratio is the useful part: the per-rendered-frame work is a small fraction, so the cost grows almost linearly with N.
 
 ### Debug capture and parity dumps
 
@@ -632,7 +632,9 @@ The data graph compiled into the SDK is selected at CMake configure time:
 python build.py -t Release -b vk_linux_x64 --cmake-args="-DFFX_NFRU_DATA_GRAPH_FILE=/path/to/nfru_mfg_int8.vgf"
 ```
 
-The file stem names the generated symbols and must be a C identifier. The quantization parameters (input `x`, params output `getitem`, gate output `getitem_1`, SINT and SNORM scale/zero point) are read from the model-gym export metadata `<stem>_metadata.json` next to the VGF, or from `FFX_NFRU_DATA_GRAPH_METADATA`. The default is `sdk/src/backends/vk/data_graphs/nfru/nfru_v2_0_0_int8.vgf`.
+The file stem names the generated symbols and must be a C identifier. The quantization parameters (input `x`, params output `getitem`, gate output `getitem_1`, SINT and SNORM scale/zero point) are read from the model-gym export metadata `<stem>_metadata.json` next to the VGF, or from `FFX_NFRU_DATA_GRAPH_METADATA`. The default is `sdk/src/backends/vk/data_graphs/nfru/nfru_mfg_v1_int8.vgf`, a 20-channel multi-frame graph fine-tuned with model gym from the NFRU v2 weights on Arm's NFRU data plus 180 fps-timeline renders (base rates 30-60 fps, ground truth at every t = k/6), int8 QAT. Arm's original 16-channel graph stays available as `nfru_v2_0_0_int8.vgf`.
+
+When switching graphs or editing the frame interpolation shaders, delete `build/<config>/<config>/ffx_shaders/ffx_frameinterpolation_*` before rebuilding: the permutation headers are not always regenerated when an included header changes, and a stale preprocess shader silently writes a 16-channel tensor (channels 16-19 stay zero).
 
 The outputs must match the v2 graph (4-channel params and 1-channel gate at half lane). The input-tensor layout is chosen from the graph's input channel count at context creation (`ffxFrameInterpolationGetInputTensorChannels`):
 
