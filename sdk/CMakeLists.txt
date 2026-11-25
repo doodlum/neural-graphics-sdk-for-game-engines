@@ -192,10 +192,10 @@ if(FFX_FI OR FFX_ALL)
 	# multi-frame timestep features, to swap networks without code changes. The file stem must be a valid C identifier
 	# (it names the generated symbols). The quantization parameters come from the model-gym export metadata
 	# (<stem>_metadata.json next to the VGF unless FFX_NFRU_DATA_GRAPH_METADATA says otherwise).
-	# Default: the multi-frame graph trained from scratch with model gym (20-channel input with timestep features).
-	# nfru_mfg_v1_int8.vgf is the earlier graph fine-tuned from NFRU v2; nfru_v2_0_0_int8.vgf is Arm's original
-	# 16-channel graph.
-	set(FFX_NFRU_DATA_GRAPH_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/backends/vk/data_graphs/nfru/nfru_mfg_v9_int8.vgf"
+	# Default: the multi-frame graph trained with model gym from shrunk and perturbed NFRU v2 weights (20-channel input
+	# with timestep features). nfru_mfg_v9_int8.vgf was trained from random initialization, nfru_mfg_v1_int8.vgf is a
+	# plain fine-tune of NFRU v2; nfru_v2_0_0_int8.vgf is Arm's original 16-channel graph.
+	set(FFX_NFRU_DATA_GRAPH_FILE "${CMAKE_CURRENT_SOURCE_DIR}/src/backends/vk/data_graphs/nfru/nfru_mfg_v14_int8.vgf"
 		CACHE FILEPATH "NFRU data graph (.vgf) compiled into the SDK")
 	set(FFX_NFRU_DATA_GRAPH_METADATA "" CACHE FILEPATH "NFRU data graph quantization metadata (.json); empty selects <vgf stem>_metadata.json")
 	include(${CMAKE_CURRENT_SOURCE_DIR}/src/components/frameinterpolation/NfruDataGraphSelection.cmake)
